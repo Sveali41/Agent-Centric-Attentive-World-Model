@@ -329,7 +329,6 @@ class CustomMiniGridEnv(MiniGridEnv):
 if __name__ == "__main__":
     ## 1. generate env from string
     # # Example usage of the CustomMiniGridEnv class with file input
-    # path = Paths()
     # # env_file_based = FullyObsWrapper(CustomMiniGridEnv(
     # #     txt_file_path=path.LEVEL_FILE_Rmax,
     # #     custom_mission="Find the key and open the door.",
@@ -380,4 +379,3 @@ if __name__ == "__main__":
     env.reset()
     manual_control = ManualControl(env)  # Allows manual control for testing and visualization
     manual_control.start()  # Start the manual control interface
-    

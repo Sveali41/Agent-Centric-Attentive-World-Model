@@ -1,7 +1,7 @@
 from omegaconf import DictConfig
 import Support
 from generator.common.utils import load_gen
-from minigrid_custom_env import CustomMiniGridEnv
+from domain.minigrid.minigrid_custom_env import CustomMiniGridEnv
 from modelBased.common.utils import TRAINER_PATH, extract_unique_patches, generate_minitasks_until_covered
 from modelBased.world_model import AttentionWM_training
 from modelBased.policy_training import PPO_world_training

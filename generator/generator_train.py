@@ -1,9 +1,6 @@
 import torch
 from torch import nn
 import os
-import sys
-sys.path.append('/home/siyao/project/rlPractice/MiniGrid')
-from path import Paths
 from data.datamodule import GenDataModule
 from data.datamodule_vae import VaeDataModule
 import hydra
