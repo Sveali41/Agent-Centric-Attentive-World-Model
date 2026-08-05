@@ -6,6 +6,7 @@ outputs/
 __pycache__/
 
 *.py[cod]
+*.egg-info/
 
 # Ignore JetBrains IDE settings
 .idea/

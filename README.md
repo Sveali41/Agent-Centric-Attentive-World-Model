@@ -2,6 +2,14 @@
 
 This repository contains the Agent-Centric Attentive World Model and its domain adapters for MiniGrid, Crafter, and BipedalWalker.
 
+The `modelBased/` and shared `domain/` packages are the canonical WM source.
+Other projects, including Curriculum/MAC, should install this repository in
+editable mode instead of copying these directories:
+
+```bash
+pip install -e .
+```
+
 ## Environment Setup
 
 1. **Clone this repository on your machine**:

@@ -185,8 +185,28 @@ def normalize_obs(x, obs_norm_values):
     else:
         raise TypeError("Input must be a NumPy array or PyTorch tensor.")
     
-    # Normalize based on the dimensionality of x
-    if x.ndim == 3:
+    # Normalize vector observations (e.g. BipedalWalker).
+    if x.ndim == 1:
+        if obs_norm_values is None or len(obs_norm_values) not in (1, x.shape[0]):
+            raise ValueError("Normalization values must be scalar or match the feature dimension.")
+        if len(obs_norm_values) == 1:
+            if obs_norm_values[0] != 0:
+                x /= obs_norm_values[0]
+        else:
+            for i, value in enumerate(obs_norm_values):
+                if value != 0:
+                    x[i] /= value
+    elif x.ndim == 2:
+        if obs_norm_values is None or len(obs_norm_values) not in (1, x.shape[1]):
+            raise ValueError("Normalization values must be scalar or match the feature dimension.")
+        if len(obs_norm_values) == 1:
+            if obs_norm_values[0] != 0:
+                x /= obs_norm_values[0]
+        else:
+            for i, value in enumerate(obs_norm_values):
+                if value != 0:
+                    x[:, i] /= value
+    elif x.ndim == 3:
         if obs_norm_values is None or len(obs_norm_values) != x.shape[0]:
             raise ValueError("Normalization values must be provided and must match the number of channels in the data.")
         # x is of shape (H, W, C)
@@ -210,13 +230,33 @@ def normalize_obs(x, obs_norm_values):
         # Flatten each observation in the batch
         x = x.reshape(B, channel, row, col)
     else:
-        raise ValueError("Input must be a 3D or 4D array.")
+        raise ValueError("Input must be a 1D, 2D, 3D or 4D array.")
     
     return x
 
 def denormalize_obj(x, obs_norm_values):    
-    # Normalize based on the dimensionality of x
-    if x.ndim == 3:
+    # Denormalize vector observations (e.g. BipedalWalker).
+    if x.ndim == 1:
+        if obs_norm_values is None or len(obs_norm_values) not in (1, x.shape[0]):
+            raise ValueError("Normalization values must be scalar or match the feature dimension.")
+        if len(obs_norm_values) == 1:
+            if obs_norm_values[0] != 0:
+                x *= obs_norm_values[0]
+        else:
+            for i, value in enumerate(obs_norm_values):
+                if value != 0:
+                    x[i] *= value
+    elif x.ndim == 2:
+        if obs_norm_values is None or len(obs_norm_values) not in (1, x.shape[1]):
+            raise ValueError("Normalization values must be scalar or match the feature dimension.")
+        if len(obs_norm_values) == 1:
+            if obs_norm_values[0] != 0:
+                x *= obs_norm_values[0]
+        else:
+            for i, value in enumerate(obs_norm_values):
+                if value != 0:
+                    x[:, i] *= value
+    elif x.ndim == 3:
         if obs_norm_values is None or len(obs_norm_values) != x.shape[0]:
             raise ValueError("Normalization values must be provided and must match the number of channels in the data.")
         # x is of shape (H, W, C)
@@ -240,7 +280,7 @@ def denormalize_obj(x, obs_norm_values):
         # Flatten each observation in the batch
         x = x.reshape(B, channel, row, col)
     else:
-        raise ValueError("Input must be a 3D or 4D array.")
+        raise ValueError("Input must be a 1D, 2D, 3D or 4D array.")
     return x
     
 def map_obs_to_nearest_value(obs_denorm, obj_values, color_values, state_values):
@@ -732,7 +772,6 @@ GENERATOR_PATH : Path = Path(get_env("GENERATOR_PATH"))
 TRAINER_PATH : Path = Path(get_env("TRAINER_PATH"))
 WORLD_MODEL_PATH = Path(get_env("WORLD_MODEL_PATH"))
 sys.path.append(str(PROJECT_ROOT.resolve()))	
-
 
 
 
