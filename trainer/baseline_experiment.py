@@ -3,7 +3,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-from modelBased import PPO_world_training, PPO_world_test
+from modelBased.policy_training import PPO_world_training, PPO_world_test
 from modelBased.common.utils import TRAINER_PATH
 from omegaconf import DictConfig
 import hydra

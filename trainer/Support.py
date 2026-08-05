@@ -11,7 +11,7 @@ from minigrid_custom_env import *
 import textwrap
 from minigrid.wrappers import FullyObsWrapper, RGBImgObsWrapper
 import torch
-from modelBased.data_collect import *
+from modelBased.data.data_collect import *
 from modelBased.data.datamodule import *
 # from generator.data.env_dataset_support import generate_valid_minigrid_with_key_door
 from matplotlib import pyplot as plt
@@ -21,7 +21,8 @@ from generator.data.env_dataset_support import generate_envs_dataset
 from generator.data.env_dataset_support import replace_vector_value, visualize_grid
 from learning_buffer import EnvLearningBuffer
 from generator.data.env_dataset_support import is_reachable
-from modelBased import AttentionWM_training, PPO_world_training
+from modelBased.world_model import AttentionWM_training
+from modelBased.policy_training import PPO_world_training
 
 
 class Support:
@@ -448,7 +449,6 @@ class Support:
         return start_step, old_params, fisher
 
         
-
 
 
 
