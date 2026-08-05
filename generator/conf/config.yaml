@@ -1,0 +1,82 @@
+data_generator:
+  map_width: 12
+  map_height: 6
+  num_keys: 1
+  num_episodes: 40000
+  output_file: ${oc.env:GENERATOR_PATH}/data/generated_data_final.json
+  
+
+deconv:
+  z_shape: 128 
+  dropout : 0.3
+  output_channels: 2  # 2*8*8 grid world with 2 maps
+  grid_size: [6,12]
+  n_filters: 32
+
+
+basic:
+  z_dim: 64
+  n_filters: 32
+  kernel_size: 3
+  stride: 1
+  padding: 1
+  activation: relu
+  batch_norm: True
+  dropout: 0.0
+
+vae:
+    img_size: [12,12]
+    latent_dim: 32
+    lr: 1e-4 
+    vae_task: classification
+    class_value_list: [1,2,8] 
+
+dataloader_gan:
+  # data 
+  data_dir: ${oc.env:GENERATOR_PATH}/data/generated_data_final.json
+  batch_size: 32
+  n_cpu: 4
+  # model
+  generator: "vae"
+  n_epochs: 1000
+  lr: 0.0002
+  wd : 0.0
+  pth_path: ${oc.env:GENERATOR_PATH}/models/gan_model_classifier.ckpt
+  validation_path: ${oc.env:GENERATOR_PATH}/models/gan_model_classifier.ckpt
+  map_element: {'E': 0, 'W': 1, 'B': 2, 'O': 3, 'K': 4, 'D': 5}
+  # map_element: {'W': 0, 'E': 1, 'D': 2, 'G': 3, 'K': 4, 'Y': 5}
+  env_path: ${oc.env:TRAINER_PATH}/level/level.txt
+  #
+dataloader_vae:
+  # data 
+  data_dir: ${oc.env:GENERATOR_PATH}/data/grid500.pkl
+  batch_size: 32
+  n_cpu: 4
+  # model
+  generator: "vae"
+  n_epochs: 1000
+  lr: 0.0002
+  wd : 0.0
+  pth_path: ${oc.env:GENERATOR_PATH}/models/gan_model_classifier.ckpt
+  validation_path: ${oc.env:GENERATOR_PATH}/models/gan_model_classifier.ckpt
+  map_element: {'E': 0, 'W': 1, 'B': 2, 'O': 3, 'K': 4, 'D': 5}
+  # map_element: {'W': 0, 'E': 1, 'D': 2, 'G': 3, 'K': 4, 'Y': 5}
+  env_path: ${oc.env:TRAINER_PATH}/level/level.txt
+
+training_generator:
+  use_wandb: False
+  # data 
+  data_dir: ${oc.env:GENERATOR_PATH}/data/generated_data_final.json
+  batch_size: 32
+  n_cpu: 4
+  # model
+  generator: "vae"
+  n_epochs: 1000
+  lr: 0.0002
+  wd : 0.0
+  pth_path: ${oc.env:GENERATOR_PATH}/models/gan_model_classifier.ckpt
+  validation_path: ${oc.env:GENERATOR_PATH}/models/gan_model_classifier.ckpt
+  map_element: {'E': 0, 'W': 1, 'B': 2, 'O': 3, 'K': 4, 'D': 5}
+  # map_element: {'W': 0, 'E': 1, 'D': 2, 'G': 3, 'K': 4, 'Y': 5}
+  env_path: ${oc.env:TRAINER_PATH}/level/level.txt
+

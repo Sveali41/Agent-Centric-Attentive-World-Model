@@ -1,0 +1,12 @@
+GRRRRG
+GGTTTT
+GGAGOG
+
+# --- Initial Stats(make table and use iron to make furnace and iron pickaxe) ---
+wood: 5
+stone: 5
+iron: 2
+coal: 2
+food: 9
+drink: 9
+energy: 9

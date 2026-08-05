@@ -8,7 +8,7 @@ from matplotlib.colors import LinearSegmentedColormap
 from minigrid.wrappers import FullyObsWrapper
 
 from domain.minigrid.minigrid_custom_env import CustomMiniGridEnv
-from modelBased.common.map_utils import (
+from generator.common.utils import (
     add_outer_wall,
     combine_maps,
     generate_color_map,
@@ -17,6 +17,7 @@ from modelBased.common.map_utils import (
     
     
 )
+from generator.data.env_dataset_support import generate_envs_dataset, is_reachable
 from modelBased.common import utils
 
 
@@ -80,14 +81,6 @@ def generate_final_task(
     max_len=1e7,
     random_gen_max=3e4,
 ):
-    try:
-        from generator.data.env_dataset_support import generate_envs_dataset
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "MiniGrid task generation is provided by the consuming project "
-            "(for example Curriculum_world_model_learning/generator)."
-        ) from exc
-
     final_task_dict = generate_envs_dataset(
         rows,
         cols,
@@ -164,12 +157,6 @@ def env_editor(env, dynamic_object, cfg, flip_ratio=0.15, max_attempts=20000):
             env[new_i, new_j] = val
             empty_inner_coords.remove((new_i, new_j))
 
-        try:
-            from generator.data.env_dataset_support import is_reachable
-        except ModuleNotFoundError as exc:
-            raise RuntimeError(
-                "MiniGrid environment editing requires the consuming project's generator package."
-            ) from exc
         if is_reachable(env, key_door=key_door):
             env_layout = env
             env = wrap_env(torch.tensor(env).unsqueeze(0), cfg)

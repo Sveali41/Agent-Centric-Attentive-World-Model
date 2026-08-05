@@ -1,0 +1,135 @@
+# 1. load the generator
+training_generator:
+  # data 
+  map_width: 6
+  map_height: 6
+  data_dir: ${oc.env:GENERATOR_PATH}/data/dataset/generated_data_final.json
+  batch_size: 1
+  n_cpu: 0
+  # model
+  z_shape: 128
+  generator: "deconv"
+  n_epochs: 130
+  lr: 1e-4
+  wd : 0.0
+  pth_path: ${oc.env:GENERATOR_PATH}/models/gan_model_classifer.ckpt #${oc.env:GENERATOR_PATH}/models/gan_model_classifier.ckpt
+  validation_path: ${oc.env:GENERATOR_PATH}/models/gan_model_classifier.ckpt 
+  map_element: {'E': 1, 'W': 2, 'G':8 , 'K': 5, 'D': 4, 'S': 3} #{'E': 0, 'W': 1, 'K': 2, 'D': 3, 'S': 4, 'G': 5}
+  dynamic_objects: [8, 4, 5]
+  # map_element: {'W': 0, 'E': 1, 'D': 2, 'G': 3, 'K':4 , 'Y': 5}
+  env_path: ${oc.env:TRAINER_PATH}/level/level.txt
+  use_wandb: true
+  elites_path: ${oc.env:GENERATOR_PATH}/data/grid500_6_6.pkl
+  learning_buffer_size: 5000 # 5000
+  learning_buffer_threshold: 0.0001
+  learning_steps: 200 # 1000
+  ablation:
+    disable_editor: False
+    disable_buffer: True
+    disable_MAP: false
+  
+
+# 2.collect data from the generated env
+env:
+  # env_name: MiniGrid-Empty-8x8-v0 #MiniGrid-Dynamic-Obstacles-8x8-v0 # Name of environment, or comma-separate list of environment names to instantiate as each env in the VecEnv.
+  visualize: False # to choose whether your want to see the env during interaction or not
+  collect:
+    episodes: 500  # 500 number of episodes to start 
+    data_folder: ${oc.env:TRAINER_PATH}/data/ # folder where to save the rollouts
+    data_save_path: ${oc.env:TRAINER_PATH}/data/gridworld_trainer.npz # folder where to save the rollouts
+    num_workers: 0 # number of workers to use for data collection
+
+# 3. attension model
+attention_model:
+  env_type: empty # empty means empty only wall in preprocess no info for keys, lava/door/key/wall/norm
+  data_type: discrete # 'norm' or 'discrete'  # 这两种类型效果都还不错 20250213
+  model_type: Attention       # Attention, Embedding, MLP
+  grid_shape: [3, 0, 0]  # Channel, Row, Col  # Row, Col 暂时不用，所以设为0就ok 20250213
+  attention_mask_size: 3
+  batch_size: 128  # test 64/128/256
+  n_cpu: 0
+  embed_dim: 128  # 128 64/128/256
+  num_heads: 1   # 1 if the embed_dim is 64, num_heads should better be 1
+  data_dir: ${oc.env:TRAINER_PATH}/data/gridworld_trainer.npz # ${oc.env:TRAINER_PATH}/data/gridworld_episode.npz 
+  n_epochs: 25  # 25
+  lr: 1e-4 # 1e-4 
+  wd: 1e-5
+  obs_norm_values: [10, 5, 3] # object, color, state --> agent_state: 1-down 2-left 3-up 0-right 
+  action_norm_values: 6 # 0-left 1-right 2-forward 3-pickup 4-drop 5-toggle 6-done
+  valid_values_obj: [1, 2, 4, 5, 8, 10]                                                             
+  valid_values_color: [0, 1, 5]
+  valid_values_state: [0, 1, 2, 3]
+  use_wandb: False
+  fisher_buffer_size: 500000
+
+  # freeze weights
+  freeze_weight: False  # 置true 会加载权重，不会训练模型，用于验证
+  # model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model.ckpt   # 这是整个模型的保存路径 20250213
+  model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model.ckpt
+
+  # plot
+  visualization: False     
+  visualize_every: 1000
+  save_path: ${oc.env:TRAINER_PATH}/visulization
+  direction_map: {0: 'right', 1: 'down', 2: 'left', 3: 'up'}
+  action_map: {0: 'left', 1: 'right', 2: 'forward', 3: 'pickup', 4: 'drop', 5: 'toggle', 6: 'done'}
+  lambda_ewc: 500
+  continue_learning: True
+
+  # 4. PPO model for final task
+PPO:
+  # add the params for regret computation
+  performance_eval_method: "average_reward"  # regret/accuracy of the model
+  compute_regret: False
+  regret_eval_freq: 15000  # how often to compute regret (in timesteps) 5000
+  regret_eval_episodes: 5  # how many episodes to average for evaluation
+  regret_threshold: 0.1  # threshold for regret
+  real_policy_folder: ${oc.env:MODEL_FPATH}
+  real_policy_path: None
+  # the params for final task path
+  final_task: ${oc.env:TRAINER_PATH}/level/final_task
+  env_path: ${oc.env:TRAINER_PATH}/level/env2_move.txt
+
+  # PPO training
+  env_type: empty # empty means empty only wall in preprocess no info for keys, lava/door/key/wall/norm
+  has_continuous_action_space: False
+  max_ep_len: 1200  # max timesteps in one episode 8000
+  action_std: 0.1  # set same std for action distribution which was used while saving
+  i_episode: 0
+  K_epochs: 3  # update policy for K epochs
+  eps_clip: 0.1  # clip parameter for PPO
+  gamma: 0.95  # discount factor
+  lr_actor: 1e-4  # learning rate for actor
+  lr_critic: 3e-4  # learning rate for critic
+  checkpoint_path: ${oc.env:MODEL_FPATH}/optimal_policy.ckpt
+  time_step: 0
+  max_training_timesteps: 4e6 #1e6
+  # max_training_timesteps: 3e5
+  action_std_decay_freq: 3000
+  action_std_decay_rate: 0.95
+  min_action_std: 0.1
+  save_model_freq: 5e4 #2e4
+  ########################################
+  # test
+  total_test_episodes: 20
+  render: True
+  visualize: false
+  save_gif: True
+  save_path_gif: ${oc.env:PROJECT_ROOT}/modelBased/visulization/PPO/PPO_gif
+  save_csv: False
+  save_path_csv: ${oc.env:PROJECT_ROOT}/modelBased/visulization/PPO/PPO_csv
+  use_wandb: False
+  wandb_run_name: None
+
+    # evaluation
+  episodes_eval: 20
+  reward_threshold: 0.8
+  
+  
+
+
+test_env:
+  visualize: False
+  time_limit: 256 #max number of steps for each rollout 600
+  env_name: MiniGrid-Empty-8x8-v0 #MiniGrid-Dynamic-Obstacles-8x8-v0 #MiniGrid-Empty-5x5-v0 #MiniGrid-Empty-8x8-v0 #MiniGrid-Empty-Random-6x6-v0 
+  n_rollouts: 1000

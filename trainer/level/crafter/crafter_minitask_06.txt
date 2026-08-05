@@ -1,0 +1,13 @@
+TTTTTT
+GGAOGG
+GGGGGG
+
+# --- Initial Stats(use iron pickaxe to pick diamond) ---
+iron_pickaxe: 1
+wood: 5
+iron: 2
+stone: 5
+coal: 5
+food: 5
+drink: 5
+energy: 9

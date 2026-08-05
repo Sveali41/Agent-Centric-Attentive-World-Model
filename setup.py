@@ -6,7 +6,7 @@ setup(
     version="0.1.0",
     description="Agent-Centric Attentive World Model and reusable domain adapters",
     packages=find_namespace_packages(
-        include=["modelBased*", "domain*"]
+        include=["modelBased*", "domain*", "generator*"]
     ),
     include_package_data=True,
 )

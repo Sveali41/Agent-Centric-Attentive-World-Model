@@ -1,0 +1,6 @@
+# Bipedal layout tokens: R=Roughness, G=Grass, S=Stump, P=Pit, T=Stairs
+# Format: <Type><Number>, separated by spaces/newlines.
+# Example: R1.3 G20 S3.0 P4 T2
+# Roughness multiplies random grass perturbation (0.0 = flat, 1.0 = default, >1.0 = rougher).
+
+G12
