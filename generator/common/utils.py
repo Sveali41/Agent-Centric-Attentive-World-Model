@@ -1,15 +1,12 @@
 import torch
-import sys  
-sys.path.append('/home/siyao/project/rlPractice/MiniGrid')
 from generator.gen import GAN
 import random
 import re
+from minigrid.core.constants import IDX_TO_COLOR
 
 def load_gen(cfg):
     hparams = cfg
     if hparams.training_generator.generator == "deconv":
-        import sys
-        sys.path.append('/home/siyao/project/rlPractice/MiniGrid/generator')
         from generator.deconv_gen import Generator, Discriminator
         model = GAN(generator=Generator(hparams.training_generator.z_shape, len(hparams.training_generator.map_element)), 
             discriminator=Discriminator(input_channels = len(hparams.training_generator.map_element)), 
@@ -51,6 +48,26 @@ def generate_obj_map(layout, map_dict):
         layout_line = ''.join([reverse_map_dict.get(num.item()) for num in row])
         layout_strings.append(layout_line)
     return '\n'.join(layout_strings)
+
+def interpret_color_map(color_layout, color_map):
+    """Convert a MiniGrid color-index layout into its ASCII color map."""
+    if hasattr(color_layout, "detach"):
+        color_layout = color_layout.detach().cpu()
+
+    color_name_to_char = {
+        "red": "R", "green": "G", "blue": "B",
+        "purple": "M", "yellow": "Y", "grey": "W",
+    }
+    color_name_to_char.update({
+        value: key for key, value in color_map.items()
+        if value not in color_name_to_char
+    })
+
+    height, width = color_layout.shape
+    return "\n".join(
+        "".join(color_name_to_char.get(IDX_TO_COLOR[int(idx)], "?") for idx in color_layout[row])
+        for row in range(height)
+    )
 
 def generate_color_map(layout_strings):
     '''

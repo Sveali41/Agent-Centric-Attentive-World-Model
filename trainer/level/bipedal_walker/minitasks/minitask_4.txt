@@ -1,0 +1,2 @@
+# Hard long track
+G10 R1.5 G8 S1 G8 P2.0 G10

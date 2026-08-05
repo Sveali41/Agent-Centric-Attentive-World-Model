@@ -56,6 +56,8 @@ gym==0.26.2
 gym-notices==0.0.8
 gym3==0.3.3
 gymnasium==0.29.1
+Box2D==2.3.10
+crafter @ git+https://github.com/danijar/crafter.git@e04542a2159f1aad3d4c5ad52e8185717380ee3a
 h11==0.14.0
 h5py==3.13.0
 httpcore==1.0.7

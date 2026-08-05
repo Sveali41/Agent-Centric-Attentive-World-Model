@@ -1,6 +1,8 @@
 # Agent-Centric Attentive World Model
 
-## How to Reproduce the Results
+This repository contains the Agent-Centric Attentive World Model and its domain adapters for MiniGrid, Crafter, and BipedalWalker.
+
+## Environment Setup
 
 1. **Clone this repository on your machine**:
     ```bash
@@ -13,30 +15,36 @@
     ```
 
 3. **Data Collection for Transition Function**:
-   - You can personalize the parameters you prefer in the config file located at `/MiniGrid/modelBased/conf/env/config.yaml`.
-   - Randomly run the environment and collect the trajectory data (observation, action, observation_next, reward, done):
+   - Source the repository-local paths before running experiments:
      ```bash
-     python /modelBased/modelBased/data_collect.py
+     source .env
      ```
-   - Save the data into `MiniGrid/modelBased/data/train_world_model/gridworld_full.npz`.
+
+   - Select the domain in `modelBased/config/config.yaml` (`crafter`, `minigrid`, or `bipedalwalker`).
+   - Collect trajectory data for a selected domain:
+     ```bash
+     python modelBased/data/data_collect.py domain=crafter
+     python modelBased/data/data_collect.py domain=bipedalwalker
+     ```
+   - Save the data into `modelBased/data/train_world_model/`.
      - *(Note: Some collected data may already exist here, which you can use and proceed to the next step.)*
 
 4. **Run the World Model**:
-   - You can personalize the parameters you prefer in the config file located at `/MiniGrid/modelBased/conf/model/config.yaml`.
+   - Configure the world model in `modelBased/config/config.yaml`.
    - train the model
      ```bash
-     python /modelBased/modelBased/world_model_training.py
+     python modelBased/world_model/AttentionWM_training.py domain=crafter
      ```
 5. **Train the policy based on World Model**:
-   - Still, You can personalize the parameters you prefer in the config file located at `/MiniGrid/modelBased/conf/model/config.yaml`.
+   - Configure PPO in `modelBased/config/config.yaml`.
    - train the PPO model
    ```bash
-   python /modelBased/modelBased/PPO_model_training.py
+   python modelBased/policy_training/PPO_world_training.py domain=bipedalwalker
    ```
 
 6. **Run the trained policy model in the real world**:
    ```bash
-   python /modelBased/modelBased/PPO_model_test.py
+   python modelBased/policy_training/PPO_world_test.py domain=minigrid
    ```
    
 ## Q&A
@@ -45,11 +53,11 @@
 This is on the TODO list and will be fixed in the future—though I'm unsure how soon :)
    ```bash
    import sys
-   sys.path.append('/home/siyao/project/rlPractice/MiniGrid')
+   sys.path.append('/home/siyao/phd_file/Research/rlPractice/Agent-Centric-Attentive-World-Model')
 
 2. If you encounter issues related to can't find the path, change the path in .env file to your own device.
    ```bash
-   export PROJECT_ROOT="/home/siyao/project/rlPractice/MiniGrid/modelBased"
+   export PROJECT_ROOT="/home/siyao/phd_file/Research/rlPractice/Agent-Centric-Attentive-World-Model"
    export TRAIN_DATASET_PATH="${PROJECT_ROOT}/data/train_world_model"
    export PTH_FOLDER="${PROJECT_ROOT}/modelBased/models/ckpt"
    export LOG_FOLDER="${PROJECT_ROOT}/modelBased/models/log"
