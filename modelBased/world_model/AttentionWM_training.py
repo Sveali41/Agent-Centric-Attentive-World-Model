@@ -17,7 +17,6 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks import ModelCheckpoint
 import wandb
 import numpy as np
-from modelBased.common.utils import TRAINER_PATH
 from omegaconf import open_dict
 
 

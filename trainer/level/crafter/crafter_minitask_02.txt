@@ -1,9 +1,0 @@
-GRRRRR
-GGTTTG
-GGAGGG
-
-# --- Initial Stats(make table and wood pickaxe) ---
-wood: 5
-food: 9
-drink: 9
-energy: 9

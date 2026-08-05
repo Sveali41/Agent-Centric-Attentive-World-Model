@@ -1,9 +1,0 @@
-TTTTTT
-GGAWOG
-GGGGGG
-
-# --- Initial Stats(pickup woods) ---
-wood: 0
-food: 9
-drink: 9
-energy: 9
