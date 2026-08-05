@@ -1,10 +1,10 @@
-# ModelBased MiniGrid with a Simple Network
+# Agent-Centric Attentive World Model
 
 ## How to Reproduce the Results
 
 1. **Clone this repository on your machine**:
     ```bash
-    git clone https://github.com/Sveali41/MiniGrid.git
+    git clone https://github.com/Sveali41/Agent-Centric-Attentive-World-Model.git
     ```
 
 2. **Install the requirements inside the cloned folder**:
@@ -54,4 +54,3 @@ This is on the TODO list and will be fixed in the future—though I'm unsure how
    export PTH_FOLDER="${PROJECT_ROOT}/modelBased/models/ckpt"
    export LOG_FOLDER="${PROJECT_ROOT}/modelBased/models/log"
    PYDEVD_WARN_EVALUATION_TIMEOUT=100.00
-
