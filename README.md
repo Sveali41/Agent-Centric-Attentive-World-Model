@@ -116,6 +116,127 @@ For **Crafter**, choose a layout from `trainer/level/crafter/`, set `domain: cra
 
 For **BipedalWalker**, choose a terrain from `trainer/level/bipedal_walker/`, set `domain: bipedalwalker`, and use normalized data. The default `behavior_policy: heuristic` is suitable for initial data collection; set `behavior_policy: pretrained_sb3` and provide `sb3_model_path` when using a trained continuous-control policy.
 
+## Configuring Environment Layouts
+
+Each domain uses a different layout format. After creating or selecting a layout file, update the matching values under `domains.<domain>` in `modelBased/config/config.yaml`.
+
+### MiniGrid layout
+
+MiniGrid files contain two equally sized blocks separated by one empty line:
+
+1. An object layout.
+2. A color layout with the same dimensions.
+
+For example, `level/Grid_11_11_KD_level1.txt` uses symbols such as:
+
+| Symbol | Meaning |
+| --- | --- |
+| `W` | Wall |
+| `E` | Empty/floor cell |
+| `S` | Agent start position |
+| `K` | Key |
+| `D` | Locked door |
+| `O` | Unlocked door |
+| `B` | Ball |
+| `X` | Box |
+| `G` | Goal |
+| `L` | Lava |
+
+The second block specifies colors character-by-character. Supported color symbols include `R` (red), `G` (green), `B` (blue), `Y` (yellow), `M` (purple), and `W`/`E`/`S` (grey). Both blocks must have the same number of rows and columns.
+
+```text
+WWWWW
+WSEKW
+WEEGW
+WWWWW
+
+WWWWW
+WGYGW
+WEEGW
+WWWWW
+```
+
+Point `domains.minigrid.env_path` to the new file. The file path can also be changed temporarily from the command line:
+
+```bash
+python modelBased/data/data_collect.py \
+  domain=minigrid \
+  domains.minigrid.env_path=/path/to/my_minigrid_layout.txt
+```
+
+### Crafter layout
+
+Crafter files contain a character grid, optionally followed by an initial-inventory block separated by an empty line. The player must be represented by `A`.
+
+Common map symbols are:
+
+| Symbol | Meaning |
+| --- | --- |
+| `G` or `.` | Grass |
+| `W` | Water |
+| `T` | Tree |
+| `R` | Stone |
+| `C` | Coal |
+| `I` | Iron |
+| `O` | Diamond |
+| `L` | Lava |
+| `P` | Path |
+| `S` | Sand |
+| `X` | Table |
+| `U` | Furnace |
+| `A` | Player |
+| `M` | Cow |
+| `Z` | Zombie |
+| `K` | Skeleton |
+| `t` | Plant |
+| `F` | Fence |
+
+Example:
+
+```text
+TTTTTT
+GGAWOG
+GGGGGG
+
+# --- Initial Stats ---
+wood: 0
+food: 9
+drink: 9
+energy: 9
+```
+
+Set `domains.crafter.env_path` to the new file. Crafter reads the map directly from this file; the `env_path` comment in the configuration only means that the path is not used by the generic MiniGrid loader.
+
+### BipedalWalker layout
+
+BipedalWalker uses a one-line sequence of terrain tokens. Each token consists of a terrain type followed by a numeric parameter:
+
+| Token | Meaning |
+| --- | --- |
+| `G<n>` | Grass segment with length/width parameter `n` |
+| `S<n>` | Stump with height `n` |
+| `P<n>` | Pit with width `n` |
+| `T<n>` | Stairs; positive/negative `n` controls direction |
+| `R<n>` | Terrain roughness parameter |
+
+For example:
+
+```text
+G35 S3.61 P4 G5 G5 T3 G5 T-2 G5 R2.86 G5
+```
+
+Tokens may be separated by spaces or split across multiple lines. Lines beginning with `#` are treated as comments. Set `domains.bipedalwalker.task_name` and, if needed, `task_folder` to use a new terrain file:
+
+```yaml
+domains:
+  bipedalwalker:
+    task_group: target
+    task_folder: target_tasks
+    task_name: bipedal_target_task_16
+```
+
+For a custom file outside the default task folders, update `domains.bipedalwalker.env_path` directly. The generated dataset filename changes automatically with the selected task name and data type.
+
 ## Q&A
 
 1. If imports fail, check that the repository is installed in editable mode and that `.env` has been sourced. If a script still requires an absolute path, replace it with the path to your local clone.
