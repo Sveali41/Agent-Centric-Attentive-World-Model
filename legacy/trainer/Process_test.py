@@ -1,7 +1,7 @@
 import os
 from omegaconf import DictConfig
 import Support
-from generator.common.utils import load_gen
+from legacy.generator.common.utils import load_gen
 from modelBased.common.utils import TRAINER_PATH
 import hydra
 from learning_buffer import EnvLearningBuffer
@@ -185,5 +185,4 @@ def run(cfg: DictConfig):
 if __name__ == "__main__":
     run()
     # check_data()  # Uncomment to check data
-
 

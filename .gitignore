@@ -1,7 +1,6 @@
 # Local configuration and secrets
 .env
 .env.*
-!.env.example
 *.local
 *.local.yaml
 *.local.yml
@@ -37,7 +36,7 @@ path/to/logdir/
 
 # Generated model weights and checkpoints
 modelBased/models/
-generator/models/
+legacy/generator/models/
 legacy/trainer/models/
 *.ckpt
 *.pt
@@ -48,7 +47,7 @@ legacy/trainer/models/
 # Generated visualizations and recorded rollouts
 modelBased/visulization/
 modelBased/visualization/
-generator/visualize/
+legacy/generator/visualize/
 visualization/
 visualizations/
 videos/

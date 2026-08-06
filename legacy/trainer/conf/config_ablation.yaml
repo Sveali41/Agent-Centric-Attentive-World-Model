@@ -17,7 +17,7 @@ training_generator:
   map_element: {'E': 1, 'W': 2, 'G':8 , 'K': 5, 'D': 4, 'S': 3} #{'E': 0, 'W': 1, 'K': 2, 'D': 3, 'S': 4, 'G': 5}
   dynamic_objects: [8, 4, 5]
   # map_element: {'W': 0, 'E': 1, 'D': 2, 'G': 3, 'K':4 , 'Y': 5}
-  env_path: ${oc.env:TRAINER_PATH}/level/level.txt
+  env_path: ${oc.env:ENV_PATH}/minigrid/level.txt
   use_wandb: true
   elites_path: ${oc.env:GENERATOR_PATH}/data/grid500_6_6.pkl
   learning_buffer_size: 5000 # 5000
@@ -87,8 +87,8 @@ PPO:
   real_policy_folder: ${oc.env:MODEL_FPATH}
   real_policy_path: None
   # the params for final task path
-  final_task: ${oc.env:TRAINER_PATH}/level/final_task
-  env_path: ${oc.env:TRAINER_PATH}/level/env2_move.txt
+  final_task: ${oc.env:ENV_PATH}/minigrid/final_task
+  env_path: ${oc.env:ENV_PATH}/minigrid/env2_move.txt
 
   # PPO training
   env_type: empty # empty means empty only wall in preprocess no info for keys, lava/door/key/wall/norm

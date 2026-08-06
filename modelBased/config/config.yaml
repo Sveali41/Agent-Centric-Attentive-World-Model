@@ -24,7 +24,7 @@ domains:
     action_norm_values: 17
     # Canonical layout source. Data collection, WM identity checks and policy
     # environment configuration all reference this single field.
-    layout_path: ${oc.env:TRAINER_PATH}/level/crafter/target_tasks/${domains.crafter.task_name}.txt
+    layout_path: ${oc.env:ENV_PATH}/crafter/target_tasks/${domains.crafter.task_name}.txt
     data_save_path: ${oc.env:TRAIN_DATASET_PATH}/crafter_${domains.crafter.task_name}_${env.collect.data_type}.npz
     world_model_checkpoint: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_crafter_${domains.crafter.task_name}.ckpt
     validation_data_dir: ${oc.env:TRAIN_DATASET_PATH}/crafter_train_random_2.npz
@@ -43,7 +43,7 @@ domains:
     obs_norm_values: [10, 5, 3]
     action_norm_values: 7
     # Canonical layout source. Normally only task_name needs to change.
-    layout_path: ${oc.env:PROJECT_ROOT}/level/${domains.minigrid.task_name}.txt
+    layout_path: ${oc.env:ENV_PATH}/minigrid/${domains.minigrid.task_name}.txt
     data_save_path: ${oc.env:TRAIN_DATASET_PATH}/minigrid_${domains.minigrid.task_name}_${env.collect.data_type}.npz
     world_model_checkpoint: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_minigrid_${domains.minigrid.task_name}.ckpt
     validation_data_dir: null
@@ -69,7 +69,7 @@ domains:
     obs_norm_values: [1]
     action_norm_values: 4
     # Canonical layout source. Data collection and downstream stages reuse it.
-    layout_path: ${oc.env:TRAINER_PATH}/level/bipedal_walker/${domains.bipedalwalker.task_folder}/${domains.bipedalwalker.task_name}.txt
+    layout_path: ${oc.env:ENV_PATH}/bipedalwalker/${domains.bipedalwalker.task_folder}/${domains.bipedalwalker.task_name}.txt
     data_save_path: ${oc.env:TRAIN_DATASET_PATH}/bipedalwalker_${domains.bipedalwalker.task_group}_${domains.bipedalwalker.task_name}_${env.collect.data_type}.npz
     validation_data_dir: ${oc.env:TRAIN_DATASET_PATH}/bipedalwalker_${domains.bipedalwalker.validation_task_group}_${domains.bipedalwalker.validation_task_name}_${env.collect.data_type}.npz
     visualize_filename: ${domains.bipedalwalker.task_name}_coverage.png

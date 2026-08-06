@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import pytorch_lightning as pl
-from common.utils import map_value_to_index, map_index_to_value
+from legacy.generator.common.utils import map_value_to_index, map_index_to_value
 
 
 class VAE(pl.LightningModule):
@@ -114,4 +114,3 @@ class VAE(pl.LightningModule):
 
     def configure_optimizers(self):
         return optim.Adam(self.parameters(), lr=self.hparams.lr)
-

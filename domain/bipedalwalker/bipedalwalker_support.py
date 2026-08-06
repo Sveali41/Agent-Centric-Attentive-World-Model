@@ -139,7 +139,7 @@ class BipedalHeuristicPolicy:
         return self.np.clip(a, -1.0, 1.0)
 
 def interpret_env(grid_1d_np, active_width=None):
-    from generator.bipedal_env_designer import bipedal_array_to_layout_str
+    from legacy.generator.bipedal_env_designer import bipedal_array_to_layout_str
     
     layout_str = bipedal_array_to_layout_str(grid_1d_np, active_width=active_width)
     print(f"[Bipedal UED] Generated layout: {layout_str}")

@@ -8,7 +8,7 @@ from matplotlib.colors import LinearSegmentedColormap
 from minigrid.wrappers import FullyObsWrapper
 
 from domain.minigrid.minigrid_custom_env import CustomMiniGridEnv
-from generator.common.utils import (
+from legacy.generator.common.utils import (
     add_outer_wall,
     combine_maps,
     generate_color_map,
@@ -17,7 +17,7 @@ from generator.common.utils import (
     
     
 )
-from generator.data.env_dataset_support import generate_envs_dataset, is_reachable
+from legacy.generator.data.env_dataset_support import generate_envs_dataset, is_reachable
 from modelBased.common import utils, utilis_support
 
 
@@ -94,7 +94,7 @@ def generate_final_task(
 
     file_names = []
     if save:
-        from modelBased.common.utils import TRAINER_PATH
+        from modelBased.common.utils import LEVEL_PATH
 
         for idx, key in enumerate(final_task_dict):
             map_data = final_task_dict[key]
@@ -102,8 +102,8 @@ def generate_final_task(
             layout_string = generate_obj_map(map_tensor, cfg.training_generator.map_element)
             color_string = generate_color_map(layout_string)
             save_path = os.path.join(
-                TRAINER_PATH,
-                "level",
+                LEVEL_PATH,
+                "minigrid",
                 "final_task",
                 f"gen_final_task_{idx}.txt",
             )

@@ -4,11 +4,11 @@ import os
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-from data.datamodule import GenDataModule
-from data.datamodule_vae import VaeDataModule
+from legacy.generator.data.datamodule import GenDataModule
+from legacy.generator.data.datamodule_vae import VaeDataModule
 import hydra
 from modelBased.common.utils import PROJECT_ROOT, get_env
 from omegaconf import DictConfig
@@ -16,11 +16,11 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers.wandb import WandbLogger
-from gen import GAN
+from legacy.generator.gen import GAN
 from modelBased.common.utils import GENERATOR_PATH
 import wandb
-from generator.common.utils import map_index_to_value
-from data.env_dataset_support import *
+from legacy.generator.common.utils import map_index_to_value
+from legacy.generator.data.env_dataset_support import *
 
 @hydra.main(version_base=None, config_path=str(GENERATOR_PATH / "conf"), config_name="config")
 def train(cfg: DictConfig):
@@ -138,7 +138,7 @@ def validate(cfg: DictConfig):
                     generated_maps,
                     count=32,
                     save_flag=True,
-                    save_path=str(PROJECT_ROOT / 'generator' / 'result'),
+                    save_path=str(PROJECT_ROOT / 'legacy' / 'generator' / 'result'),
                 )
 
 if __name__ == "__main__":

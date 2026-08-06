@@ -1,11 +1,11 @@
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from data.env_dataset_support import *
+from legacy.generator.data.env_dataset_support import *
 import numpy as np
 import matplotlib.pyplot as plt
 import os
@@ -14,7 +14,7 @@ import random
 
 
 if __name__ == "__main__":
-    file_path = PROJECT_ROOT / 'generator' / 'data' / 'grid10000.pkl'
+    file_path = PROJECT_ROOT / 'legacy' / 'generator' / 'data' / 'grid10000.pkl'
     dict = load_dic(file_path)
     cnt = len(dict)
     feature_map = np.zeros((cnt, 2))

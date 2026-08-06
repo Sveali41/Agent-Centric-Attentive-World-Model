@@ -1,6 +1,6 @@
 from omegaconf import DictConfig
 import Support
-from generator.common.utils import load_gen
+from legacy.generator.common.utils import load_gen
 from modelBased.common.utils import TRAINER_PATH
 from modelBased.world_model import AttentionWM_training
 from modelBased.policy_training import PPO_world_training

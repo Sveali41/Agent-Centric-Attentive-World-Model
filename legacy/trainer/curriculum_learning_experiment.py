@@ -1,8 +1,8 @@
 from omegaconf import DictConfig
 import Support
-from generator.common.utils import load_gen
+from legacy.generator.common.utils import load_gen
 from domain.minigrid.minigrid_custom_env import CustomMiniGridEnv
-from modelBased.common.utils import TRAINER_PATH, extract_unique_patches, generate_minitasks_until_covered
+from modelBased.common.utils import LEVEL_PATH, TRAINER_PATH, extract_unique_patches, generate_minitasks_until_covered
 from modelBased.world_model import AttentionWM_training
 from modelBased.policy_training import PPO_world_training
 from modelBased.data.data_collect import visualize_agent_coverage, visualize_saved_dataset
@@ -92,7 +92,7 @@ def split_targets_into_minitasks(
 
     for file in target_files:
         env = CustomMiniGridEnv(
-            txt_file_path=TRAINER_PATH / "level" / file,
+            txt_file_path=LEVEL_PATH / "minigrid" / file,
             custom_mission="Find the key and open the door.",
             max_steps=5000,
             render_mode=None
@@ -367,7 +367,7 @@ def collect_data_for_txt(cfg: DictConfig):
 
     collect_data_general(
         cfg,
-        env_source=TRAINER_PATH / 'level' / env_text_file_name,
+        env_source=LEVEL_PATH / 'minigrid' / env_text_file_name,
         save_name=file_name,
         max_steps=1000
     )
@@ -648,7 +648,7 @@ def curriculum_learning_transitions(cfg: DictConfig):
             phase_name = os.path.splitext(phase)[0]
             dataset_path = collect_data_general(
                 cfg,
-                env_source=TRAINER_PATH / "level" / phase,
+                env_source=LEVEL_PATH / "minigrid" / phase,
                 save_name=phase_name,
                 max_steps=10000,
                 maximum_dataset_size=maximum_dataset_size

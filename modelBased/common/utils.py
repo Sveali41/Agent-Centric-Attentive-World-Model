@@ -9,7 +9,7 @@ import torch
 from . import utilis_support
 from typing import Dict
 from matplotlib.colors import LinearSegmentedColormap
-from generator.common.utils import generate_color_map, layout_to_string, combine_maps, add_outer_wall
+from legacy.generator.common.utils import generate_color_map, layout_to_string, combine_maps, add_outer_wall
 import omegaconf
 import torch.serialization
 
@@ -862,6 +862,6 @@ load_envs()
 PROJECT_ROOT : Path = Path(get_env("PROJECT_ROOT"))
 GENERATOR_PATH : Path = Path(get_env("GENERATOR_PATH"))
 TRAINER_PATH : Path = Path(get_env("TRAINER_PATH"))
+LEVEL_PATH : Path = Path(get_env("ENV_PATH"))
 WORLD_MODEL_PATH = Path(get_env("WORLD_MODEL_PATH"))
 sys.path.append(str(PROJECT_ROOT.resolve()))	
-

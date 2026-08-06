@@ -1,5 +1,5 @@
 import torch
-from generator.gen import GAN
+from legacy.generator.gen import GAN
 import random
 import re
 from minigrid.core.constants import IDX_TO_COLOR
@@ -7,13 +7,13 @@ from minigrid.core.constants import IDX_TO_COLOR
 def load_gen(cfg):
     hparams = cfg
     if hparams.training_generator.generator == "deconv":
-        from generator.deconv_gen import Generator, Discriminator
+        from legacy.generator.deconv_gen import Generator, Discriminator
         model = GAN(generator=Generator(hparams.training_generator.z_shape, len(hparams.training_generator.map_element)), 
             discriminator=Discriminator(input_channels = len(hparams.training_generator.map_element)), 
             z_size=hparams.training_generator.z_shape, lr=hparams.training_generator.lr, wd=hparams.training_generator.wd)
         
     elif cfg.training_generator.model == "basic":
-        from generator.basic_gen import Generator, Discriminator
+        from legacy.generator.basic_gen import Generator, Discriminator
         model = GAN(generator=Generator(hparams.basic.z_shape, hparams.basic.dropout), discriminator=Discriminator(hparams.basic.input_channels, hparams.basic.dropout), z_size=hparams.basic.z_shape, lr=0.0002, wd=0.0)
 
     checkpoint = torch.load(hparams.training_generator.validation_path)

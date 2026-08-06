@@ -380,7 +380,7 @@ if __name__ == "__main__":
 
     # 2. generate env from text file
     project_root = Path(__file__).resolve().parents[2]
-    level_path = project_root / "legacy" / "trainer" / "level" / "env1_keydoor.txt"
+    level_path = project_root / "level" / "minigrid" / "env1_keydoor.txt"
     env = FullyObsWrapper(CustomMiniGridEnv(txt_file_path=level_path, 
                                         custom_mission="Find the key and open the door.",
                                         max_steps=5000, render_mode='human'))

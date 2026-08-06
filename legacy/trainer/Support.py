@@ -5,24 +5,24 @@ from pathlib import Path
 ROOTPATH = Path(__file__).resolve().parents[1]
 if str(ROOTPATH) not in sys.path:
     sys.path.insert(0, str(ROOTPATH))
-from modelBased.common.utils import GENERATOR_PATH, TRAINER_PATH
+from modelBased.common.utils import GENERATOR_PATH, LEVEL_PATH, TRAINER_PATH
 from omegaconf import DictConfig
-from generator.common.utils import load_gen, generate_color_map, generate_obj_map, layout_to_string, combine_maps, clean_and_place_goal
-from generator.gen import GAN
+from legacy.generator.common.utils import load_gen, generate_color_map, generate_obj_map, layout_to_string, combine_maps, clean_and_place_goal
+from legacy.generator.gen import GAN
 from domain.minigrid.minigrid_custom_env import *
 import textwrap
 from minigrid.wrappers import FullyObsWrapper, RGBImgObsWrapper
 import torch
 from modelBased.data.data_collect import *
 from modelBased.data.datamodule import *
-# from generator.data.env_dataset_support import generate_valid_minigrid_with_key_door
+# from legacy.generator.data.env_dataset_support import generate_valid_minigrid_with_key_door
 from matplotlib import pyplot as plt
 import pickle
 import random
-from generator.data.env_dataset_support import generate_envs_dataset
-from generator.data.env_dataset_support import replace_vector_value, visualize_grid
+from legacy.generator.data.env_dataset_support import generate_envs_dataset
+from legacy.generator.data.env_dataset_support import replace_vector_value, visualize_grid
 from learning_buffer import EnvLearningBuffer
-from generator.data.env_dataset_support import is_reachable
+from legacy.generator.data.env_dataset_support import is_reachable
 from modelBased.world_model import AttentionWM_training
 from modelBased.policy_training import PPO_world_training
 
@@ -145,13 +145,13 @@ class Support:
                 # visualize_grid(
                 #         map,
                 #         save_flag=True,
-                #         save_path='/home/siyao/project/rlPractice/MiniGrid/trainer/level/final_task_set',
+                #         save_path=LEVEL_PATH / 'minigrid' / 'final_task_set',
                 #         idx=f'map_{idx}'
                 #     )
                 map_tensor = torch.tensor(map).unsqueeze(0)
                 layout_string = generate_obj_map(map_tensor, self.cfg.training_generator.map_element)
                 color_string = generate_color_map(layout_string)
-                save_path = os.path.join(TRAINER_PATH, 'level', 'final_task', f'gen_final_task_{idx}.txt')
+                save_path = os.path.join(LEVEL_PATH, 'minigrid', 'final_task', f'gen_final_task_{idx}.txt')
                 combine_maps(layout_string, color_string, save_path)
                 file_names.append(save_path)
 
@@ -418,7 +418,7 @@ class Support:
         # Load the trained model
         for final_task in final_task_set:
             cfg.PPO.wandb_run_name = f"final_task_{final_task}"
-            cfg.PPO.env_path = os.path.join(TRAINER_PATH, 'level', 'final_task', f'gen_final_task_{final_task}.txt')
+            cfg.PPO.env_path = os.path.join(LEVEL_PATH, 'minigrid', 'final_task', f'gen_final_task_{final_task}.txt')
             PPO_world_training.run_ppo_wm(cfg)
 
     # === Resume save/load ===
@@ -451,7 +451,4 @@ class Support:
         return start_step, old_params, fisher
 
         
-
-
-
 

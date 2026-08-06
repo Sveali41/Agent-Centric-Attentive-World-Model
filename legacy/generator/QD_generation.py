@@ -1,11 +1,11 @@
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from data.env_dataset_support import *
+from legacy.generator.data.env_dataset_support import *
 
 if __name__ == "__main__":
     rows = 6
@@ -19,8 +19,8 @@ if __name__ == "__main__":
                 max_len=1e7,
                 random_gen_max=3e4,
                 save_flag= False,
-                save_path=str(PROJECT_ROOT / 'generator' / 'result'), start_point_flag=False)
+                save_path=str(PROJECT_ROOT / 'legacy' / 'generator' / 'result'), start_point_flag=False)
 
     print("Generated {} maps.".format(len(task_dict)))
     # save the dataset
-    save_dic(task_dict, str(PROJECT_ROOT / 'generator' / 'data' / 'grid500_6_6.pkl'))
+    save_dic(task_dict, str(PROJECT_ROOT / 'legacy' / 'generator' / 'data' / 'grid500_6_6.pkl'))

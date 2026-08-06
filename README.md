@@ -28,9 +28,9 @@ domain: minigrid  # minigrid | crafter | bipedalwalker
 
 The main differences are already defined under `domains:` in the same file:
 
-- **MiniGrid** uses a `3`-channel discrete grid, an attention mask size of `3`, and active level files under `level/`.
-- **Crafter** uses a `2`-channel discrete symbolic grid, an attention mask size of `5`, and custom layouts under `legacy/trainer/level/crafter/`. Its custom environment creates the world from the layout, so `env_path` is kept only for compatibility.
-- **BipedalWalker** uses a normalized continuous state with shape `[1, 1, 24]`, an attention mask size of `5`, and terrain files under `legacy/trainer/level/bipedal_walker/`. Data collection can use either the heuristic behavior policy or a pretrained SB3 policy.
+- **MiniGrid** uses a `3`-channel discrete grid, an attention mask size of `3`, and level files under `level/minigrid/`.
+- **Crafter** uses a `2`-channel discrete symbolic grid, an attention mask size of `5`, and custom layouts under `level/crafter/`. Its custom environment creates the world from the layout, so `env_path` is kept only for compatibility.
+- **BipedalWalker** uses a normalized continuous state with shape `[1, 1, 24]`, an attention mask size of `5`, and terrain files under `level/bipedalwalker/`. Data collection can use either the heuristic behavior policy or a pretrained SB3 policy.
 
 Available task groups include:
 
@@ -61,18 +61,75 @@ MiniGrid, Crafter, and BipedalWalker pipeline. It intentionally does not pin
 transitive packages, Jupyter tooling, or CUDA runtime wheels from one specific
 machine.
 
-3. **Load the repository-local paths before running experiments:**
+3. **Create the local path configuration:**
 
-   ```bash
-   cp .env.example .env
-   # Edit PROJECT_ROOT in .env to point to this clone.
-   source .env
-   ```
+Create a file named `.env` in the repository root. It is ignored by Git and
+must be configured separately on each machine:
 
-The active pipeline lives under `modelBased/`, `domain/`, and `generator/`.
-Older curriculum and continual-learning experiments are retained under
-`legacy/trainer/`; `TRAINER_PATH` points there for compatibility with their
-configs and with the Crafter/BipedalWalker layout collection.
+```bash
+export PROJECT_ROOT="/absolute/path/to/Agent-Centric-Attentive-World-Model"
+
+export ENV_PATH="${PROJECT_ROOT}/level"
+export WORLD_MODEL_PATH="${PROJECT_ROOT}/modelBased"
+export TRAIN_DATASET_PATH="${PROJECT_ROOT}/modelBased/data/train_world_model"
+export MODEL_FPATH="${WORLD_MODEL_PATH}/models"
+
+export GENERATOR_PATH="${PROJECT_ROOT}/legacy/generator"
+export GENERATOR_MODEL_PATH="${GENERATOR_PATH}/models/ckpt"
+export TRAINER_PATH="${PROJECT_ROOT}/legacy/trainer"
+export TRAINER_MODEL_PATH="${TRAINER_PATH}/models/ckpt"
+```
+
+Normally, only `PROJECT_ROOT` needs to be changed. All other paths are derived
+from it. Load the variables in every new terminal before running the project:
+
+```bash
+source .env
+```
+
+The active pipeline lives under `modelBased/` and `domain/`. Older curriculum,
+continual-learning, and environment-generator experiments are retained under
+`legacy/trainer/` and `legacy/generator/`. `TRAINER_PATH` and `GENERATOR_PATH`
+point there for compatibility with the archived code. All active environment
+layouts are selected through `ENV_PATH`.
+
+4. **Select the environment to run:**
+
+Edit `modelBased/config/config.yaml`. Set the top-level `domain`, then change
+the `task_name` under the matching domain to a filename stem from its level
+folder:
+
+```yaml
+domain: minigrid  # minigrid | crafter | bipedalwalker
+
+domains:
+  minigrid:
+    task_name: Grid_11_11_KD_level1
+    layout_path: ${oc.env:ENV_PATH}/minigrid/${domains.minigrid.task_name}.txt
+```
+
+The domain layout folders are:
+
+```text
+minigrid       -> level/minigrid/
+crafter        -> level/crafter/target_tasks/
+bipedalwalker  -> level/bipedalwalker/target_tasks/
+```
+
+For MiniGrid policy training, use the same config file to select the transition
+source:
+
+```yaml
+PPO:
+  train_in_real_env: false  # false: plan/train in WM; true: model-free real env
+```
+
+Then run the configured environment with:
+
+```bash
+source .env
+python run_pipeline.py
+```
 
 All documented entry points add the repository root automatically, so they can be run from the repository root with either direct script syntax or Python module syntax. Module syntax is also supported:
 
@@ -183,7 +240,7 @@ domains:
   minigrid:
     # Switch the MiniGrid task here. Use the layout .txt filename without .txt.
     task_name: simple_test
-    layout_path: ${oc.env:PROJECT_ROOT}/level/${domains.minigrid.task_name}.txt
+    layout_path: ${oc.env:ENV_PATH}/minigrid/${domains.minigrid.task_name}.txt
 
 PPO:
   train_in_real_env: true
@@ -194,12 +251,12 @@ Switch MiniGrid environments at `domains.minigrid.task_name` in
 the `.txt` extension**:
 
 ```text
-level/simple_test.txt              -> task_name: simple_test
-level/Grid_11_11_KD_level1.txt     -> task_name: Grid_11_11_KD_level1
+level/minigrid/simple_test.txt              -> task_name: simple_test
+level/minigrid/Grid_11_11_KD_level1.txt     -> task_name: Grid_11_11_KD_level1
 ```
 
 This is normally the only field that needs to change. `task_name` is the
-canonical task identifier: it selects `level/<task_name>.txt` and is reused in
+canonical task identifier: it selects `level/minigrid/<task_name>.txt` and is reused in
 dataset, world-model checkpoint, policy-checkpoint, and visualization
 filenames. Policy training and testing both resolve the same `layout_path`.
 
@@ -278,15 +335,22 @@ not change the observation.
 
 ## Recommended Workflow by Domain
 
-For **MiniGrid**, choose a text layout in `level/`, set `domain: minigrid`, and use the discrete world-model pipeline. This is the simplest domain for checking grid transitions and key-door or obstacle behavior.
+For **MiniGrid**, choose a text layout in `level/minigrid/`, set `domain: minigrid`, and use the discrete world-model pipeline. This is the simplest domain for checking grid transitions and key-door or obstacle behavior.
 
-For **Crafter**, choose a layout from `legacy/trainer/level/crafter/`, set `domain: crafter`, and keep `env.crafter.stochastic: false` for deterministic initial experiments. Set it to `true` when evaluating robustness to moving entities and stochastic behavior.
+For **Crafter**, choose a layout from `level/crafter/`, set `domain: crafter`, and keep `env.crafter.stochastic: false` for deterministic initial experiments. Set it to `true` when evaluating robustness to moving entities and stochastic behavior.
 
-For **BipedalWalker**, choose a terrain from `legacy/trainer/level/bipedal_walker/`, set `domain: bipedalwalker`, and use normalized data. The default `behavior_policy: heuristic` is suitable for initial data collection; set `behavior_policy: pretrained_sb3` and provide `sb3_model_path` when using a trained continuous-control policy.
+For **BipedalWalker**, choose a terrain from `level/bipedalwalker/`, set `domain: bipedalwalker`, and use normalized data. The default `behavior_policy: heuristic` is suitable for initial data collection; set `behavior_policy: pretrained_sb3` and provide `sb3_model_path` when using a trained continuous-control policy.
 
 ## Configuring Environment Layouts
 
 Each domain uses a different layout format. After creating or selecting a layout file, update the matching values under `domains.<domain>` in `modelBased/config/config.yaml`.
+
+```text
+level/
+├── minigrid/
+├── crafter/
+└── bipedalwalker/
+```
 
 ### MiniGrid layout
 
@@ -295,7 +359,7 @@ MiniGrid files contain two equally sized blocks separated by one empty line:
 1. An object layout.
 2. A color layout with the same dimensions.
 
-For example, `level/Grid_11_11_KD_level1.txt` uses symbols such as:
+For example, `level/minigrid/Grid_11_11_KD_level1.txt` uses symbols such as:
 
 | Symbol | Meaning |
 | --- | --- |
@@ -324,9 +388,9 @@ WEEGW
 WWWWW
 ```
 
-Put the new file under `level/`, then switch the task in
+Put the new file under `level/minigrid/`, then switch the task in
 `modelBased/config/config.yaml`. The `task_name` must match the `.txt` filename
-without its extension. For example, `level/my_layout.txt` requires:
+without its extension. For example, `level/minigrid/my_layout.txt` requires:
 
 ```yaml
 domains:
@@ -343,7 +407,12 @@ python -m modelBased.data.data_collect \
   domains.minigrid.task_name=my_layout
 ```
 
-For a layout outside the default `level/` directory, override
+The former trainer directory contained different files with the same
+`Grid_11_11_KD_level1/2/3.txt` names. Those older variants are preserved under
+`level/minigrid/legacy_variants/`; the files directly under `level/minigrid/`
+remain the canonical layouts selected by `task_name`.
+
+For a layout outside the default `level/minigrid/` directory, override
 `domains.minigrid.layout_path` explicitly. In that exceptional case, also set a
 matching `task_name` so generated artifacts remain identifiable.
 
@@ -388,7 +457,7 @@ drink: 9
 energy: 9
 ```
 
-Place the file under `legacy/trainer/level/crafter/target_tasks/` and set
+Place the file under `level/crafter/target_tasks/` and set
 `domains.crafter.task_name` to its filename stem. Crafter's `layout_path`,
 dataset, checkpoints, and visualization filenames are derived from that name.
 Override `domains.crafter.layout_path` only for a file outside the default

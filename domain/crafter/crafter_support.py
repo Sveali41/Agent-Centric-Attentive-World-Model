@@ -28,7 +28,7 @@ def _to_nchw(obs: np.ndarray) -> np.ndarray:
 def interpret_env(terrain_map, cfg, inventory_vec=None):
     import torch
     import numpy as np
-    from generator.crafter_env_designer import CRAFTER_OBJ_MAP
+    from legacy.generator.crafter_env_designer import CRAFTER_OBJ_MAP
     
     # Handle inputs
     if isinstance(terrain_map, torch.Tensor):
