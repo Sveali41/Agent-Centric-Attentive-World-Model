@@ -157,22 +157,46 @@ domain: minigrid
 
 domains:
   minigrid:
+    # Switch the MiniGrid task here. Use the layout .txt filename without .txt.
     task_name: simple_test
-    layout_path: ${oc.env:PROJECT_ROOT}/level/simple_test.txt
+    layout_path: ${oc.env:PROJECT_ROOT}/level/${domains.minigrid.task_name}.txt
 
 PPO:
   train_in_real_env: true
 ```
 
-`domains.minigrid.layout_path` selects the real MiniGrid environment used by
-both policy training and testing. Change `task_name` together with the layout
-so that a new environment does not reuse a checkpoint name from an older task.
+Switch MiniGrid environments at `domains.minigrid.task_name` in
+`modelBased/config/config.yaml`. Set it to the layout text filename **without
+the `.txt` extension**:
+
+```text
+level/simple_test.txt              -> task_name: simple_test
+level/Grid_11_11_KD_level1.txt     -> task_name: Grid_11_11_KD_level1
+```
+
+This is normally the only field that needs to change. `task_name` is the
+canonical task identifier: it selects `level/<task_name>.txt` and is reused in
+dataset, world-model checkpoint, policy-checkpoint, and visualization
+filenames. Policy training and testing both resolve the same `layout_path`.
 
 Run model-free PPO directly with:
 
 ```bash
+wandb login  # required once per machine
 python -m modelBased.policy_training.PPO_world_training domain=minigrid
 ```
+
+With `PPO.use_wandb=true`, every episode records `episode/reward`,
+`episode/success`, and `episode/steps`. Smoothed training statistics are logged
+as `rolling/average_reward`, `rolling/success_rate`, and
+`rolling/average_episode_steps`; PPO update loss and gradient statistics are
+stored under `ppo/`. The rolling curves use the latest
+`PPO.rolling_window_episodes` episodes (50 by default), not a fixed timestep
+bucket. A converged policy should show a stable reward curve, success rate close
+to 100%, and episode steps decreasing to a stable range.
+WandB prints the run URL in the terminal but does not necessarily open a web
+browser automatically. The same `PPO.use_wandb` setting is respected when
+training through `run_pipeline.py`.
 
 The same settings can be supplied without editing the YAML file:
 
@@ -180,8 +204,7 @@ The same settings can be supplied without editing the YAML file:
 python -m modelBased.policy_training.PPO_world_training \
   domain=minigrid \
   PPO.train_in_real_env=true \
-  domains.minigrid.task_name=simple_test \
-  domains.minigrid.layout_path=${PROJECT_ROOT}/level/simple_test.txt
+  domains.minigrid.task_name=simple_test
 ```
 
 When using the complete pipeline, `PPO.train_in_real_env=true` also tells
@@ -262,13 +285,28 @@ WEEGW
 WWWWW
 ```
 
-Point `domains.minigrid.env_path` to the new file. The file path can also be changed temporarily from the command line:
+Put the new file under `level/`, then switch the task in
+`modelBased/config/config.yaml`. The `task_name` must match the `.txt` filename
+without its extension. For example, `level/my_layout.txt` requires:
+
+```yaml
+domains:
+  minigrid:
+    # Switch the active layout here.
+    task_name: my_layout
+```
+
+The same selection can be made temporarily from the command line:
 
 ```bash
-python modelBased/data/data_collect.py \
+python -m modelBased.data.data_collect \
   domain=minigrid \
-  domains.minigrid.env_path=/path/to/my_minigrid_layout.txt
+  domains.minigrid.task_name=my_layout
 ```
+
+For a layout outside the default `level/` directory, override
+`domains.minigrid.layout_path` explicitly. In that exceptional case, also set a
+matching `task_name` so generated artifacts remain identifiable.
 
 ### Crafter layout
 
@@ -311,7 +349,11 @@ drink: 9
 energy: 9
 ```
 
-Set `domains.crafter.env_path` to the new file. Crafter reads the map directly from this file; the `env_path` comment in the configuration only means that the path is not used by the generic MiniGrid loader.
+Place the file under `trainer/level/crafter/target_tasks/` and set
+`domains.crafter.task_name` to its filename stem. Crafter's `layout_path`,
+dataset, checkpoints, and visualization filenames are derived from that name.
+Override `domains.crafter.layout_path` only for a file outside the default
+folder.
 
 ### BipedalWalker layout
 
@@ -341,7 +383,9 @@ domains:
     task_name: bipedal_target_task_16
 ```
 
-For a custom file outside the default task folders, update `domains.bipedalwalker.env_path` directly. The generated dataset filename changes automatically with the selected task name and data type.
+For a custom file outside the default task folders, update
+`domains.bipedalwalker.layout_path` directly. The generated dataset filename
+changes automatically with the selected task name and data type.
 
 ## Q&A
 
@@ -349,4 +393,7 @@ For a custom file outside the default task folders, update `domains.bipedalwalke
 
 2. If a dataset, checkpoint, or level cannot be found, verify the paths in `.env`, especially `PROJECT_ROOT`, `TRAINER_PATH`, `TRAIN_DATASET_PATH`, and `MODEL_FPATH`.
 
-3. For a different task, update the corresponding values under `domains.<domain>` in `modelBased/config/config.yaml`, such as `env_path`, `task_name`, `task_folder`, or `validation_task_name`.
+3. For a different task in a default task folder, change
+   `domains.<domain>.task_name`; the layout, dataset, visualization, and
+   checkpoint paths are derived from it. Override `layout_path` only when the
+   layout is outside its default folder.

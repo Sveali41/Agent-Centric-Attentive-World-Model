@@ -1,4 +1,5 @@
 import sys
+from collections import deque
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -239,9 +240,9 @@ def run_ppo_wm(cfg):
     action_std_decay_rate = hparams_PPO.action_std_decay_rate
     min_action_std = hparams_PPO.min_action_std
     action_std_decay_freq = hparams_PPO.action_std_decay_freq
-    max_training_timesteps = hparams_PPO.max_training_timesteps
-    save_model_freq = hparams_PPO.save_model_freq
-    max_ep_len = hparams_PPO.max_ep_len
+    max_training_timesteps = int(hparams_PPO.max_training_timesteps)
+    save_model_freq = int(hparams_PPO.save_model_freq)
+    max_ep_len = int(hparams_PPO.max_ep_len)
     has_continuous_action_space = hparams_PPO.has_continuous_action_space
     checkpoint_path = hparams_PPO.checkpoint_path
     env_path = hparams_PPO.env_path
@@ -249,11 +250,22 @@ def run_ppo_wm(cfg):
     env_type =  hparams_PPO.env_type
     use_wandb = hparams_PPO.use_wandb
     wandb_run_name = hparams_PPO.wandb_run_name
+    update_timestep = int(getattr(hparams_PPO, "rollout_steps", 1024))
+    if update_timestep < 2:
+        raise ValueError("PPO.rollout_steps must be at least 2")
+    entropy_coef = float(getattr(hparams_PPO, "entropy_coef", 0.01))
+    normalize_advantages = bool(getattr(hparams_PPO, "normalize_advantages", True))
+    normalize_returns = bool(getattr(hparams_PPO, "normalize_returns", False))
+    max_grad_norm = float(getattr(hparams_PPO, "max_grad_norm", 0.5))
+    rolling_window_episodes = int(
+        getattr(hparams_PPO, "rolling_window_episodes", 50)
+    )
+    if rolling_window_episodes < 1:
+        raise ValueError("PPO.rolling_window_episodes must be at least 1")
     
 
     if use_wandb:
-        wandb.login(key="eeecc8f761c161927a5713203b0362dfcb3181c4")
-        sub_run = wandb.init(project='Trainer_policy', entity='18920011663-king-s-college-london',name=wandb_run_name, reinit=True)
+        sub_run = _init_policy_wandb_run(cfg, default_project="minigrid_policy_training")
     else:
         sub_run = None
 
@@ -264,13 +276,18 @@ def run_ppo_wm(cfg):
     # 3. Real environment
     env = FullyObsWrapper(
         CustomMiniGridEnv(txt_file_path=env_path, custom_mission="Find the key and open the door.",
-                        max_steps=4000, render_mode=None))
+                        max_steps=max_ep_len, render_mode=None))
     # 4. Initialize training
     i_episode = 0
-    update_timestep = max_ep_len   # update policy every n timesteps
-    print_freq = max_ep_len * 2
+    print_freq = 1000
     print_running_reward = 0
     print_running_episodes = 0
+    print_running_steps = 0
+    print_running_successes = 0
+    next_print_timestep = print_freq
+    recent_rewards = deque(maxlen=rolling_window_episodes)
+    recent_steps = deque(maxlen=rolling_window_episodes)
+    recent_successes = deque(maxlen=rolling_window_episodes)
     time_step = 0
     step_penalty = float(getattr(hparams_PPO, "step_penalty", 0.0))
     final_norm_regret = None
@@ -285,8 +302,21 @@ def run_ppo_wm(cfg):
         # excluded during data collection and are mapped only at env.step().
         action_dim = MODEL_ACTION_COUNT
     state_dim = np.prod(env.observation_space['image'].shape)
-    ppo_agent = PPO(state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, has_continuous_action_space,
-                    action_std)
+    ppo_agent = PPO(
+        state_dim,
+        action_dim,
+        lr_actor,
+        lr_critic,
+        gamma,
+        K_epochs,
+        eps_clip,
+        has_continuous_action_space,
+        action_std,
+        entropy_coef=entropy_coef,
+        normalize_advantages=normalize_advantages,
+        normalize_returns=normalize_returns,
+        max_grad_norm=max_grad_norm,
+    )
     if compute_regret:
         real_policy_agent = PPO(state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip,
                         has_continuous_action_space, action_std)
@@ -295,9 +325,10 @@ def run_ppo_wm(cfg):
     
 
     # training loop
-    while time_step <= max_training_timesteps:
+    done = False
+    state_0 = None
+    while time_step < max_training_timesteps:
 
-        print(f'time step: {time_step}')
         state_init = env.reset()[0]['image']
         if time_step == 0 and sub_run is not None:
             img = env.get_frame()
@@ -306,8 +337,7 @@ def run_ppo_wm(cfg):
         goal_position_yx = find_position(state_0, (8, 1, 0)) # find the goal position
         current_ep_reward = 0
         info = {'carrying_key': False}
-        for t in range(1, int(max_ep_len + 1)):
-            need_update = False
+        for t in range(1, max_ep_len + 1):
             # self.buffer.states = [state.squeeze(0) if state.dim() > 1 else state for state in self.buffer.states]
             if t==1:
                 # state = utils.normalize_obs(state_0, hparams_world_model.obs_norm_values)
@@ -367,8 +397,13 @@ def run_ppo_wm(cfg):
                 
             state_0 = state_pre
             # obtain reward from the state representation & done
-            done, reward = get_destination(state_0, t, max_ep_len, goal_position_yx)
+            reached_goal, reward = get_destination(
+                state_0, t, max_ep_len, goal_position_yx
+            )
             reward += step_penalty
+            # Match Gymnasium's real-env semantics: the horizon is a terminal
+            # truncation for the trajectory even when the goal was not reached.
+            done = reached_goal or t == max_ep_len
             # saving reward and is_terminals
             ppo_agent.save_buffer(state_buffer, action_buffer, action_logprob, state_val, reward, done)
             
@@ -376,45 +411,124 @@ def run_ppo_wm(cfg):
             time_step += 1
             current_ep_reward += reward
     
-            # Update is triggered periodically or at episode end
-            if time_step % update_timestep == 0 or done or t >= max_ep_len:
-                need_update = True
+            # Use the same fixed-size rollout/update schedule as direct
+            # real-environment training. Episode boundaries stay in the buffer.
+            if time_step % update_timestep == 0:
+                if len(ppo_agent.buffer.rewards) > 1:
+                    next_state_norm = utils.normalize_obs(
+                        state_0.clone(), hparams_world_model.obs_norm_values
+                    ).flatten()
+                    bootstrap_value = (
+                        0.0
+                        if done
+                        else ppo_agent.estimate_old_value(next_state_norm)
+                    )
+                    update_metrics = ppo_agent.update(
+                        bootstrap_value=bootstrap_value
+                    )
+                    if sub_run is not None and update_metrics.get("updated", False):
+                        sub_run.log(
+                            {
+                                "ppo/loss": update_metrics["loss"],
+                                "ppo/grad_norm": update_metrics["grad_norm"],
+                                "ppo/parameter_delta": update_metrics["parameter_delta"],
+                                "ppo/rollout_size": update_metrics["rollout_size"],
+                                "ppo/update_count": update_metrics["update_count"],
+                            },
+                            step=time_step,
+                        )
 
-            if need_update:
-                rollout_size = len(ppo_agent.buffer.rewards)
-                if rollout_size >= 2:
-                    ppo_agent.update()
-                else:
-                    if rollout_size > 0:
-                        print(f"[PPO SKIP] Rollout too short ({rollout_size} sample); skipping update.")
-                    ppo_agent.buffer.clear()
-                need_update = False
+            if has_continuous_action_space and time_step % action_std_decay_freq == 0:
+                ppo_agent.decay_action_std(action_std_decay_rate, min_action_std)
 
             if time_step % save_model_freq == 0:
                 print("--------------------------------------------------------------------------------------------")
                 print("saving model at : " + checkpoint_path)
                 ppo_agent.save(checkpoint_path)
                 print("model saved")
+                print("Elapsed Time  : ", datetime.now().replace(microsecond=0) - start_time)
                 print("--------------------------------------------------------------------------------------------")
 
-            if done or t >= max_ep_len:
+            budget_exhausted = time_step >= max_training_timesteps
+            if done or budget_exhausted:
                 break
 
         print_running_reward += current_ep_reward
         print_running_episodes += 1
+        print_running_steps += t
+        success = int(reached_goal)
+        print_running_successes += success
+        recent_rewards.append(float(current_ep_reward))
+        recent_steps.append(int(t))
+        recent_successes.append(success)
 
-        if time_step % print_freq < max_ep_len and print_running_episodes > 0:
+        rolling_avg_reward = sum(recent_rewards) / len(recent_rewards)
+        rolling_avg_steps = sum(recent_steps) / len(recent_steps)
+        rolling_success_rate = sum(recent_successes) / len(recent_successes)
+
+        if sub_run is not None:
+            sub_run.log(
+                {
+                    "episode/reward": current_ep_reward,
+                    "episode/success": success,
+                    "episode/steps": t,
+                    "episode/index": i_episode,
+                    "rolling/average_reward": rolling_avg_reward,
+                    "rolling/success_rate": rolling_success_rate,
+                    "rolling/average_episode_steps": rolling_avg_steps,
+                    "rolling/window_episode_count": len(recent_rewards),
+                },
+                step=time_step,
+            )
+
+        if time_step >= next_print_timestep and print_running_episodes > 0:
             print_avg_reward = print_running_reward / print_running_episodes
-            if use_wandb:
-                sub_run.log({"average_reward": print_avg_reward})
-            print(f"Episode : {i_episode} \t Timestep : {time_step} \t Average Reward : {print_avg_reward:.4f}")
+            print_avg_steps = print_running_steps / print_running_episodes
+            print_success_rate = print_running_successes / print_running_episodes
+            print(
+                f"Episode : {i_episode} \t Timestep : {time_step} \t "
+                f"Interval Reward : {print_avg_reward:.5f} \t "
+                f"Interval Success : {print_success_rate:.1%} \t "
+                f"Interval Steps : {print_avg_steps:.1f} \t "
+                f"Rolling({len(recent_rewards)}) Reward : {rolling_avg_reward:.5f} \t "
+                f"Success : {rolling_success_rate:.1%} \t "
+                f"Steps : {rolling_avg_steps:.1f}"
+            )
             print_running_reward = 0
             print_running_episodes = 0
+            print_running_steps = 0
+            print_running_successes = 0
+            while next_print_timestep <= time_step:
+                next_print_timestep += print_freq
 
         i_episode += 1
-    
+
+    # Train once more on the partial fixed-size rollout at the budget boundary.
+    if len(ppo_agent.buffer.rewards) >= 2:
+        next_state_norm = utils.normalize_obs(
+            state_0.clone(), hparams_world_model.obs_norm_values
+        ).flatten()
+        bootstrap_value = (
+            0.0 if done else ppo_agent.estimate_old_value(next_state_norm)
+        )
+        update_metrics = ppo_agent.update(bootstrap_value=bootstrap_value)
+        if sub_run is not None and update_metrics.get("updated", False):
+            sub_run.log(
+                {
+                    "ppo/loss": update_metrics["loss"],
+                    "ppo/grad_norm": update_metrics["grad_norm"],
+                    "ppo/parameter_delta": update_metrics["parameter_delta"],
+                    "ppo/rollout_size": update_metrics["rollout_size"],
+                    "ppo/update_count": update_metrics["update_count"],
+                },
+                step=time_step,
+            )
+    else:
+        ppo_agent.buffer.clear()
+
     # Final save after loop completes
     ppo_agent.save(checkpoint_path)
+    print(f"Final policy saved at: {checkpoint_path}")
     env.close()
     if use_wandb:
         sub_run.finish()
@@ -425,6 +539,29 @@ def run_ppo_wm(cfg):
 @hydra.main(version_base=None, config_path=str(PROJECT_ROOT / "modelBased/config"), config_name="config")
 def training_agent_real_env(cfg: DictConfig):
     run_training_real_env(cfg)
+
+def _init_policy_wandb_run(cfg, default_project):
+    """Initialize WandB from the user's login without embedding credentials."""
+    ppo_cfg = cfg.PPO
+    wandb.login()
+    init_kwargs = {
+        "project": str(getattr(ppo_cfg, "wandb_project", default_project)),
+        "name": str(ppo_cfg.wandb_run_name),
+        "reinit": True,
+        "config": {
+            "domain": str(cfg.domain),
+            "task_name": str(cfg.domains[str(cfg.domain)].task_name),
+            "train_in_real_env": bool(ppo_cfg.train_in_real_env),
+            "max_ep_len": int(ppo_cfg.max_ep_len),
+            "rollout_steps": int(getattr(ppo_cfg, "rollout_steps", 1024)),
+            "max_training_timesteps": int(ppo_cfg.max_training_timesteps),
+        },
+    }
+    entity = getattr(ppo_cfg, "wandb_entity", None)
+    if entity:
+        init_kwargs["entity"] = str(entity)
+    return wandb.init(**init_kwargs)
+
 
 def run_training_real_env(cfg):
     # parameters
@@ -443,6 +580,14 @@ def run_training_real_env(cfg):
     print_running_steps = 0
     print_running_successes = 0
     next_print_timestep = print_freq
+    rolling_window_episodes = int(
+        getattr(hparams_PPO, "rolling_window_episodes", 50)
+    )
+    if rolling_window_episodes < 1:
+        raise ValueError("PPO.rolling_window_episodes must be at least 1")
+    recent_rewards = deque(maxlen=rolling_window_episodes)
+    recent_steps = deque(maxlen=rolling_window_episodes)
+    recent_successes = deque(maxlen=rolling_window_episodes)
     start_time = datetime.now().replace(microsecond=0)
     env_type =  hparams_PPO.env_type
     wandb_run_name = hparams_PPO.wandb_run_name
@@ -472,8 +617,7 @@ def run_training_real_env(cfg):
     max_grad_norm = float(getattr(hparams_PPO, "max_grad_norm", 0.5))
 
     if use_wandb:
-        wandb.login(key="eeecc8f761c161927a5713203b0362dfcb3181c4")
-        subrun = wandb.init(project='final_task_policy', entity='18920011663-king-s-college-london', name=wandb_run_name, reinit=True)
+        subrun = _init_policy_wandb_run(cfg, default_project="minigrid_policy_training")
 
 
     # state space dimension
@@ -533,7 +677,18 @@ def run_training_real_env(cfg):
             if time_step % update_timestep == 0:
                 if len(ppo_agent.buffer.rewards) > 1:
                     bootstrap_value = 0.0 if done else ppo_agent.estimate_old_value(state)
-                    ppo_agent.update(bootstrap_value=bootstrap_value)
+                    update_metrics = ppo_agent.update(bootstrap_value=bootstrap_value)
+                    if use_wandb and update_metrics.get("updated", False):
+                        subrun.log(
+                            {
+                                "ppo/loss": update_metrics["loss"],
+                                "ppo/grad_norm": update_metrics["grad_norm"],
+                                "ppo/parameter_delta": update_metrics["parameter_delta"],
+                                "ppo/rollout_size": update_metrics["rollout_size"],
+                                "ppo/update_count": update_metrics["update_count"],
+                            },
+                            step=time_step,
+                        )
 
             # if continuous action space; then decay action std of ouput action distribution
             if has_continuous_action_space and time_step % action_std_decay_freq == 0:
@@ -555,23 +710,41 @@ def run_training_real_env(cfg):
         print_running_episodes += 1
         print_running_steps += t
         print_running_successes += int(current_ep_reward > 0.0)
+        recent_rewards.append(float(current_ep_reward))
+        recent_steps.append(int(t))
+        recent_successes.append(int(current_ep_reward > 0.0))
+
+        rolling_avg_reward = sum(recent_rewards) / len(recent_rewards)
+        rolling_avg_steps = sum(recent_steps) / len(recent_steps)
+        rolling_success_rate = sum(recent_successes) / len(recent_successes)
+
+        if use_wandb:
+            subrun.log(
+                {
+                    "episode/reward": current_ep_reward,
+                    "episode/success": int(current_ep_reward > 0.0),
+                    "episode/steps": t,
+                    "episode/index": i_episode,
+                    "rolling/average_reward": rolling_avg_reward,
+                    "rolling/success_rate": rolling_success_rate,
+                    "rolling/average_episode_steps": rolling_avg_steps,
+                    "rolling/window_episode_count": len(recent_rewards),
+                },
+                step=time_step,
+            )
 
         if time_step >= next_print_timestep and print_running_episodes > 0:
             print_avg_reward = print_running_reward / print_running_episodes
             print_avg_steps = print_running_steps / print_running_episodes
             print_success_rate = print_running_successes / print_running_episodes
-            metrics = {
-                "average_reward": print_avg_reward,
-                "average_episode_steps": print_avg_steps,
-                "success_rate": print_success_rate,
-            }
-            if use_wandb:
-                subrun.log(metrics, step=time_step)
             print(
                 f"Episode : {i_episode} \t Timestep : {time_step} \t "
-                f"Average Reward : {print_avg_reward:.5f} \t "
-                f"Success Rate : {print_success_rate:.1%} \t "
-                f"Average Steps : {print_avg_steps:.1f}"
+                f"Interval Reward : {print_avg_reward:.5f} \t "
+                f"Interval Success : {print_success_rate:.1%} \t "
+                f"Interval Steps : {print_avg_steps:.1f} \t "
+                f"Rolling({len(recent_rewards)}) Reward : {rolling_avg_reward:.5f} \t "
+                f"Success : {rolling_success_rate:.1%} \t "
+                f"Steps : {rolling_avg_steps:.1f}"
             )
             print_running_reward = 0
             print_running_episodes = 0
@@ -585,7 +758,18 @@ def run_training_real_env(cfg):
     # Fixed-size rollouts may leave one partial batch at the end of training.
     if len(ppo_agent.buffer.rewards) >= 2:
         bootstrap_value = 0.0 if done else ppo_agent.estimate_old_value(state)
-        ppo_agent.update(bootstrap_value=bootstrap_value)
+        update_metrics = ppo_agent.update(bootstrap_value=bootstrap_value)
+        if use_wandb and update_metrics.get("updated", False):
+            subrun.log(
+                {
+                    "ppo/loss": update_metrics["loss"],
+                    "ppo/grad_norm": update_metrics["grad_norm"],
+                    "ppo/parameter_delta": update_metrics["parameter_delta"],
+                    "ppo/rollout_size": update_metrics["rollout_size"],
+                    "ppo/update_count": update_metrics["update_count"],
+                },
+                step=time_step,
+            )
     else:
         ppo_agent.buffer.clear()
 

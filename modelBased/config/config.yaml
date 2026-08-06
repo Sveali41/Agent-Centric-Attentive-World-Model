@@ -3,7 +3,7 @@ domain: minigrid  # crafter | minigrid | bipedalwalker
 pipeline:
   label: ${domain}  # minigrid | crafter | bipedalwalker | full
   force: false
-  force_policy: True  # Retrain only policy; keep the matching dataset and WM.
+  force_policy: false  # Retrain only policy; keep the matching dataset and WM.
   skip_policy: false
   domains:
     minigrid:
@@ -24,12 +24,12 @@ domains:
     action_norm_values: 17
     # Canonical layout source. Data collection, WM identity checks and policy
     # environment configuration all reference this single field.
-    layout_path: ${oc.env:TRAINER_PATH}/level/crafter/target_tasks/crafter_target_task_1.txt
+    layout_path: ${oc.env:TRAINER_PATH}/level/crafter/target_tasks/${domains.crafter.task_name}.txt
     data_save_path: ${oc.env:TRAIN_DATASET_PATH}/crafter_${domains.crafter.task_name}_${env.collect.data_type}.npz
     world_model_checkpoint: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_crafter_${domains.crafter.task_name}.ckpt
     validation_data_dir: ${oc.env:TRAIN_DATASET_PATH}/crafter_train_random_2.npz
-    visualize_filename: crafter_target_task_diamond_random_coverage.png
-    env_visualize_filename: crafter_target_task_diamond_random_env.png
+    visualize_filename: ${domains.crafter.task_name}_${env.collect.data_type}_coverage.png
+    env_visualize_filename: ${domains.crafter.task_name}_${env.collect.data_type}_env.png
     use_bipedal_attention: false
     wm_data_type: discrete
     use_weighted_loss: false
@@ -42,13 +42,13 @@ domains:
     attention_mask_size: 3
     obs_norm_values: [10, 5, 3]
     action_norm_values: 7
-    # Canonical layout source. Change this path once when changing the task.
-    layout_path: ${oc.env:PROJECT_ROOT}/level/simple_test.txt
+    # Canonical layout source. Normally only task_name needs to change.
+    layout_path: ${oc.env:PROJECT_ROOT}/level/${domains.minigrid.task_name}.txt
     data_save_path: ${oc.env:TRAIN_DATASET_PATH}/minigrid_${domains.minigrid.task_name}_${env.collect.data_type}.npz
     world_model_checkpoint: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_minigrid_${domains.minigrid.task_name}.ckpt
     validation_data_dir: null
-    visualize_filename: minigrid_train_random_coverage.png
-    env_visualize_filename: minigrid_train_random_env.png
+    visualize_filename: ${domains.minigrid.task_name}_${env.collect.data_type}_coverage.png
+    env_visualize_filename: ${domains.minigrid.task_name}_${env.collect.data_type}_env.png
     use_bipedal_attention: false
     wm_data_type: discrete
     use_weighted_loss: false
@@ -177,12 +177,19 @@ env:
 
 # 4. PPO model
 PPO:
-  train_in_real_env: True
+  # This is the only training-source switch. All PPO settings below are shared:
+  # True = direct environment transitions; False = world-model transitions.
+  train_in_real_env: False
   env_type: ${domains.${domain}.env_type}
   has_continuous_action_space: False
-  # Shared real-env training/evaluation horizon. Keeping this tight prevents a
-  # random walk in a tiny map from looking like a high-performing policy.
-  max_ep_len: 256
+  # Maximum actions before an unfinished episode resets. Increase this with
+  # task size/complexity: 6x5=128-256, simple 11x11=512-1000,
+  # key-door 11x11=1000-2000, 21x21=2000-4000. A useful rule is 5-10x the
+  # shortest feasible solution length; avoid oversized values because random
+  # walks can then achieve deceptively high MiniGrid rewards. Keep
+  # rollout_steps roughly 2-4x max_ep_len so each PPO update sees multiple
+  # episodes.
+  max_ep_len: 1000
   action_std: 0.1  # set same std for action distribution which was used while saving
   i_episode: 0
   K_epochs: 8  # update policy for K epochs
@@ -190,7 +197,7 @@ PPO:
   gamma: 0.99  # discount factor
   # Standard PPO rollout/update settings. A rollout spans multiple episodes;
   # never run eight optimizer epochs on a single 3- or 4-step episode.
-  rollout_steps: 1024
+  rollout_steps: 4096
   # Zero is the usual choice when deterministic argmax performance matters;
   # positive entropy explicitly rewards keeping the policy stochastic.
   entropy_coef: 0.0
@@ -206,9 +213,12 @@ PPO:
   regret_eval_freq: 5000
   regret_eval_episodes: 5
   episodes_eval: 10
-  wandb_run_name: local_policy_training
+  wandb_project: minigrid_policy_training
+  wandb_entity: null  # null uses the default entity from your `wandb login`
+  wandb_run_name: ${domain}_${domains.${domain}.task_name}_policy
+  rolling_window_episodes: 50  # WandB rolling metrics use the latest N episodes
   time_step: 0
-  max_training_timesteps: 1e5  # Increase after validating the pipeline.
+  max_training_timesteps: 1e6  # Increase after validating the pipeline.
   # max_training_timesteps: 3e5
   action_std_decay_freq: 2.5e5
   action_std_decay_rate: 0.05
@@ -228,7 +238,7 @@ PPO:
   save_path_gif: ${oc.env:PROJECT_ROOT}/modelBased/visulization/PPO/PPO_gif
   save_csv: True
   save_path_csv: ${oc.env:PROJECT_ROOT}/modelBased/visulization/PPO/PPO_csv
-  use_wandb: False
+  use_wandb: True
 
 test_env:
   visualize: False

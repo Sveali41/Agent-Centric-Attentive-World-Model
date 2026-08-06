@@ -110,7 +110,6 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
                     "domain=minigrid",
                     f"PPO.checkpoint_path={policy_path}",
                     f"PPO.checkpoint_path_wm={world_model_path}",
-                    "PPO.use_wandb=false",
                 ],
                 f"{domain} / train policy",
                 cfg,
