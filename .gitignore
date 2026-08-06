@@ -32,6 +32,7 @@ lightning_logs/
 # Training logs
 modelBased/log/
 trainer/logs/
+path/to/logdir/
 *.log
 
 # Generated model weights and checkpoints
