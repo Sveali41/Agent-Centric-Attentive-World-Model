@@ -9,14 +9,17 @@ def map_to_nearest_value_support(tensor, valid_values):
     nearest_values = valid_values[indices]  # Get nearest values using indices
     return nearest_values
 
-def extract_masked_state_support(state, agent_position_yx, mask_size):
+def extract_masked_state_support(state, agent_position_yx, mask_size, pad_value=None):
     """
     state dimensions: (channels, rows, cols)
     """
     channels, rows, cols = state.shape
     y, x = agent_position_yx
     half = mask_size // 2
-    margin_data = state[:, 0, 0]
+    if pad_value is None:
+        margin_data = state[:, 0, 0]
+    else:
+        margin_data = np.full(channels, pad_value, dtype=state.dtype)
     region = np.tile(margin_data.reshape(channels, 1, 1),
                      (1, mask_size, mask_size))
 
@@ -29,5 +32,4 @@ def extract_masked_state_support(state, agent_position_yx, mask_size):
     # 将 state 中的有效区域复制到预填充区域中
     region[:, dest_slice_y, dest_slice_x] = state[:, src_slice_y, src_slice_x]
     return region
-
 

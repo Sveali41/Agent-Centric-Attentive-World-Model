@@ -1,6 +1,12 @@
 import torch
 from torch import nn
 import os
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 from data.datamodule import GenDataModule
 from data.datamodule_vae import VaeDataModule
 import hydra
@@ -128,7 +134,12 @@ def validate(cfg: DictConfig):
                 # if decode returns continuous, maybe threshold or argmax
                 generated_maps = torch.argmax(generated, dim=1)
                 generated_maps = map_index_to_value(generated_maps, class_values)
-                visualize_grid(generated_maps,count=32, save_flag=True, save_path='/home/siyao/project/rlPractice/MiniGrid/generator/result')
+                visualize_grid(
+                    generated_maps,
+                    count=32,
+                    save_flag=True,
+                    save_path=str(PROJECT_ROOT / 'generator' / 'result'),
+                )
 
 if __name__ == "__main__":
     train()

@@ -1,9 +1,18 @@
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 try:
     # Package import (e.g., `python -m modelBased.data.data_collect`)
     from ..common.utils import normalize_obs, WORLD_MODEL_PATH, PROJECT_ROOT
 except ImportError:
     # Script import (e.g., `python modelBased/data/data_collect.py`)
     from modelBased.common.utils import normalize_obs, WORLD_MODEL_PATH, PROJECT_ROOT
+from modelBased.common.dataset_identity import metadata_array
+from domain.minigrid.action_codec import compact_to_native, native_to_compact
 from domain.minigrid.minigrid_support import (
     ColRowCanl_to_CanlRowCol,
     Visualization,
@@ -818,7 +827,12 @@ def run_env(
                         act = policy.select_action(state_norm)
 
             # --- 3. Step in Environment ---
-            obs_next, reward, done, trunc, info = env.step(act)
+            env_action = (
+                compact_to_native(act)
+                if is_minigrid and policy is not None
+                else act
+            )
+            obs_next, reward, done, trunc, info = env.step(env_action)
             env_reward_for_metrics = float(reward)
 
             # --- BipedalWalker Odometry Update ---
@@ -1020,7 +1034,7 @@ def run_env(
     act_np = np.concatenate(act_list)
     # Only for MiniGrid convention.
     if is_minigrid:
-        act_np[act_np == 5] = 4
+        act_np = native_to_compact(act_np)
     rew_np = np.concatenate(rew_list)
     done_np = np.concatenate(done_list)
     info_np = np.concatenate(info_list)
@@ -1268,7 +1282,7 @@ def run_env_uniform(env, cfg, wandb_run, log_name, policy=None, rmax_exploration
     # Raw env id 4 is drop and is never included in meaningful_actions.
     if np.any(act_np == 5):
         print("Mapping live action 5 (toggle) → compact action 4 (toggle).")
-        act_np[act_np == 5] = 4
+    act_np = native_to_compact(act_np)
 
     # Theoretical coverage size
     full_coverage = width * height * 4 * len(meaningful_actions)
@@ -1347,11 +1361,19 @@ def save_experiments(cfg: DictConfig, obs, obs_next, act, rew, done, info=None, 
         obs_next = obs_next.astype(np.float32, copy=False)
     else:
         raise ValueError(f"Unsupported observation shape for saving: {obs.shape}")
-    save_path = cfg.collect.data_save_path
+    save_path = cfg.env.collect.data_save_path
     save_dir = os.path.dirname(save_path)
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
-    save_kwargs = dict(a=obs, b=obs_next, c=act, d=rew, e=done, f=info)
+    save_kwargs = dict(
+        a=obs,
+        b=obs_next,
+        c=act,
+        d=rew,
+        e=done,
+        f=info,
+        metadata=metadata_array(cfg),
+    )
     if inv is not None:
         save_kwargs['g'] = inv        # inventory at time t
         save_kwargs['h'] = inv_next   # inventory at time t+1
@@ -1588,14 +1610,23 @@ def data_collect(cfg: DictConfig):
     else:
         env_path = getattr(cfg.env, "env_path", None)
         max_steps = getattr(cfg.env, "max_steps", 10000)
+        replace_start_with_empty = bool(
+            getattr(cfg.env.collect, "replace_start_with_empty", False)
+        )
         env = FullyObsWrapper(
             CustomMiniGridEnv(
                 txt_file_path=env_path,
+                replace_start_with_empty=replace_start_with_empty,
                 custom_mission="Find the key and open the door.",
                 max_steps=max_steps,
                 render_mode=mode,
             )
         )
+        if replace_start_with_empty:
+            print(
+                "[Data Collection] Treating layout S as E; "
+                "MiniGrid starts from a random empty position."
+            )
 
     collect_cfg = getattr(cfg.env, "collect", cfg.env)
     data_type = str(getattr(collect_cfg, "data_type", "random")).lower()
@@ -1605,7 +1636,7 @@ def data_collect(cfg: DictConfig):
     obs, obs_next, act, rew, done, info, inv, inv_next = run_env(
         env, cfg, log_name=log_name, wandb_run=None, save_img=False, randomize_inventory=randomize
     )
-    save_experiments(cfg.env, obs, obs_next, act, rew, done, info, inv=inv, inv_next=inv_next)
+    save_experiments(cfg, obs, obs_next, act, rew, done, info, inv=inv, inv_next=inv_next)
 
     # coverage visualization
     data_path = cfg.env.collect.data_save_path
@@ -1637,7 +1668,7 @@ def data_collect(cfg: DictConfig):
 def data_collect_api_multiprocess(cfg: DictConfig, env, wandb_run, save_img=False):
     hparam = cfg.env
     obs, obs_next, act, rew, done, info = run_env_multiprocess(env, hparam, wandb_run, save_img=save_img)
-    save_experiments(cfg.env,obs,obs_next, act, rew, done, info)
+    save_experiments(cfg, obs, obs_next, act, rew, done, info)
 
 def data_collect_api(
     cfg: DictConfig,
@@ -1814,7 +1845,7 @@ def _finalize_and_save(
 
     print(f"Final data shape: {obs_all.shape}")
 
-    save_experiments(cfg.env, obs_all, obsn_all, act_all, rew_all, done_all, info_all, inv=inv_final, inv_next=invn_final)
+    save_experiments(cfg, obs_all, obsn_all, act_all, rew_all, done_all, info_all, inv=inv_final, inv_next=invn_final)
 
     # visualization
     data_path = cfg.env.collect.data_save_path

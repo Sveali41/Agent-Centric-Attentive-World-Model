@@ -75,6 +75,7 @@ class CustomMiniGridEnv(MiniGridEnv):
             size: Optional[int] = None,
             agent_start_pos: Optional[tuple[int, int]] = None,  # Allow None for random initialization
             agent_start_dir: Optional[int] = None,  # Allow None for random initialization
+            replace_start_with_empty: bool = False,
             custom_mission: str = "Explore and interact with objects.",
             max_steps: Optional[int] = None,
             **kwargs,
@@ -92,6 +93,9 @@ class CustomMiniGridEnv(MiniGridEnv):
             size (Optional[int]): The size of the environment grid. If not provided, determined from input.
             agent_start_pos (Optional[tuple[int, int]]): Starting position of the agent.
             agent_start_dir (Optional[int]): Initial direction the agent is facing. If None, random direction.
+            replace_start_with_empty (bool): Treat layout ``S`` cells as ``E``.
+                Intended for random data collection; policy environments keep
+                the default and therefore still start from ``S``.
             custom_mission (str): Custom mission description.
             max_steps (Optional[int]): Maximum number of steps in an episode.
             **kwargs: Additional keyword arguments for MiniGridEnv.
@@ -100,6 +104,7 @@ class CustomMiniGridEnv(MiniGridEnv):
         self.layout_str = layout_str
         self.color_str = color_str
         self.s_positions = []  # List to store positions of 'S'
+        self.replace_start_with_empty = bool(replace_start_with_empty)
 
         # Determine the size of the environment if not provided
         if size is None:
@@ -248,13 +253,16 @@ class CustomMiniGridEnv(MiniGridEnv):
             for y, (layout_line, color_line) in enumerate(zip(layout_lines, color_lines)):
                 for x, (char, color_char) in enumerate(zip(layout_line, color_line)):
                     if char.upper() == 'S':
+                        if self.replace_start_with_empty:
+                            # Collection-only mode: S behaves exactly like E.
+                            # No object and no fixed spawn marker are created.
+                            continue
                         # Record 'S' position as agent's start position
                         self.s_positions.append((x, y))
-                        # Set 'S' as Floor with specified color
-                        color = char_to_color(color_char)
-                        obj = Floor()
-                        self.grid.set(x, y, obj)
-                        continue  # 'S' is handled
+                        # S is a spawn marker, not a grid object. Keeping its
+                        # cell empty makes the physical layout identical to
+                        # collection mode, where S is parsed as E.
+                        continue
                     color = char_to_color(color_char)
                     obj = char_to_object(char, color)
                     if obj:
@@ -285,13 +293,12 @@ class CustomMiniGridEnv(MiniGridEnv):
                 raise ValueError("Each layout line must correspond to a color line of the same length.")
             for x, (char, color_char) in enumerate(zip(layout_line, color_line)):
                 if char.upper() == 'S':
+                    if self.replace_start_with_empty:
+                        continue
                     # Record 'S' position as agent's start position
                     self.s_positions.append((x, y))
-                    # Set 'S' as Floor with specified color
-                    color = char_to_color(color_char)
-                    obj = Floor()
-                    self.grid.set(x, y, obj)
-                    continue  # 'S' is handled
+                    # S fixes the spawn but otherwise represents an empty cell.
+                    continue
                 color = char_to_color(color_char)
                 obj = char_to_object(char, color)
                 if obj:

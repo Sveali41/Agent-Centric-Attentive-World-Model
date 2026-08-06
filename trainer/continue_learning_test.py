@@ -37,7 +37,7 @@ def collect_data(cfg: DictConfig):
         file_path = os.path.join(file_dir, env_text_file_name[step])
         env = support.wrap_env_from_text(file_path, max_steps=10000)
         file_name = os.path.splitext(env_text_file_name[step])[0]  # 'env1_move'
-        data_save_dir = '/home/siyao/project/rlPractice/MiniGrid/trainer/data'
+        data_save_dir = str(TRAINER_PATH / 'data')
         cfg.env.collect.data_save_path = os.path.join(data_save_dir, f'{file_name}_test.npz')
         support.collect_data_trainer(
             env=env,
@@ -77,7 +77,7 @@ def test_1(cfg: DictConfig):
     # env_text_file_name = ['Grid_11_11_KD_level1.txt', 'Grid_11_11_KD_level2.txt', 'Grid_11_11_KD_level3.txt']  
     env_text_file_name = ['Grid_11_11_KD_level1.txt', 'Grid_11_11_KD_level2.txt', 'Grid_11_11_KD_level3.txt', 'Grid_11_11_KD_level4.txt']  
     step_len = len(env_text_file_name)
-    data_save_dir = '/home/siyao/project/rlPractice/MiniGrid/trainer/data'
+    data_save_dir = str(TRAINER_PATH / 'data')
 
     for step in range(step_len):
         print(f"Step {step+1} of {step_len}...")
@@ -131,15 +131,15 @@ def test_2(cfg: DictConfig):
         print(f"Step {step+1} of {step_len}...")
         # env = support.wrap_env(support.generate_env(model))
         file_name = os.path.splitext(env_text_file_name[step])[0]  # 'env1_move'
-        data_save_dir = '/home/siyao/project/rlPractice/MiniGrid/trainer/data'
+        data_save_dir = str(TRAINER_PATH / 'data')
         cfg.attention_model.data_dir = os.path.join(data_save_dir, f'{file_name}.npz')
         cur_old_params, cur_fisher = AttentionWM_training.train_api(cfg, old_params, fisher)
         old_params, fisher = cur_old_params, cur_fisher
 
     cfg.attention_model.freeze_weight = True
-    cfg.attention_model.data_dir = '/home/siyao/project/rlPractice/MiniGrid/trainer/data/env1_test.npz'
+    cfg.attention_model.data_dir = str(TRAINER_PATH / 'data' / 'env1_test.npz')
     AttentionWM_training.train_api(cfg, old_params, fisher)
-    cfg.attention_model.data_dir = '/home/siyao/project/rlPractice/MiniGrid/trainer/data/env2_test.npz'
+    cfg.attention_model.data_dir = str(TRAINER_PATH / 'data' / 'env2_test.npz')
     AttentionWM_training.train_api(cfg, old_params, fisher)
 
     

@@ -101,6 +101,62 @@ def extract_masked_state(state, mask_size, agent_position_yx):
         state_masked = torch.from_numpy(state_masked).cuda()
     return state_masked
 
+
+def get_agent_position_torch(state):
+    """Find MiniGrid agent positions without moving tensors to CPU."""
+    if state.ndim == 3:
+        flat = torch.argmax(state[0].reshape(-1))
+        return torch.stack((flat // state.shape[2], flat % state.shape[2]))
+    if state.ndim == 4:
+        flat = torch.argmax(state[:, 0].reshape(state.shape[0], -1), dim=1)
+        return torch.stack((flat // state.shape[3], flat % state.shape[3]), dim=1)
+    raise ValueError("Expected a (C,H,W) or (B,C,H,W) tensor.")
+
+
+def extract_masked_state_torch(state, mask_size, agent_position_yx=None, pad_value=None):
+    """GPU-native MiniGrid local-state extraction for PPO imagined rollouts."""
+    single = state.ndim == 3
+    batch = state.unsqueeze(0) if single else state
+    if batch.ndim != 4:
+        raise ValueError("Expected a (C,H,W) or (B,C,H,W) tensor.")
+    positions = (
+        get_agent_position_torch(batch)
+        if agent_position_yx is None
+        else agent_position_yx.reshape(-1, 2)
+    )
+    bsz, channels, rows, cols = batch.shape
+    half = mask_size // 2
+    output = torch.empty((bsz, channels, mask_size, mask_size), device=batch.device, dtype=batch.dtype)
+    for i in range(bsz):
+        y, x = int(positions[i, 0].item()), int(positions[i, 1].item())
+        fill = batch[i, :, 0, 0] if pad_value is None else torch.full(
+            (channels,), pad_value, device=batch.device, dtype=batch.dtype
+        )
+        output[i] = fill[:, None, None].expand(-1, mask_size, mask_size)
+        sy0, sy1 = max(y - half, 0), min(y + half + 1, rows)
+        sx0, sx1 = max(x - half, 0), min(x + half + 1, cols)
+        dy0, dx0 = max(half - y, 0), max(half - x, 0)
+        output[i, :, dy0:dy0 + sy1 - sy0, dx0:dx0 + sx1 - sx0] = batch[i, :, sy0:sy1, sx0:sx1]
+    return output[0] if single else output
+
+
+def put_back_masked_state_torch(state_masked, original_state, mask_size, agent_position_yx):
+    """GPU-native inverse of ``extract_masked_state_torch``."""
+    single = original_state.ndim == 3
+    masked = state_masked.unsqueeze(0) if state_masked.ndim == 3 else state_masked
+    original = original_state.unsqueeze(0) if single else original_state
+    positions = agent_position_yx.reshape(-1, 2)
+    output = original.clone()
+    rows, cols = output.shape[-2:]
+    half = mask_size // 2
+    for i in range(output.shape[0]):
+        y, x = int(positions[i, 0].item()), int(positions[i, 1].item())
+        sy0, sy1 = max(y - half, 0), min(y + half + 1, rows)
+        sx0, sx1 = max(x - half, 0), min(x + half + 1, cols)
+        dy0, dx0 = max(half - y, 0), max(half - x, 0)
+        output[i, :, sy0:sy1, sx0:sx1] = masked[i, :, dy0:dy0 + sy1 - sy0, dx0:dx0 + sx1 - sx0]
+    return output[0] if single else output
+
 def put_back_masked_state(state_masked, orginal_state, mask_size, agent_position_yx):
     tensor_flag = False
     if isinstance(state_masked, torch.Tensor):
@@ -133,10 +189,21 @@ def load_model_weight(model, weight_path, freeze=True):
     try:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        torch.serialization.add_safe_globals([omegaconf.dictconfig.DictConfig])
+        if hasattr(torch.serialization, "add_safe_globals"):
+            try:
+                torch.serialization.add_safe_globals([omegaconf.dictconfig.DictConfig])
+            except Exception:
+                pass
 
-        with torch.serialization.safe_globals([omegaconf.dictconfig.DictConfig]):
+        if hasattr(torch.serialization, "safe_globals"):
+            try:
+                with torch.serialization.safe_globals([omegaconf.dictconfig.DictConfig]):
+                    checkpoint = torch.load(weight_path, weights_only=False, map_location=device)
+            except Exception:
+                checkpoint = torch.load(weight_path, weights_only=False, map_location=device)
+        else:
             checkpoint = torch.load(weight_path, weights_only=False, map_location=device)
+
 
 
         if "state_dict" in checkpoint:
@@ -772,6 +839,5 @@ GENERATOR_PATH : Path = Path(get_env("GENERATOR_PATH"))
 TRAINER_PATH : Path = Path(get_env("TRAINER_PATH"))
 WORLD_MODEL_PATH = Path(get_env("WORLD_MODEL_PATH"))
 sys.path.append(str(PROJECT_ROOT.resolve()))	
-
 
 

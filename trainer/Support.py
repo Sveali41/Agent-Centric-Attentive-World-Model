@@ -1,8 +1,10 @@
 import hydra
 import sys
-import os
-ROOTPATH = os.path.abspath(os.path.join(__file__, '..', '..'))
-sys.path.append(ROOTPATH)
+from pathlib import Path
+
+ROOTPATH = Path(__file__).resolve().parents[1]
+if str(ROOTPATH) not in sys.path:
+    sys.path.insert(0, str(ROOTPATH))
 from modelBased.common.utils import GENERATOR_PATH, TRAINER_PATH
 from omegaconf import DictConfig
 from generator.common.utils import load_gen, generate_color_map, generate_obj_map, layout_to_string, combine_maps, clean_and_place_goal
@@ -449,7 +451,6 @@ class Support:
         return start_step, old_params, fisher
 
         
-
 
 
 

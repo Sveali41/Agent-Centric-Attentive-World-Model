@@ -1,41 +1,65 @@
-domain: bipedalwalker  # crafter | minigrid | bipedalwalker
+domain: minigrid  # crafter | minigrid | bipedalwalker
+
+pipeline:
+  label: ${domain}  # minigrid | crafter | bipedalwalker | full
+  force: false
+  force_policy: True  # Retrain only policy; keep the matching dataset and WM.
+  skip_policy: false
+  domains:
+    minigrid:
+      policy_checkpoint: ${oc.env:MODEL_FPATH}/Policy/policy_minigrid_${domains.minigrid.task_name}.ckpt
+    crafter:
+      policy_checkpoint: ${oc.env:MODEL_FPATH}/Policy/policy_crafter_${domains.crafter.task_name}.ckpt
+    bipedalwalker:
+      policy_checkpoint: ${oc.env:MODEL_FPATH}/Policy/policy_bipedalwalker_${domains.bipedalwalker.task_name}.ckpt
 
 domains:
   crafter:
     env_type: crafter
+    task_name: crafter_target_task_1
     max_steps: 10000
     grid_shape: [2, 0, 0]
     attention_mask_size: 5
     obs_norm_values: [20, 5, 0]
     action_norm_values: 17
-    env_path: ${oc.env:TRAINER_PATH}/level/crafter/target_tasks/crafter_target_task_1.txt
-    data_save_path: ${oc.env:TRAIN_DATASET_PATH}/crafter_target_task_diamond_random.npz
+    # Canonical layout source. Data collection, WM identity checks and policy
+    # environment configuration all reference this single field.
+    layout_path: ${oc.env:TRAINER_PATH}/level/crafter/target_tasks/crafter_target_task_1.txt
+    data_save_path: ${oc.env:TRAIN_DATASET_PATH}/crafter_${domains.crafter.task_name}_${env.collect.data_type}.npz
+    world_model_checkpoint: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_crafter_${domains.crafter.task_name}.ckpt
     validation_data_dir: ${oc.env:TRAIN_DATASET_PATH}/crafter_train_random_2.npz
     visualize_filename: crafter_target_task_diamond_random_coverage.png
     env_visualize_filename: crafter_target_task_diamond_random_env.png
     use_bipedal_attention: false
     wm_data_type: discrete
+    use_weighted_loss: false
 
   minigrid:
     env_type: minigrid
-    max_steps: 10000
+    task_name: Grid_11_11_KD_level1
+    max_steps: 5000
     grid_shape: [3, 0, 0]
     attention_mask_size: 3
     obs_norm_values: [10, 5, 3]
     action_norm_values: 7
-    env_path: ${oc.env:TRAINER_PATH}/level/Grid_11_11_KD_level1.txt
-    data_save_path: ${oc.env:TRAIN_DATASET_PATH}/minigrid_train_random.npz
+    # Canonical layout source. Change this path once when changing the task.
+    layout_path: ${oc.env:PROJECT_ROOT}/level/simple_test.txt
+    data_save_path: ${oc.env:TRAIN_DATASET_PATH}/minigrid_${domains.minigrid.task_name}_${env.collect.data_type}.npz
+    world_model_checkpoint: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_minigrid_${domains.minigrid.task_name}.ckpt
     validation_data_dir: null
     visualize_filename: minigrid_train_random_coverage.png
     env_visualize_filename: minigrid_train_random_env.png
     use_bipedal_attention: false
     wm_data_type: discrete
+    use_weighted_loss: false
+    collection_replace_start_with_empty: true
 
   bipedalwalker:
     env_type: bipedalwalker
     task_group: target # target/minitask
     task_folder: target_tasks # target_tasks/minitasks
     task_name: bipedal_target_task_16
+    world_model_checkpoint: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_bipedalwalker_${domains.bipedalwalker.task_name}.ckpt
     validation_task_group: target
     validation_task_folder: target_tasks
     validation_task_name: target_env_stump_1
@@ -44,9 +68,10 @@ domains:
     attention_mask_size: 5
     obs_norm_values: [1]
     action_norm_values: 4
-    env_path: ${oc.env:TRAINER_PATH}/level/bipedal_walker/${domains.bipedalwalker.task_folder}/${domains.bipedalwalker.task_name}.txt
+    # Canonical layout source. Data collection and downstream stages reuse it.
+    layout_path: ${oc.env:TRAINER_PATH}/level/bipedal_walker/${domains.bipedalwalker.task_folder}/${domains.bipedalwalker.task_name}.txt
     data_save_path: ${oc.env:TRAIN_DATASET_PATH}/bipedalwalker_${domains.bipedalwalker.task_group}_${domains.bipedalwalker.task_name}_${env.collect.data_type}.npz
-    validation_data_dir: ${oc.env:TRAIN_DATASET_PATH}/bipedalwalker_${domains.bipedalwalker.validation_task_group}_${domains.bipedalwalker.validation_task_name}.npz
+    validation_data_dir: ${oc.env:TRAIN_DATASET_PATH}/bipedalwalker_${domains.bipedalwalker.validation_task_group}_${domains.bipedalwalker.validation_task_name}_${env.collect.data_type}.npz
     visualize_filename: ${domains.bipedalwalker.task_name}_coverage.png
     env_visualize_filename: ${domains.bipedalwalker.task_name}_env.png
     bipedal_prior_weight: 0.5  # 30% prior weight for heuristic vs random noise
@@ -57,6 +82,7 @@ domains:
     sb3_deterministic: false
     wm_data_type: norm
     use_bipedal_attention: true
+    use_weighted_loss: false
 
 
 attention_model:
@@ -78,15 +104,19 @@ attention_model:
   wd: 1e-5
   obs_norm_values: ${domains.${domain}.obs_norm_values}
   action_norm_values: ${domains.${domain}.action_norm_values}
-  valid_values_obj: [1, 2, 4, 5, 8, 10]                                                             
-  valid_values_color: [0, 1, 5]
+  # Cover the MiniGrid object/color vocabulary used by supported layouts.
+  valid_values_obj: [1, 2, 3, 4, 5, 8, 10]
+  valid_values_color: [0, 1, 2, 4, 5]
   valid_values_state: [0, 1, 2, 3]
+  use_weighted_loss: ${domains.${domain}.use_weighted_loss}
   use_wandb: False
+  enable_progress_bar: True
+  log_every_n_steps: 10
   frame_stack: 1  # K=1 for deterministic Crafter (no need for temporal context)
 
   # freeze weights
   freeze_weight: False  # When true, load weights and skip further training.
-  model_save_path: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_${env.env_type}.ckpt
+  model_save_path: ${domains.${domain}.world_model_checkpoint}
 
   # resume training
   resume_training: False  # Resume training from a previous checkpoint when enabled.
@@ -94,10 +124,12 @@ attention_model:
   fisher_buffer_size: 500000
 
   # plot
-  visualization: True     
+  visualization: False    # Disable WM visualizations
   visualize_every: 50
   save_path: ${oc.env:PROJECT_ROOT}/modelBased/visulization
   direction_map: {0: 'right', 1: 'down', 2: 'left', 3: 'up'}
+  # Compact WM/PPO actions. Native MiniGrid IDs are [0, 1, 2, 3, 5];
+  # native drop (4) and done (6) are intentionally excluded.
   action_map: {0: 'left', 1: 'right', 2: 'forward', 3: 'pickup', 4: 'toggle'}
   continue_learning: True
   lambda_ewc: 100         # EWC regularization strength
@@ -119,7 +151,7 @@ attention_model:
 env:
   # For Crafter collection, env_path is not used by CustomCrafterEnv.
   # Keep it for backward compatibility with MiniGrid scripts.
-  env_path: ${domains.${domain}.env_path}
+  env_path: ${domains.${domain}.layout_path}
   visualize: False
   env_type: ${domains.${domain}.env_type}
   max_steps: ${domains.${domain}.max_steps}
@@ -128,43 +160,69 @@ env:
     slippery_prob: 0.0     # 0.0 = fully deterministic for initial validation
   collect:
     data_type: random # uniform | random
+    # During MiniGrid collection only, parse S as E for random starts. Policy
+    # training still reads the original layout and uses S as its fixed start.
+    replace_start_with_empty: ${oc.select:domains.${domain}.collection_replace_start_with_empty,false}
     uniform_reset_steps: 5000
     episodes: 1000
     mini_dataset_size: 8000
     maximum_dataset_size: 40000 
     data_save_path: ${domains.${domain}.data_save_path}
-    save_coverage_visualize: True
+    save_coverage_visualize: False
     visualize_save_path: ${oc.env:PROJECT_ROOT}/trainer/logs/dataset_visualization
     visualize_filename: ${domains.${domain}.visualize_filename}
-    save_env_visualize: True
+    save_env_visualize: False
     env_visualize_save_path: ${oc.env:PROJECT_ROOT}/trainer/logs/env_visualization
     env_visualize_filename: ${domains.${domain}.env_visualize_filename}
 
 # 4. PPO model
 PPO:
-  env_type: empty # empty, with obj
+  train_in_real_env: True
+  env_type: ${domains.${domain}.env_type}
   has_continuous_action_space: False
-  max_ep_len: 10000  # max timesteps in one episode
+  # Shared real-env training/evaluation horizon. Keeping this tight prevents a
+  # random walk in a tiny map from looking like a high-performing policy.
+  max_ep_len: 256
   action_std: 0.1  # set same std for action distribution which was used while saving
   i_episode: 0
-  K_epochs: 80  # update policy for K epochs
+  K_epochs: 8  # update policy for K epochs
   eps_clip: 0.2  # clip parameter for PPO
   gamma: 0.99  # discount factor
+  # Standard PPO rollout/update settings. A rollout spans multiple episodes;
+  # never run eight optimizer epochs on a single 3- or 4-step episode.
+  rollout_steps: 1024
+  # Zero is the usual choice when deterministic argmax performance matters;
+  # positive entropy explicitly rewards keeping the policy stochastic.
+  entropy_coef: 0.0
+  normalize_advantages: True
+  normalize_returns: False
+  max_grad_norm: 0.5
+  step_penalty: 0.0  # Step penalty set to 0.0 (original reward already incorporates step decay)
   lr_actor: 0.0003  # learning rate for actor
   lr_critic: 0.001  # learning rate for critic
-  checkpoint_path: ${oc.env:MODEL_FPATH}/policy_model_21_21.ckpt
+  checkpoint_path: ${oc.env:MODEL_FPATH}/Policy/policy_${domain}_${domains.${domain}.task_name}.ckpt
+  checkpoint_path_wm: ${domains.${domain}.world_model_checkpoint}
+  compute_regret: False
+  regret_eval_freq: 5000
+  regret_eval_episodes: 5
+  episodes_eval: 10
+  wandb_run_name: local_policy_training
   time_step: 0
-  max_training_timesteps: 3e6 #1.2e5
+  max_training_timesteps: 1e5  # Increase after validating the pipeline.
   # max_training_timesteps: 3e5
   action_std_decay_freq: 2.5e5
   action_std_decay_rate: 0.05
   min_action_std: 0.1
-  save_model_freq: 2e4
+  save_model_freq: 1e4
   ########################################
   # test
   total_test_episodes: 1000
-  render: True
-  env_path: ${oc.env:ENV_PATH}/Grid_21_21_empty.txt
+  render: False
+  # False samples from the learned categorical policy. True uses actor argmax.
+  test_deterministic: False
+  render_delay: 0.05
+  gif_fps: 10
+  env_path: ${domains.${domain}.layout_path}
   visualize: false
   save_gif: True
   save_path_gif: ${oc.env:PROJECT_ROOT}/modelBased/visulization/PPO/PPO_gif

@@ -1,16 +1,22 @@
 import os
+import shutil
+import sys
 import warnings
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
-ROOTPATH = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-import sys
-sys.path.append(ROOTPATH)
 
 from modelBased.world_model.AttentionWM import AttentionWorldModel
 from modelBased.data.datamodule import WMRLDataModule, WMRLDataset, WMRLDataset
+from modelBased.common.dataset_identity import dataset_matches
 from modelBased.common.utils import PROJECT_ROOT, get_env
 import hydra
 from omegaconf import DictConfig
+from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning.loggers.wandb import WandbLogger
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
@@ -76,7 +82,12 @@ def train(cfg: DictConfig):
 
     # ===== Step 2: Validate on Dataset 2 (if configured) =====
     val_data_dir = getattr(cfg.attention_model, "validation_data_dir", None)
-    if val_data_dir and result["mode"] == "train":
+    validation_matches = bool(
+        val_data_dir
+        and os.path.exists(str(val_data_dir))
+        and dataset_matches(val_data_dir, cfg)
+    )
+    if val_data_dir and result["mode"] == "train" and validation_matches:
         print(f"\n{'='*60}")
         print(f"[Phase 2] VALIDATING on: {val_data_dir}")
         print(f"{'='*60}\n")
@@ -100,6 +111,11 @@ def train(cfg: DictConfig):
                 ordered_keys = sorted(token_metrics.keys())
                 summary = ", ".join(f"{k}={float(token_metrics[k]):.6f}" for k in ordered_keys)
                 print(f"[Phase 2] Validation token metrics: {summary}")
+    elif val_data_dir and result["mode"] == "train":
+        print(
+            "[Phase 2] Validation dataset missing or identity mismatch; "
+            f"skipping validation: {val_data_dir}"
+        )
 
 def compare_params(net, old_params):
     if old_params is None:
@@ -131,6 +147,13 @@ def run(
     
     print(f'*************************Data set: {cfg.attention_model.data_dir}************************')
 
+    if not dataset_matches(cfg.attention_model.data_dir, cfg):
+        raise RuntimeError(
+            "Dataset identity does not match the selected domain/task/layout. "
+            "Recollect data with: python -m modelBased.data.data_collect "
+            f"domain={cfg.domain}"
+        )
+
     use_wandb = cfg.attention_model.use_wandb
     fisher_beta = float(getattr(cfg.attention_model, "fisher_beta", 0.5))
 
@@ -146,14 +169,20 @@ def run(
         datamodule = WMRLDataModule(hparams=cfg.attention_model, data=direct_data, replay_data=None)
 
     # logger
-    wandb_logger = None
+    logger = None
     if use_wandb:
-        wandb_logger = WandbLogger(project="Local_Attention_Training", log_model=True, reinit=True)
+        logger = WandbLogger(project="Local_Attention_Training", log_model=True, reinit=True)
         # Avoid attaching W&B watch hooks during validation-only execution.
         # Those hooks would outlive the temporary logger instance.
         if not cfg.attention_model.freeze_weight:
-            # wandb_logger.experiment.watch(net, log='all', log_freq=1000)
+            # logger.experiment.watch(net, log='all', log_freq=1000)
             pass
+    else:
+        # Keep local metrics even when W&B is disabled.
+        logger = CSVLogger(
+            save_dir=str(PROJECT_ROOT / "modelBased" / "log"),
+            name="world_model",
+        )
 
     # callbacks
     metric_to_monitor = 'avg_val_loss_wm'
@@ -166,6 +195,7 @@ def run(
     )
     try:
         tmp_dir = os.path.dirname(cfg.attention_model.model_save_path)
+        os.makedirs(tmp_dir, exist_ok=True)
     except Exception as e:
         print("EXCEPTION AT E1:", e)
         
@@ -174,17 +204,21 @@ def run(
         monitor=metric_to_monitor,
         mode="min",
         dirpath=tmp_dir,
-        filename="att-{epoch:02d}-{avg_val_loss_wm:.5f}",
+        # Keep exactly one temporary checkpoint for this run.  The best
+        # weights are copied to model_save_path below and the temporary file
+        # is removed afterwards.
+        filename=f"best-{str(cfg.domain)}",
+        auto_insert_metric_name=False,
         verbose=False
     )
 
     # trainer
     debug_mode = bool(getattr(cfg.attention_model, "debug_mode", False))
-    show_progress_bar = bool(getattr(cfg.attention_model, "enable_progress_bar", debug_mode))
+    show_progress_bar = bool(getattr(cfg.attention_model, "enable_progress_bar", True))
 
     trainer = pl.Trainer(
         precision=32,
-        logger=wandb_logger if use_wandb else None,
+        logger=logger,
         max_epochs=cfg.attention_model.n_epochs,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
@@ -192,6 +226,7 @@ def run(
         callbacks=[early_stop_callback, checkpoint_callback],
         deterministic=False,
         enable_progress_bar=show_progress_bar,
+        log_every_n_steps=int(getattr(cfg.attention_model, "log_every_n_steps", 10)),
     )
 
 
@@ -218,6 +253,24 @@ def run(
         # ===== training =====
         trainer.fit(net, datamodule)
 
+        # Lightning leaves the module at the last epoch, while the desired
+        # artifact is the best validation checkpoint. Load that checkpoint
+        # before calculating consolidation statistics and writing the final
+        # model file.
+        best_model_path = checkpoint_callback.best_model_path
+        if best_model_path and os.path.exists(best_model_path):
+            # Lightning checkpoints contain optimizer/configuration objects
+            # in addition to tensors. This is a trusted local checkpoint;
+            # PyTorch 2.6 otherwise defaults to weights_only=True and rejects
+            # the embedded OmegaConf DictConfig.
+            best_checkpoint = torch.load(
+                best_model_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+            net.load_state_dict(best_checkpoint["state_dict"])
+            print(f"[WM] Loaded best checkpoint: {best_model_path}")
+
         # Save the current parameters as the consolidation anchor.
         old_params = net.save_old_params()
 
@@ -242,7 +295,23 @@ def run(
     # ... (in run)
         # Save the training checkpoint.
         model_pth = cfg.attention_model.model_save_path
-        trainer.save_checkpoint(model_pth)
+        # Copy the actual Lightning best checkpoint instead of calling
+        # trainer.save_checkpoint() again. Older Lightning versions can save
+        # the trainer's last in-memory state there, even after the module was
+        # restored, which makes the final artifact differ from best_model_path.
+        if best_model_path and os.path.exists(best_model_path):
+            shutil.copy2(best_model_path, model_pth)
+        else:
+            trainer.save_checkpoint(model_pth)
+        # Lightning may add a version suffix to the temporary filename in
+        # older releases. Remove every temporary best checkpoint for this
+        # domain, while keeping only the canonical final artifact.
+        final_path = Path(str(model_pth)).resolve()
+        temporary_pattern = f"best-{str(cfg.domain)}*.ckpt"
+        for temporary_path in Path(tmp_dir).glob(temporary_pattern):
+            if temporary_path.resolve() != final_path:
+                temporary_path.unlink(missing_ok=True)
+                print(f"[WM] Removed temporary checkpoint: {temporary_path}")
         if use_wandb:
             wandb.save(str(model_pth))
             wandb.save(model_pth)

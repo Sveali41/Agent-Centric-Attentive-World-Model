@@ -284,7 +284,7 @@ class AttentionModule(nn.Module):
         elif self.is_bipedal:
             self.out_channel = self.state_dim
         else:
-            self.out_channel = 3
+            self.out_channel = 11 + 6 + 4  # obj(11) + color(6) + state(4) for MiniGrid CE
         if not self.is_bipedal:
             self.fc = nn.Linear(embed_dim, self.out_channel)
         

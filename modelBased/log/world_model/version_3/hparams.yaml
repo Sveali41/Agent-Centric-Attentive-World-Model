@@ -1,0 +1,82 @@
+env_type: minigrid
+doors_locked: false
+use_bipedal_attention: false
+data_type: discrete
+model_type: Attention
+grid_shape:
+- 3
+- 0
+- 0
+attention_mask_size: 3
+batch_size: 256
+n_cpu: 4
+embed_dim: 128
+num_heads: 1
+data_dir: /home/siyao/phd_file/Research/rlPractice/Agent-Centric-Attentive-World-Model/modelBased/data/train_world_model/minigrid_Grid_11_11_KD_level1_random.npz
+validation_data_dir: null
+n_epochs: 25
+lr: 0.0005
+wd: 1.0e-05
+obs_norm_values:
+- 10
+- 5
+- 3
+action_norm_values: 7
+valid_values_obj:
+- 1
+- 2
+- 3
+- 4
+- 5
+- 8
+- 10
+valid_values_color:
+- 0
+- 1
+- 2
+- 4
+- 5
+valid_values_state:
+- 0
+- 1
+- 2
+- 3
+use_weighted_loss: false
+use_wandb: false
+enable_progress_bar: true
+log_every_n_steps: 10
+frame_stack: 1
+freeze_weight: false
+model_save_path: /home/siyao/phd_file/Research/rlPractice/Agent-Centric-Attentive-World-Model/modelBased/models/AttentionWM/attention_world_model_minigrid_Grid_11_11_KD_level1.ckpt
+resume_training: false
+resume_path: /home/siyao/phd_file/Research/rlPractice/Agent-Centric-Attentive-World-Model/modelBased/models/AttentionWM/attention_world_model_minigrid_old.ckpt
+fisher_buffer_size: 500000
+visualization: false
+visualize_every: 50
+save_path: /home/siyao/phd_file/Research/rlPractice/Agent-Centric-Attentive-World-Model/modelBased/visulization
+direction_map:
+  0: right
+  1: down
+  2: left
+  3: up
+action_map:
+  0: left
+  1: right
+  2: forward
+  3: pickup
+  4: toggle
+continue_learning: true
+lambda_ewc: 100
+ewc_ratio: 0.2
+lambda_ema: 0.1
+lambda_ewc_min: 10
+lambda_ewc_max: 1000.0
+scale_factor: 1.0
+drift_threshold: null
+warmup_steps: 100
+drift_cooldown: 200
+drift_hi: 1.1
+drift_lo: 0.7
+drift_up_step: 0.1
+drift_down_step: 0.05
+replay_frac: 0.5

@@ -1,149 +1,182 @@
-import torch
+"""Evaluate a trained compact-action PPO policy in the real MiniGrid env."""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import hydra
+import imageio.v2 as imageio
 import numpy as np
 import pandas as pd
-import gym
-import hydra
-import imageio  # Import imageio to save GIFs
-from modelBased.common.utils import PROJECT_ROOT, normalize_obs
-from modelBased.policy_training.PPO import PPO
-from omegaconf import DictConfig, OmegaConf
+import torch
 from minigrid.wrappers import FullyObsWrapper
-from domain.minigrid.minigrid_custom_env import *
-from domain.minigrid import minigrid_support as minigrid_utils
+from omegaconf import DictConfig
+
+from domain.minigrid.action_codec import (
+    COMPACT_ACTION_NAMES,
+    MODEL_ACTION_COUNT,
+    compact_to_native,
+)
 from domain.minigrid.minigrid_custom_env import CustomMiniGridEnv
+from domain.minigrid.minigrid_support import ColRowCanl_to_CanlRowCol
+from modelBased.common.utils import normalize_obs
+from modelBased.policy_training.PPO import PPO
 
-# Set device to CPU or CUDA
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
-    print("Device set to : " + str(torch.cuda.get_device_name(device)))
-else:
-    print("Device set to : cpu")
 
-#################################### Testing ###################################
-@hydra.main(version_base=None, config_path= str(PROJECT_ROOT / "modelBased/config"), config_name="config")
-def test(cfg: DictConfig):
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+def _select_eval_action(ppo_agent: PPO, state: torch.Tensor, deterministic: bool) -> int:
+    """Select a compact action without writing to the PPO rollout buffer."""
+    if deterministic:
+        with torch.no_grad():
+            probabilities = ppo_agent.policy_old.actor(state.to(device))
+        return int(torch.argmax(probabilities, dim=-1).item())
+    action, _, _, _, _ = ppo_agent.select_action(state)
+    return int(action)
+
+
+@hydra.main(
+    version_base=None,
+    config_path=str(PROJECT_ROOT / "modelBased/config"),
+    config_name="config",
+)
+def test(cfg: DictConfig) -> None:
     validate_policy(cfg)
 
-def validate_policy(cfg):
-    print("============================================================================================")
 
-    ################## Hyperparameters ##################
-    has_continuous_action_space = cfg.PPO.has_continuous_action_space
-    action_std = cfg.PPO.action_std
-    lr_actor = cfg.PPO.lr_actor
-    lr_critic = cfg.PPO.lr_critic
-    gamma = cfg.PPO.gamma
-    K_epochs = cfg.PPO.K_epochs
-    eps_clip = cfg.PPO.eps_clip
-    total_test_episodes = cfg.PPO.total_test_episodes
-    max_ep_len = cfg.PPO.max_ep_len
-    render = cfg.PPO.render
-    checkpoint_path = cfg.PPO.checkpoint_path
-    env_type = cfg.PPO.env_type
-    obs_norm_values = cfg.attention_model.obs_norm_values
-    visualize_obs = minigrid_utils.Visualization(cfg.attention_model)
-    visualize_flag = cfg.PPO.visualize
-    env_path = cfg.PPO.env_path
-    # save experiment results
-    # gif
-    save_path_gif = cfg.PPO.save_path_gif
-    save_gif = cfg.PPO.save_gif  # Set to True to save the GIF
-    gif_filename = os.path.join(save_path_gif, "ppo_test.gif")
-    # csv
-    save_path_csv = cfg.PPO.save_path_csv
-    csv_output = cfg.PPO.save_csv  # Set to True to save rewards
-    data = []  # Store episode rewards
-    csv_filename = os.path.join(save_path_csv, "test_PPO_rewards.csv")  # CSV file path
-    
-    #####################################################
-    # Load environment with RGB rendering enabled
-    env = FullyObsWrapper(CustomMiniGridEnv(txt_file_path=env_path, 
-                                            custom_mission="Find the key and open the door.",
-                                            max_steps=4000, render_mode="rgb_array"))  # Use "rgb_array" for rendering
+def validate_policy(cfg: DictConfig) -> float:
+    if str(cfg.domain).lower() != "minigrid":
+        raise ValueError("PPO_world_test currently supports the MiniGrid policy only.")
 
-    # Action space dimension
-    if has_continuous_action_space:
-        action_dim = 3 if env_type == 'empty' else env.action_space
-    else:
-        action_dim = 3 if env_type == 'empty' else env.action_space.n
-    state_dim = np.prod(env.observation_space['image'].shape)
+    ppo_cfg = cfg.PPO
+    checkpoint_path = Path(str(ppo_cfg.checkpoint_path)).expanduser().resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Policy checkpoint not found: {checkpoint_path}")
 
-    # Initialize a PPO agent
-    ppo_agent = PPO(state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, has_continuous_action_space, action_std)
+    render = bool(ppo_cfg.render)
+    save_gif = bool(ppo_cfg.save_gif)
+    save_csv = bool(ppo_cfg.save_csv)
+    deterministic = bool(getattr(ppo_cfg, "test_deterministic", True))
+    render_delay = float(getattr(ppo_cfg, "render_delay", 0.05))
+    gif_fps = int(getattr(ppo_cfg, "gif_fps", 10))
+    total_episodes = int(ppo_cfg.total_test_episodes)
+    max_ep_len = int(ppo_cfg.max_ep_len)
 
-    # Load pre-trained weights
-    print("Loading network from : " + checkpoint_path)
-    ppo_agent.load(checkpoint_path)
-    print("--------------------------------------------------------------------------------------------")
+    # Human mode opens a live window. RGB mode is used for headless/GIF runs.
+    render_mode = "human" if render else "rgb_array"
+    env = FullyObsWrapper(
+        CustomMiniGridEnv(
+            txt_file_path=str(ppo_cfg.env_path),
+            custom_mission="Reach the goal.",
+            max_steps=max_ep_len,
+            render_mode=render_mode,
+        )
+    )
 
-    test_running_reward = 0
+    state_dim = int(np.prod(env.observation_space["image"].shape))
+    ppo_agent = PPO(
+        state_dim,
+        MODEL_ACTION_COUNT,
+        ppo_cfg.lr_actor,
+        ppo_cfg.lr_critic,
+        ppo_cfg.gamma,
+        ppo_cfg.K_epochs,
+        ppo_cfg.eps_clip,
+        ppo_cfg.has_continuous_action_space,
+        ppo_cfg.action_std,
+    )
+    print(f"Loading policy: {checkpoint_path}")
+    print(f"Real layout:   {ppo_cfg.env_path}")
+    print(f"Evaluation:    {'deterministic' if deterministic else 'stochastic'}")
+    ppo_agent.load(str(checkpoint_path))
+    ppo_agent.policy_old.eval()
 
-    for ep in range(1, total_test_episodes + 1):
-        ep_reward = 0
-        state_init = env.reset()[0]['image']
-        state = minigrid_utils.ColRowCanl_to_CanlRowCol(state_init)
-        
-        frames = []  # Store frames for the GIF
+    gif_dir = Path(str(ppo_cfg.save_path_gif)).expanduser().resolve()
+    csv_dir = Path(str(ppo_cfg.save_path_csv)).expanduser().resolve()
+    if save_gif:
+        gif_dir.mkdir(parents=True, exist_ok=True)
+    if save_csv:
+        csv_dir.mkdir(parents=True, exist_ok=True)
+
+    results = []
+    total_reward = 0.0
+    for episode in range(1, total_episodes + 1):
+        observation, _ = env.reset()
+        state = ColRowCanl_to_CanlRowCol(observation["image"])
+        episode_reward = 0.0
+        frames = []
+        if save_gif and not render and episode == 1:
+            frames.append(env.render())
 
         for step in range(1, max_ep_len + 1):
-            state_norm = normalize_obs(state, obs_norm_values)
-            if isinstance(state_norm, np.ndarray):
-                state_norm = torch.tensor(state_norm, dtype=torch.float32).to(device)
-                # ---- Select action ----
-            action_out = ppo_agent.select_action(state_norm.flatten())
+            # normalize_obs mutates its input, so preserve the raw discrete state.
+            normalized = normalize_obs(state.copy(), cfg.attention_model.obs_norm_values)
+            state_tensor = torch.as_tensor(
+                normalized, dtype=torch.float32, device=device
+            ).flatten()
+            compact_action = _select_eval_action(
+                ppo_agent, state_tensor, deterministic
+            )
+            native_action = compact_to_native(compact_action)
+            observation, reward, terminated, truncated, _ = env.step(native_action)
+            episode_reward += float(reward)
+            state = ColRowCanl_to_CanlRowCol(observation["image"])
 
-        if isinstance(action_out, tuple):
-            action = action_out[0]
-        else:
-            action = action_out
+            if render:
+                env.render()
+                print(
+                    f"\rEpisode {episode} | step {step} | "
+                    f"action {compact_action}:{COMPACT_ACTION_NAMES[compact_action]} | "
+                    f"reward {episode_reward:.5f}",
+                    end="",
+                    flush=True,
+                )
+                if render_delay > 0:
+                    time.sleep(render_delay)
+            elif save_gif and episode == 1:
+                frames.append(env.render())
 
-        if isinstance(action, torch.Tensor):
-            action = action.item()
-            state_next, reward, done, trunc, _ = env.step(action)
-            ep_reward += reward
-            state_next = minigrid_utils.ColRowCanl_to_CanlRowCol(state_next['image'])
-
-            # Save frames for the GIF
-            if save_gif:
-                frame = env.render()  # Get RGB frame
-                frames.append(frame)
-
-            if visualize_flag:
-                print(f'Episode: {ep} \t Step: {step} \t Reward: {round(ep_reward, 2)}')
-                visualize_obs.compare_states(state, state_next, action, f'ep:{ep} step:{step}', True)
-
-            state = state_next
-
-            if done or trunc:
+            if terminated or truncated:
                 break
 
-        # Save the GIF after an episode (optional: only for the first episode)
-        if save_gif and ep == 1:
-            imageio.mimsave(gif_filename, frames, fps=10)
-            print(f"Saved test episode GIF as {gif_filename}")
-            # Store episode reward for CSV
+        if render:
+            print()
+        success = episode_reward > 0.0
+        total_reward += episode_reward
+        results.append((episode, step, episode_reward, success))
+        print(
+            f"Episode {episode}: steps={step}, reward={episode_reward:.5f}, "
+            f"success={success}"
+        )
 
-        if csv_output:
-            data.append([ep, ep_reward])
-
-        # Clear buffer
-        ppo_agent.buffer.clear()
-        test_running_reward += ep_reward
-        print(f'Episode: {ep} \t\t Reward: {round(ep_reward, 2)}')
-
-    # Save rewards to CSV
-    if csv_output:
-        df = pd.DataFrame(data, columns=["Episode", "Reward"])
-        df.to_csv(csv_filename, index=False, header=True)
+        if save_gif and not render and episode == 1 and frames:
+            gif_path = gif_dir / "ppo_real_env_test.gif"
+            imageio.mimsave(gif_path, frames, fps=gif_fps)
+            print(f"Saved GIF: {gif_path}")
 
     env.close()
-    print("============================================================================================")
 
-    avg_test_reward = test_running_reward / total_test_episodes
-    print(f"Average test reward : {round(avg_test_reward, 2)}")
-    print("============================================================================================")
+    if save_csv:
+        csv_path = csv_dir / "ppo_real_env_test.csv"
+        pd.DataFrame(
+            results, columns=["episode", "steps", "reward", "success"]
+        ).to_csv(csv_path, index=False)
+        print(f"Saved CSV: {csv_path}")
+
+    average_reward = total_reward / max(total_episodes, 1)
+    success_rate = sum(row[3] for row in results) / max(total_episodes, 1)
+    print(f"Average real-environment reward: {average_reward:.5f}")
+    print(f"Success rate: {success_rate:.1%}")
+    return average_reward
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     test()

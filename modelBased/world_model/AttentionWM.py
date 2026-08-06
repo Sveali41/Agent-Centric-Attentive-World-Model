@@ -625,10 +625,24 @@ class AttentionWorldModel(pl.LightningModule):
             )  # (B, H, W)
             weights = 1.0 # Tiered weights are already inside crafter_classification_loss
         else:
-            # MiniGrid: Standard Regression
-            raw_sq_error = (next_observations_predict - next_observations_true) ** 2
-            raw_error_map = raw_sq_error.mean(dim=1)  # (B, H, W)
-            weights = 1.0
+            if getattr(self.model, 'out_channel', 3) == 21:
+                # MiniGrid: Cross Entropy
+                C_target = next_observations_true.size(1)
+                C_prev = obs_prev.size(1)
+                obs_prev_latest = obs_prev[:, -C_target:] if C_prev > C_target else obs_prev
+                true_abs = (obs_prev_latest + next_observations_true).long()
+                
+                loss_obj = F.cross_entropy(next_observations_predict[:, 0:11, ...], true_abs[:, 0, ...], reduction='none')
+                loss_color = F.cross_entropy(next_observations_predict[:, 11:17, ...], true_abs[:, 1, ...], reduction='none')
+                loss_state = F.cross_entropy(next_observations_predict[:, 17:21, ...], true_abs[:, 2, ...], reduction='none')
+                
+                raw_error_map = loss_obj + loss_color + loss_state
+                weights = 1.0
+            else:
+                # MiniGrid: Standard Regression
+                raw_sq_error = (next_observations_predict - next_observations_true) ** 2
+                raw_error_map = raw_sq_error.mean(dim=1)  # (B, H, W)
+                weights = 1.0
 
         # 2. Aggressive Spatial/Change Weighting (Only if use_weighted_loss is True and NOT handled by CE)
         if use_weighted_loss and self.env_type != 'crafter':
@@ -803,8 +817,28 @@ class AttentionWorldModel(pl.LightningModule):
                 continuous_mask[contact_indices] = False
                 raw_mse = F.mse_loss(obs_pred[:, continuous_mask], obs_next[:, continuous_mask])
             else:
-                raw_mse = F.mse_loss(obs_pred, obs_next)
-            raw_ce = None
+                if getattr(self.model, 'out_channel', 3) == 21:
+                    C_target = obs_next.size(1)
+                    C_prev = obs.size(1)
+                    obs_prev_latest = obs[:, -C_target:] if C_prev > C_target else obs
+                    true_abs = (obs_prev_latest + obs_next).long()
+                    
+                    loss_obj = F.cross_entropy(obs_pred[:, 0:11, ...], true_abs[:, 0, ...])
+                    loss_color = F.cross_entropy(obs_pred[:, 11:17, ...], true_abs[:, 1, ...])
+                    loss_state = F.cross_entropy(obs_pred[:, 17:21, ...], true_abs[:, 2, ...])
+                    
+                    raw_ce = loss_obj + loss_color + loss_state
+                    
+                    # Compute synthetic MSE for backward compatibility
+                    obj_pred = torch.argmax(obs_pred[:, 0:11, ...], dim=1, keepdim=True)
+                    color_pred = torch.argmax(obs_pred[:, 11:17, ...], dim=1, keepdim=True)
+                    state_pred = torch.argmax(obs_pred[:, 17:21, ...], dim=1, keepdim=True)
+                    state_pre_masked = torch.cat([obj_pred, color_pred, state_pred], dim=1).float()
+                    delta_pred = state_pre_masked - obs_prev_latest
+                    raw_mse = F.mse_loss(delta_pred, obs_next)
+                else:
+                    raw_mse = F.mse_loss(obs_pred, obs_next)
+                    raw_ce = None
             if self.is_bipedal and hasattr(self.model, "bipedal_token_specs"):
                 for token_name, token_indices in self.model.bipedal_token_specs:
                     if token_name in getattr(self.model, "contact_token_names", set()):
@@ -1027,7 +1061,20 @@ class AttentionWorldModel(pl.LightningModule):
                 continuous_mask[contact_indices] = False
                 raw_mse = F.mse_loss(obs_pred[:, continuous_mask], obs_next[:, continuous_mask])
             else:
-                raw_mse = F.mse_loss(obs_pred, obs_next)
+                if getattr(self.model, 'out_channel', 3) == 21:
+                    C_target = obs_next.size(1)
+                    C_prev = obs.size(1)
+                    obs_prev_latest = obs[:, -C_target:] if C_prev > C_target else obs
+                    true_abs = (obs_prev_latest + obs_next).long()
+                    
+                    loss_obj = F.cross_entropy(obs_pred[:, 0:11, ...], true_abs[:, 0, ...])
+                    loss_color = F.cross_entropy(obs_pred[:, 11:17, ...], true_abs[:, 1, ...])
+                    loss_state = F.cross_entropy(obs_pred[:, 17:21, ...], true_abs[:, 2, ...])
+                    
+                    raw_ce = loss_obj + loss_color + loss_state
+                    raw_mse = raw_ce  # Map to raw_mse variable to ensure val_loss works
+                else:
+                    raw_mse = F.mse_loss(obs_pred, obs_next)
             loss_val = raw_mse
             # Optional: weighted validation metric for MiniGrid comparison.
             # Keep default behavior unchanged unless validation_metric explicitly requests it.

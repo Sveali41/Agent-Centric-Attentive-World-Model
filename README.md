@@ -60,7 +60,46 @@ Available task groups include:
    source .env
    ```
 
+All documented entry points add the repository root automatically, so they can be run from the repository root with either direct script syntax or Python module syntax. Module syntax is also supported:
+
+```bash
+python -m modelBased.world_model.AttentionWM_training domain=minigrid
+```
+
 ## Training Pipeline
+
+### One-command pipeline
+
+The repository root contains the Hydra-based `run_pipeline.py`, which checks expected dataset and checkpoint files before each stage. Existing stages are skipped automatically:
+
+```bash
+source .env
+
+python run_pipeline.py pipeline.label=minigrid
+python run_pipeline.py pipeline.label=crafter
+python run_pipeline.py pipeline.label=bipedalwalker
+python run_pipeline.py pipeline.label=full                         # all domains
+python run_pipeline.py pipeline.label=full pipeline.skip_policy=true # data + world model only
+python run_pipeline.py pipeline.label=minigrid pipeline.force=true  # force rerun
+```
+
+The default values are stored in `modelBased/config/config.yaml` under `pipeline:`. Dataset and checkpoint paths can also be changed there or overridden with Hydra arguments.
+
+The current PPO world-model policy implementation is MiniGrid-specific. Therefore, `run_pipeline.py` runs the policy stage for MiniGrid and reports a clear skip for Crafter and BipedalWalker until their corresponding policy adapters are added.
+
+For a longer policy run after validating the setup, override the PPO budget explicitly:
+
+```bash
+python run_pipeline.py pipeline.label=minigrid \
+  PPO.max_training_timesteps=300000 \
+  PPO.max_ep_len=512
+```
+
+If `pipeline.label` is omitted, it follows the top-level `domain` value in `modelBased/config/config.yaml`. For example, with `domain: bipedalwalker`, simply run:
+
+```bash
+python run_pipeline.py
+```
 
 ### 1. Collect transition data
 
@@ -92,21 +131,88 @@ The model automatically uses discrete losses for MiniGrid and Crafter, and norma
 
 ### 3. Train a policy using the world model
 
-Configure PPO in `modelBased/config/config.yaml`, then run:
+Configure PPO in `modelBased/config/config.yaml` with real-environment training
+disabled:
+
+```yaml
+PPO:
+  train_in_real_env: false
+```
+
+Then run:
 
 ```bash
-python modelBased/policy_training/PPO_world_training.py domain=minigrid
-python modelBased/policy_training/PPO_world_training.py domain=crafter
-python modelBased/policy_training/PPO_world_training.py domain=bipedalwalker
+python -m modelBased.policy_training.PPO_world_training domain=minigrid
+```
+
+The current world-model PPO implementation is MiniGrid-specific.
+
+### 3a. Train model-free PPO directly in the real environment
+
+To bypass data collection and the world model, enable real-environment
+training in `modelBased/config/config.yaml`:
+
+```yaml
+domain: minigrid
+
+domains:
+  minigrid:
+    task_name: simple_test
+    layout_path: ${oc.env:PROJECT_ROOT}/level/simple_test.txt
+
+PPO:
+  train_in_real_env: true
+```
+
+`domains.minigrid.layout_path` selects the real MiniGrid environment used by
+both policy training and testing. Change `task_name` together with the layout
+so that a new environment does not reuse a checkpoint name from an older task.
+
+Run model-free PPO directly with:
+
+```bash
+python -m modelBased.policy_training.PPO_world_training domain=minigrid
+```
+
+The same settings can be supplied without editing the YAML file:
+
+```bash
+python -m modelBased.policy_training.PPO_world_training \
+  domain=minigrid \
+  PPO.train_in_real_env=true \
+  domains.minigrid.task_name=simple_test \
+  domains.minigrid.layout_path=${PROJECT_ROOT}/level/simple_test.txt
+```
+
+When using the complete pipeline, `PPO.train_in_real_env=true` also tells
+`run_pipeline.py` to skip transition-data collection and world-model training:
+
+```bash
+python run_pipeline.py pipeline.label=minigrid PPO.train_in_real_env=true
 ```
 
 ### 4. Test a trained policy
 
 ```bash
-python modelBased/policy_training/PPO_world_test.py domain=minigrid
-python modelBased/policy_training/PPO_world_test.py domain=crafter
-python modelBased/policy_training/PPO_world_test.py domain=bipedalwalker
+# Run the learned compact-action policy in the real MiniGrid environment and
+# open a live render window.
+python -m modelBased.policy_training.PPO_world_test domain=minigrid \
+  PPO.total_test_episodes=1 PPO.render=true PPO.save_gif=false PPO.save_csv=false
+
+# Headless alternative: save the first real-environment episode as a GIF.
+python -m modelBased.policy_training.PPO_world_test domain=minigrid \
+  PPO.total_test_episodes=1 PPO.render=false PPO.save_gif=true PPO.save_csv=false
 ```
+
+The evaluator loads `PPO.checkpoint_path`, reads the same configured layout as
+policy training, and maps compact actions `[0,1,2,3,4]` back to MiniGrid native
+actions `[0,1,2,3,5]` before calling the real environment's `step()` method.
+Set `PPO.test_deterministic=false` to sample from the learned categorical
+policy, or `PPO.test_deterministic=true` to evaluate its argmax behavior. The
+default configuration evaluates the learned stochastic policy. Argmax remains
+available as a stricter diagnostic, but it can turn a valid stochastic policy
+into a repeated-action loop in states where its highest-probability action does
+not change the observation.
 
 ## Recommended Workflow by Domain
 

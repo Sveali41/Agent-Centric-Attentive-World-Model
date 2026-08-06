@@ -1,4 +1,10 @@
 import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from modelBased.common.utils import PROJECT_ROOT
 from domain.minigrid.minigrid_custom_env import CustomMiniGridEnv
 from minigrid.wrappers import FullyObsWrapper
@@ -8,6 +14,7 @@ from modelBased.policy_training.PPO import PPO
 import hydra
 from datetime import datetime
 from modelBased.common import utils
+from domain.minigrid.action_codec import compact_to_native, MODEL_ACTION_COUNT
 
 from omegaconf import DictConfig, OmegaConf 
 from modelBased.world_model import AttentionWM_support
@@ -91,9 +98,7 @@ def find_position(array, target):
         return None
 
 def process_data(state, maks_size):
-    agent_postion_yx = utils.get_agent_position(state)
-    state_masked = utils.extract_masked_state(state, maks_size, agent_postion_yx) 
-    return state_masked
+    return utils.extract_masked_state_torch(state, maks_size)
 
 def evaluate_policy(policy, env, episodes, obs_norm_values):
     """
@@ -108,7 +113,7 @@ def evaluate_policy(policy, env, episodes, obs_norm_values):
         for _ in range(env.max_steps):
             state_tensor = torch.tensor(utils.normalize_obs(state, obs_norm_values)).to(device)
             action, _, _, _, _ = policy.select_action(state_tensor.flatten())
-            obs, reward, done, _, _ = env.step(action)
+            obs, reward, done, _, _ = env.step(compact_to_native(action))
             state = utils.ColRowCanl_to_CanlRowCol(obs['image'])
             ep_reward += reward
             if done:
@@ -119,19 +124,60 @@ def evaluate_policy(policy, env, episodes, obs_norm_values):
 # add the function add objects into the inventory
 def add_object_to_inventory(delta_state, info):
     """
-    Add an object to the agent's inventory in the environment.
-    It should depend on the changes between next state and current state.
-    the delta: whether the delta includes a minus key value 
-    assuming for key valus == 5
+    Update the imagined MiniGrid inventory after a key is removed.
     
     Args:
         for a keydoor environment
-        info['carraying_key'] (bool): Whether the agent is carrying a key.
+        info['carrying_key'] (bool): Whether the agent is carrying a key.
     """
 
-    if (delta_state[0,:,:] == -5).any():
+    # MiniGrid encodes key=5 and empty=1, hence pickup produces 1 - 5 = -4.
+    # Keep -5 for compatibility with older observations that used unseen=0.
+    if (delta_state[0, :, :] == -4).any() or (delta_state[0, :, :] == -5).any():
         info['carrying_key'] = True
     return info
+
+
+def apply_known_minigrid_interaction(state_masked, action, info):
+    """Apply deterministic pickup/toggle rules in compact action space.
+
+    Random WM data contains very few successful interaction transitions. These
+    rules prevent a missed pickup from blocking every subsequent imagined step;
+    movement and turning dynamics are still predicted by the world model.
+    """
+    action = int(action)
+    next_state = state_masked.clone()
+    next_info = dict(info or {})
+    carrying_key = bool(next_info.get('carrying_key', False))
+
+    center = state_masked.shape[-1] // 2
+    direction = int(state_masked[2, center, center].item())
+    direction_delta = {
+        0: (0, 1),   # right
+        1: (1, 0),   # down
+        2: (0, -1),  # left
+        3: (-1, 0),  # up
+    }
+    dy, dx = direction_delta[direction]
+    front_y, front_x = center + dy, center + dx
+    if not (0 <= front_y < state_masked.shape[-2] and 0 <= front_x < state_masked.shape[-1]):
+        return next_state, next_info
+
+    front_object = int(state_masked[0, front_y, front_x].item())
+    front_status = int(state_masked[2, front_y, front_x].item())
+
+    if action == 3 and front_object == 5 and not carrying_key:  # pickup key
+        next_state[:, front_y, front_x] = next_state.new_tensor([1, 0, 0])
+        next_info['carrying_key'] = True
+    elif action == 4 and front_object == 4:  # toggle door
+        if front_status == 2 and carrying_key:      # locked -> open
+            next_state[2, front_y, front_x] = 0
+        elif front_status == 0:                     # open -> closed
+            next_state[2, front_y, front_x] = 1
+        elif front_status == 1:                     # unlocked closed -> open
+            next_state[2, front_y, front_x] = 0
+
+    return next_state, next_info
 
 
 
@@ -160,7 +206,9 @@ def run_ppo_wm(cfg):
             hparams_world_model.grid_shape, 
             hparams_world_model.attention_mask_size, 
             hparams_world_model.embed_dim, 
-            hparams_world_model.num_heads
+            hparams_world_model.num_heads,
+            env_type=hparams_world_model.env_type,
+            frame_stack=hparams_world_model.frame_stack,
         )
     else:
         print(f"Model type: {hparams_world_model.model_type} not supported")
@@ -224,20 +272,18 @@ def run_ppo_wm(cfg):
     print_running_reward = 0
     print_running_episodes = 0
     time_step = 0
-    step_penalty = -0.9 / max_ep_len
+    step_penalty = float(getattr(hparams_PPO, "step_penalty", 0.0))
     final_norm_regret = None
     
     # action space dimension
     if has_continuous_action_space:
-        if env_type == 'empty':
-            action_dim = 3
-        else:
-            action_dim = 5
+        action_dim = int(np.prod(env.action_space.shape))
     else:
-        if env_type == 'empty':
-            action_dim = 3
-        else:
-            action_dim = 5
+        # Keep PPO's action IDs identical to the MiniGrid environment and WM
+        # dataset (the full MiniGrid action space is normally 0..6).
+        # PPO/WM use the compact five-action space. ``drop`` and ``done`` are
+        # excluded during data collection and are mapped only at env.step().
+        action_dim = MODEL_ACTION_COUNT
     state_dim = np.prod(env.observation_space['image'].shape)
     ppo_agent = PPO(state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, has_continuous_action_space,
                     action_std)
@@ -267,15 +313,36 @@ def run_ppo_wm(cfg):
                 # state = utils.normalize_obs(state_0, hparams_world_model.obs_norm_values)
                 state_0 = torch.tensor(state_0).to(device)
             
-            state_norm = utils.normalize_obs(state_0, hparams_world_model.obs_norm_values)
+            # Keep the raw discrete state for the WM and reward detector.
+            # normalize_obs operates in-place on tensors, so passing state_0
+            # directly here corrupts the state used by the next WM step.
+            state_norm = utils.normalize_obs(
+                state_0.clone(), hparams_world_model.obs_norm_values
+            )
             action, state_buffer, action_buffer, action_logprob, state_val = ppo_agent.select_action(state_norm.flatten()) # state is the dimension of flatten
 
  
             state_masked = process_data(state_0.clone(), hparams_world_model.attention_mask_size)
-            with torch.no_grad():
-                delta_masked, _ = model(state_masked, action, info)
-            
-            state_pre_masked = state_masked + delta_masked
+            if int(action) in (3, 4):
+                state_pre_masked, info = apply_known_minigrid_interaction(
+                    state_masked, int(action), info
+                )
+            else:
+                with torch.no_grad():
+                    # The WM was trained with compact dataset action IDs.
+                    wm_out, _, _ = model(state_masked, int(action), info)
+                
+                if getattr(model, 'out_channel', 3) == 21:
+                    # Cross Entropy mode: output is categorical logits
+                    # wm_out shape is (21, H, W) because batch dim is squeezed
+                    obj_pred = torch.argmax(wm_out[0:11, ...], dim=0, keepdim=True)
+                    color_pred = torch.argmax(wm_out[11:17, ...], dim=0, keepdim=True)
+                    state_pred = torch.argmax(wm_out[17:21, ...], dim=0, keepdim=True)
+                    state_pre_masked = torch.cat([obj_pred, color_pred, state_pred], dim=0).float()
+                else:
+                    # Legacy MSE mode: output is continuous delta
+                    delta_masked = wm_out
+                    state_pre_masked = state_masked + delta_masked
             if visualize_flag:
                 visualize.compare_states(state_masked, state_pre_masked, action, t, True)
             # delta_state_pre = delta_state_pre.to(dtype=torch.float32)
@@ -288,8 +355,13 @@ def run_ppo_wm(cfg):
                                                               hparams_world_model.valid_values_state)
 
             info = add_object_to_inventory((state_pre_masked - state_masked), info)
-            agent_postion_yx = utils.get_agent_position(state_0)
-            state_pre = utils.put_back_masked_state(state_pre_masked, state_0, hparams_world_model.attention_mask_size, agent_postion_yx)
+            agent_postion_yx = utils.get_agent_position_torch(state_0)
+            state_pre = utils.put_back_masked_state_torch(
+                state_pre_masked,
+                state_0,
+                hparams_world_model.attention_mask_size,
+                agent_postion_yx,
+            )
             
 
                 
@@ -304,88 +376,51 @@ def run_ppo_wm(cfg):
             time_step += 1
             current_ep_reward += reward
     
-            # # update PPO agent
-            # if time_step % update_timestep == 0:
-            #     if len(ppo_agent.buffer.rewards) == len(ppo_agent.buffer.state_values) and len(ppo_agent.buffer.rewards) > 1:
-            #         ppo_agent.update()
-            #     else:
-            #         print(f"[WARNING] Buffer mismatch, skipping update. Rewards={len(ppo_agent.buffer.rewards)}, StateValues={len(ppo_agent.buffer.state_values)}")
-            #         ppo_agent.buffer.clear()  # Force-clear the buffer to avoid stale accumulation.
+            # Update is triggered periodically or at episode end
+            if time_step % update_timestep == 0 or done or t >= max_ep_len:
+                need_update = True
 
+            if need_update:
+                rollout_size = len(ppo_agent.buffer.rewards)
+                if rollout_size >= 2:
+                    ppo_agent.update()
+                else:
+                    if rollout_size > 0:
+                        print(f"[PPO SKIP] Rollout too short ({rollout_size} sample); skipping update.")
+                    ppo_agent.buffer.clear()
+                need_update = False
 
-
-            # if continuous action space; then decay action std of ouput action distribution
-            if has_continuous_action_space and time_step % action_std_decay_freq == 0:
-                ppo_agent.decay_action_std(action_std_decay_rate, min_action_std)
-    
-            if time_step % print_freq == 0 and print_running_episodes > 0:
-                # print average reward till last episode
-                print_avg_reward = print_running_reward / print_running_episodes
-                if use_wandb:
-                    sub_run.log({"average_reward": print_avg_reward})
-
-                print("Episode : {} \t\t Timestep : {} \t\t Average Reward : {}".format(i_episode, time_step,
-                                                                                        print_avg_reward))
-
-                print_running_reward = 0
-                print_running_episodes = 0
-
-            # save model weights
-            #region
             if time_step % save_model_freq == 0:
                 print("--------------------------------------------------------------------------------------------")
                 print("saving model at : " + checkpoint_path)
                 ppo_agent.save(checkpoint_path)
                 print("model saved")
-                print("Elapsed Time  : ", datetime.now().replace(microsecond=0) - start_time)
                 print("--------------------------------------------------------------------------------------------")
-            #endregion
 
-            # compute the regret
-            #region
-            if compute_regret and time_step % regret_eval_freq == 0:
-                
-                print(f"Evaluating regret at timestep {time_step}...")
-                R_wm = evaluate_policy(ppo_agent, env, regret_eval_episodes, hparams_world_model.obs_norm_values)
-                R_real = evaluate_policy(real_policy_agent, env, regret_eval_episodes, hparams_world_model.obs_norm_values)
-                regret = R_real - R_wm
-                norm_regret = regret / max(R_real, 1e-8)
-                final_regret = regret
-                final_norm_regret = norm_regret
-                print(f"[Regret @ timestep {time_step}] Real: {R_real:.2f}, WM: {R_wm:.2f}, Regret: {regret:.2f}, Norm: {norm_regret:.2%}")
-
-                if use_wandb:
-                    sub_run.log({
-                        "regret": regret,
-                        "normalized_regret": norm_regret,
-                        "real_policy_reward_in_eva": R_real,
-                        "wm_policy_reward_in_eva": R_wm,
-                        "timestep": time_step
-                    })
-            #endregion
-
-            # break; if the episode is over
-            # Update is triggered in either of these two cases:
-            if time_step % update_timestep == 0 or done or t >= max_ep_len:
-                need_update = True
-
-            if need_update:
-                if len(ppo_agent.buffer.rewards) == len(ppo_agent.buffer.state_values) and len(ppo_agent.buffer.rewards) >= 2:
-                    ppo_agent.update()
-                else:
-                    print(f"[WARNING] Buffer mismatch, skipping update. Rewards={len(ppo_agent.buffer.rewards)}, StateValues={len(ppo_agent.buffer.state_values)}")
-                    ppo_agent.buffer.clear()
-                break  # Break immediately after update to avoid buffer contamination.
+            if done or t >= max_ep_len:
+                break
 
         print_running_reward += current_ep_reward
         print_running_episodes += 1
 
+        if time_step % print_freq < max_ep_len and print_running_episodes > 0:
+            print_avg_reward = print_running_reward / print_running_episodes
+            if use_wandb:
+                sub_run.log({"average_reward": print_avg_reward})
+            print(f"Episode : {i_episode} \t Timestep : {time_step} \t Average Reward : {print_avg_reward:.4f}")
+            print_running_reward = 0
+            print_running_episodes = 0
+
         i_episode += 1
+    
+    # Final save after loop completes
+    ppo_agent.save(checkpoint_path)
     env.close()
     if use_wandb:
         sub_run.finish()
     if compute_regret: 
         return final_norm_regret
+
 
 @hydra.main(version_base=None, config_path=str(PROJECT_ROOT / "modelBased/config"), config_name="config")
 def training_agent_real_env(cfg: DictConfig):
@@ -396,13 +431,18 @@ def run_training_real_env(cfg):
     hparams = cfg
     hparams_PPO = hparams.PPO
     has_continuous_action_space = hparams_PPO.has_continuous_action_space
-    max_ep_len =  hparams_PPO.max_ep_len
-    max_training_timesteps = hparams_PPO.max_training_timesteps
-    print_freq = max_ep_len * 10
-    save_model_freq = hparams_PPO.save_model_freq
-    update_timestep = max_ep_len // 2  # update policy every n timesteps
+    max_ep_len = int(hparams_PPO.max_ep_len)
+    max_training_timesteps = int(hparams_PPO.max_training_timesteps)
+    print_freq = 1000
+    save_model_freq = int(hparams_PPO.save_model_freq)
+    update_timestep = int(getattr(hparams_PPO, "rollout_steps", 1024))
+    if update_timestep < 2:
+        raise ValueError("PPO.rollout_steps must be at least 2")
     print_running_reward = 0
     print_running_episodes = 0
+    print_running_steps = 0
+    print_running_successes = 0
+    next_print_timestep = print_freq
     start_time = datetime.now().replace(microsecond=0)
     env_type =  hparams_PPO.env_type
     wandb_run_name = hparams_PPO.wandb_run_name
@@ -424,7 +464,12 @@ def run_training_real_env(cfg):
     has_continuous_action_space = hparams_PPO.has_continuous_action_space
     env_path = hparams_PPO.env_path
     use_wandb = hparams_PPO.use_wandb
-    step_penalty = 0
+    step_penalty = float(getattr(hparams_PPO, "step_penalty", 0.0))
+    obs_norm_values = getattr(hparams.attention_model, "obs_norm_values", [10, 5, 3])
+    entropy_coef = float(getattr(hparams_PPO, "entropy_coef", 0.01))
+    normalize_advantages = bool(getattr(hparams_PPO, "normalize_advantages", True))
+    normalize_returns = bool(getattr(hparams_PPO, "normalize_returns", False))
+    max_grad_norm = float(getattr(hparams_PPO, "max_grad_norm", 0.5))
 
     if use_wandb:
         wandb.login(key="eeecc8f761c161927a5713203b0362dfcb3181c4")
@@ -434,44 +479,51 @@ def run_training_real_env(cfg):
     # state space dimension
     env = FullyObsWrapper(
         CustomMiniGridEnv(txt_file_path=env_path, custom_mission="Find the key and open the door.",
-                        max_steps=4000, render_mode=None))
+                        max_steps=max_ep_len, render_mode=None))
     
     state_dim = np.prod(env.observation_space['image'].shape)
 
     # action space dimension
-    # action space dimension
     if has_continuous_action_space:
-        if env_type == 'empty':
-            action_dim = 3
-        else:
-            action_dim = 6
+        action_dim = int(np.prod(env.action_space.shape))
     else:
-        if env_type == 'empty':
-            action_dim = 3
-        else:
-            action_dim = 6
+        action_dim = MODEL_ACTION_COUNT
 
-    ppo_agent = PPO(state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, has_continuous_action_space,
-                    action_std)
+    ppo_agent = PPO(
+        state_dim,
+        action_dim,
+        lr_actor,
+        lr_critic,
+        gamma,
+        K_epochs,
+        eps_clip,
+        has_continuous_action_space,
+        action_std,
+        entropy_coef=entropy_coef,
+        normalize_advantages=normalize_advantages,
+        normalize_returns=normalize_returns,
+        max_grad_norm=max_grad_norm,
+    )
 
 
     # training loop
-    while time_step <= max_training_timesteps:
+    while time_step < max_training_timesteps:
 
         state = env.reset()
         current_ep_reward = 0
-        state = preprocess_observation(state[0]['image']).to(device)
+        state = preprocess_observation(state[0]['image'], obs_norm_values).to(device)
 
-        for t in range(1, int(max_ep_len + 1)):
+        for t in range(1, max_ep_len + 1):
 
             # select action with policy
             action, state_buffer, action_buffer, action_logprob, state_val = ppo_agent.select_action(state)
-            state, reward, terminated, truncated, _ = env.step(action)
+            state, reward, terminated, truncated, _ = env.step(compact_to_native(action))
             reward += step_penalty
             done = terminated or truncated
-            state = preprocess_observation(state['image']).to(device)
+            state = preprocess_observation(state['image'], obs_norm_values).to(device)
             # saving reward and is_terminals
             ppo_agent.save_buffer(state_buffer, action_buffer, action_logprob, state_val, reward, done)
+
 
 
             time_step += 1
@@ -480,23 +532,12 @@ def run_training_real_env(cfg):
             # update PPO agent
             if time_step % update_timestep == 0:
                 if len(ppo_agent.buffer.rewards) > 1:
-                    ppo_agent.update()
+                    bootstrap_value = 0.0 if done else ppo_agent.estimate_old_value(state)
+                    ppo_agent.update(bootstrap_value=bootstrap_value)
 
             # if continuous action space; then decay action std of ouput action distribution
             if has_continuous_action_space and time_step % action_std_decay_freq == 0:
                 ppo_agent.decay_action_std(action_std_decay_rate, min_action_std)
-
-            if time_step % print_freq == 0 and print_running_episodes > 0:
-                # print average reward till last episode
-                print_avg_reward = print_running_reward / print_running_episodes
-                if use_wandb:
-                    subrun.log({"average_reward": print_avg_reward})
-
-                print("Episode : {} \t\t Timestep : {} \t\t Average Reward : {}".format(i_episode, time_step,
-                                                                                        print_avg_reward))
-
-                print_running_reward = 0
-                print_running_episodes = 0
 
             # save model weights
             if time_step % save_model_freq == 0:
@@ -507,16 +548,51 @@ def run_training_real_env(cfg):
                 print("Elapsed Time  : ", datetime.now().replace(microsecond=0) - start_time)
                 print("--------------------------------------------------------------------------------------------")
 
-            if done or t == max_ep_len:
-                if len(ppo_agent.buffer.rewards) >= 2:
-                    ppo_agent.update()
-
+            budget_exhausted = time_step >= max_training_timesteps
+            if done or t == max_ep_len or budget_exhausted:
                 break
         print_running_reward += current_ep_reward
         print_running_episodes += 1
+        print_running_steps += t
+        print_running_successes += int(current_ep_reward > 0.0)
+
+        if time_step >= next_print_timestep and print_running_episodes > 0:
+            print_avg_reward = print_running_reward / print_running_episodes
+            print_avg_steps = print_running_steps / print_running_episodes
+            print_success_rate = print_running_successes / print_running_episodes
+            metrics = {
+                "average_reward": print_avg_reward,
+                "average_episode_steps": print_avg_steps,
+                "success_rate": print_success_rate,
+            }
+            if use_wandb:
+                subrun.log(metrics, step=time_step)
+            print(
+                f"Episode : {i_episode} \t Timestep : {time_step} \t "
+                f"Average Reward : {print_avg_reward:.5f} \t "
+                f"Success Rate : {print_success_rate:.1%} \t "
+                f"Average Steps : {print_avg_steps:.1f}"
+            )
+            print_running_reward = 0
+            print_running_episodes = 0
+            print_running_steps = 0
+            print_running_successes = 0
+            while next_print_timestep <= time_step:
+                next_print_timestep += print_freq
 
         i_episode += 1
 
+    # Fixed-size rollouts may leave one partial batch at the end of training.
+    if len(ppo_agent.buffer.rewards) >= 2:
+        bootstrap_value = 0.0 if done else ppo_agent.estimate_old_value(state)
+        ppo_agent.update(bootstrap_value=bootstrap_value)
+    else:
+        ppo_agent.buffer.clear()
+
+    # Always persist the policy from the final update, even when the total
+    # budget is not an exact multiple of save_model_freq.
+    ppo_agent.save(checkpoint_path)
+    print(f"Final policy saved at: {checkpoint_path}")
     env.close()
     if use_wandb:
         subrun.finish()
@@ -550,15 +626,9 @@ def run_policy_evaluation(cfg: DictConfig):
  
     # action space dimension
     if has_continuous_action_space:
-        if env_type == 'empty':
-            action_dim = 3
-        else:
-            action_dim = 6
+        action_dim = int(np.prod(env.action_space.shape))
     else:
-        if env_type == 'empty':
-            action_dim = 3
-        else:
-            action_dim = 6
+        action_dim = MODEL_ACTION_COUNT
     state_dim = np.prod(env.observation_space['image'].shape)
 
     policy_agent = PPO(state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip,
@@ -567,15 +637,14 @@ def run_policy_evaluation(cfg: DictConfig):
     Reward = evaluate_policy(policy_agent, env, episodes, hparams_world_model.obs_norm_values)
     return Reward
 
+@hydra.main(version_base=None, config_path=str(PROJECT_ROOT / "modelBased/config"), config_name="config")
+def main(cfg: DictConfig):
+    if getattr(cfg.PPO, "train_in_real_env", False):
+        print("Training PPO directly in the REAL environment...")
+        run_training_real_env(cfg)
+    else:
+        print("Training PPO using the World Model...")
+        run_ppo_wm(cfg)
+
 if __name__ == "__main__":
-    use_wandb = True
-    if use_wandb:
-        import wandb
-
-        wandb.login(key="eeecc8f761c161927a5713203b0362dfcb3181c4")
-        wandb.init(project='WM Attention PPO', entity='svea41')
-
-    training_agent_wm()
-
-    if use_wandb:
-        wandb.finish()
+    main()

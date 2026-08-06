@@ -18,7 +18,7 @@ from generator.common.utils import (
     
 )
 from generator.data.env_dataset_support import generate_envs_dataset, is_reachable
-from modelBased.common import utils
+from modelBased.common import utils, utilis_support
 
 
 def _get_env_visualize(cfg) -> bool:
@@ -222,14 +222,14 @@ def extract_masked_state(state, mask_size, agent_position_yx):
     pad_val = 2 if state.shape[-3] == 2 else 0
     
     if len(state.shape) == 3:
-        state_masked = utils.extract_masked_state_support(
+        state_masked = utilis_support.extract_masked_state_support(
             state, agent_position_yx, mask_size, pad_value=pad_val
         )
     elif len(state.shape) == 4:
         bsz, channel, _, _ = state.shape
         state_masked = np.zeros((bsz, channel, mask_size, mask_size), dtype=state.dtype)
         for i in range(bsz):
-            state_masked[i, :, :, :] = utils.extract_masked_state_support(
+            state_masked[i, :, :, :] = utilis_support.extract_masked_state_support(
                 state[i], agent_position_yx[i], mask_size, pad_value=pad_val
             )
     else:
@@ -279,13 +279,13 @@ def put_back_masked_state(state_masked, orginal_state, mask_size, agent_position
 
 
 def map_obs_to_nearest_value(obs_denorm, obj_values, color_values, state_values):
-    obs_denorm[0, :, :] = utils.map_to_nearest_value_support(
+    obs_denorm[0, :, :] = utilis_support.map_to_nearest_value_support(
         obs_denorm[0, :, :], obj_values
     )
-    obs_denorm[1, :, :] = utils.map_to_nearest_value_support(
+    obs_denorm[1, :, :] = utilis_support.map_to_nearest_value_support(
         obs_denorm[1, :, :], color_values
     )
-    obs_denorm[2, :, :] = utils.map_to_nearest_value_support(
+    obs_denorm[2, :, :] = utilis_support.map_to_nearest_value_support(
         obs_denorm[2, :, :], state_values
     )
     return obs_denorm
@@ -296,6 +296,14 @@ class Visualization:
         self.cfg = config
         if not os.path.exists(self.cfg.save_path):
             os.mkdir(self.cfg.save_path)
+
+    def _direction_name(self, value):
+        """Map invalid/unseen direction values to a safe visualization label."""
+        return self.cfg.direction_map.get(int(value), "unknown")
+
+    def _action_name(self, value):
+        """Map invalid/unseen action values to a safe visualization label."""
+        return self.cfg.action_map.get(int(value), "unknown")
 
     def compare_states(
         self,
@@ -318,15 +326,15 @@ class Visualization:
             dir_ratio, obj_ratio, act_ratio = 1, 1, 1
 
         state_image = obs[0, :, :].detach().cpu().numpy() * obj_ratio
-        direction = self.cfg.direction_map[
+        direction = self._direction_name(
             round(obs[2, :, :].detach().cpu().numpy().max() * dir_ratio)
-        ]
+        )
 
         state_image_next = obs_next[0, :, :].detach().cpu().numpy() * obj_ratio
-        direction_next = self.cfg.direction_map[
+        direction_next = self._direction_name(
             round(obs_next[2, :, :].detach().cpu().numpy().max() * dir_ratio)
-        ]
-        action = "None" if act is None else self.cfg.action_map[round(act * act_ratio)]
+        )
+        action = "None" if act is None else self._action_name(round(act * act_ratio))
 
         num_colors = 11
         custom_cmap = plt.cm.get_cmap("jet", num_colors)
@@ -370,7 +378,7 @@ class Visualization:
         plt.close()
         obs = obs.detach().cpu().numpy()
         state_image = obs[:, :, 0]
-        action = "None" if act is None else self.cfg.action_map[int(act)]
+        action = "None" if act is None else self._action_name(int(act))
 
         color_list = [
             "#440154",
@@ -421,12 +429,12 @@ class Visualization:
         all_obs = obs_all[:, 0, :, :]
         all_obs_next = obs_next_all[:, 0, :, :]
         direction = [
-            self.cfg.direction_map[int(x)]
+            self._direction_name(int(x))
             for x in np.round(obs[:, 2, mask_size // 2, mask_size // 2])
         ]
-        action = [self.cfg.action_map[int(x)] for x in act[:]]
+        action = [self._action_name(int(x)) for x in act[:]]
         next_direction = [
-            self.cfg.direction_map[int(x)]
+            self._direction_name(int(x))
             for x in np.round(obs_next[:, 2, mask_size // 2, mask_size // 2])
         ]
         obs_next_mask = obs_next[:, 0, :, :]
@@ -526,13 +534,13 @@ class Visualization:
             dir_ratio, obj_ratio, act_ratio = 1, 1, 1
 
         state_image = obs[-1, 0, :, :].detach().cpu().numpy() * obj_ratio
-        direction = self.cfg.direction_map[
+        direction = self._direction_name(
             round(obs[-1, 2, :, :].detach().cpu().numpy().max() * dir_ratio)
-        ]
-        action = self.cfg.action_map[round(act[-1].item() * act_ratio)]
-        next_direction = self.cfg.direction_map[
+        )
+        action = self._action_name(round(act[-1].item() * act_ratio))
+        next_direction = self._direction_name(
             round(obs_next_temp[-1, 2, :, :].detach().cpu().numpy().max() * dir_ratio)
-        ]
+        )
         obs_next = obs_next_temp[-1, 0, :, :].detach().cpu().numpy() * obj_ratio
         pred_direction_idx = round(
             obs_pred[-1, :].reshape(channel, row, col)[2, :, :].detach().cpu().numpy().max()

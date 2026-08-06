@@ -106,40 +106,19 @@ class ActorCritic(nn.Module):
     #     return action.detach(), action_logprob.detach(), state_val.detach()
 
 
-    def _discrete_distribution(self, state, epsilon=0.1, forward_bias=0.6):
-        """Build the behavior distribution used by both rollout and PPO update."""
+    def _discrete_distribution(self, state):
+        """Build the categorical policy used by rollout and PPO update.
+
+        Sampling from ``Categorical`` already provides exploration.  Do not
+        mix in a separate epsilon/forward-biased distribution here: rollout
+        log-probabilities and the probabilities recomputed by PPO must describe
+        exactly the same policy.
+        """
         action_probs = self.actor(state)
         action_probs = action_probs / action_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        return Categorical(action_probs)
 
-        epsilon = min(max(float(epsilon), 0.0), 1.0)
-        if epsilon == 0.0:
-            return Categorical(action_probs)
-
-        # Keep exploration in the final action dimension. For a single state,
-        # action_probs has shape (1, action_dim), so len(action_probs) is the
-        # batch size and must not be used as the number of actions.
-        num_actions = action_probs.shape[-1]
-        if num_actions <= 1:
-            explore_probs = torch.ones_like(action_probs)
-        else:
-            forward_bias = min(max(float(forward_bias), 0.0), 1.0)
-            explore_probs = torch.full_like(
-                action_probs,
-                (1.0 - forward_bias) / (num_actions - 1),
-            )
-            forward_action_index = min(2, num_actions - 1)
-            explore_probs[..., forward_action_index] = forward_bias
-
-        # Sampling from the marginal mixture makes epsilon exploration part of
-        # the PPO behavior policy. evaluate() uses the same distribution, so
-        # stored and recomputed log-probabilities remain consistent.
-        behavior_probs = (1.0 - epsilon) * action_probs + epsilon * explore_probs
-        behavior_probs = behavior_probs / behavior_probs.sum(
-            dim=-1, keepdim=True
-        ).clamp_min(1e-12)
-        return Categorical(behavior_probs)
-
-    def act(self, state, epsilon=0.1, forward_bias=0.6):
+    def act(self, state):
         state = state.to(device)  # Ensure state is on GPU
 
         if self.has_continuous_action_space:
@@ -148,11 +127,7 @@ class ActorCritic(nn.Module):
             dist = MultivariateNormal(action_mean, cov_mat)
             action = dist.sample()
         else:
-            dist = self._discrete_distribution(
-                state,
-                epsilon=epsilon,
-                forward_bias=forward_bias,
-            )
+            dist = self._discrete_distribution(state)
             action = dist.sample()
 
         action_logprob = dist.log_prob(action)
@@ -228,6 +203,10 @@ class PPO:
         self.policy_old.load_state_dict(self.policy.state_dict())
 
         self.MseLoss = nn.MSELoss()
+        # Number of successful optimizer updates.  This is intentionally kept
+        # on the agent so callers can verify that imagined rollouts really
+        # changed the policy, rather than only seeing environment timesteps.
+        self.update_count = 0
 
     def reset_actor_critic(self):
         """
@@ -246,6 +225,7 @@ class PPO:
         self.policy_old.load_state_dict(self.policy.state_dict())
         self.optimizer.state.clear()
         self.optimizer.zero_grad(set_to_none=True)
+        self.update_count = 0
 
     def set_action_std(self, new_action_std):
 
@@ -321,6 +301,15 @@ class PPO:
         return to zero. This lets P2E update within one environment without
         pretending that the environment ended at each online update boundary.
         """
+        rollout_size = len(self.buffer.rewards)
+        if rollout_size == 0:
+            return {
+                "updated": False,
+                "update_count": self.update_count,
+                "rollout_size": 0,
+                "reason": "empty_buffer",
+            }
+
         # Monte Carlo estimate of returns, optionally bootstrapped at a
         # non-terminal rollout boundary.
         rewards = []
@@ -353,6 +342,15 @@ class PPO:
                 advantages - advantages.mean()
             ) / (advantages.std() + 1e-7)
 
+        # Track the parameters across the complete K-epoch update.  A positive
+        # delta is a direct confirmation that the policy weights changed.
+        parameters_before = {
+            name: parameter.detach().clone()
+            for name, parameter in self.policy.named_parameters()
+        }
+        last_loss = None
+        last_grad_norm = 0.0
+
         # Optimize policy for K epochs
         for _ in range(self.K_epochs):
             # Evaluating old actions and values
@@ -377,20 +375,54 @@ class PPO:
 
             # take gradient step
             self.optimizer.zero_grad()
-            loss.mean().backward()
+            loss_mean = loss.mean()
+            loss_mean.backward()
+            last_loss = float(loss_mean.detach().cpu().item())
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.policy.parameters(), self.max_grad_norm
+            ) if self.max_grad_norm > 0.0 else None
             if self.max_grad_norm > 0.0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.policy.parameters(), self.max_grad_norm
-                )
+                last_grad_norm = float(grad_norm.detach().cpu().item())
+            else:
+                grad_squared_norm = 0.0
+                for parameter in self.policy.parameters():
+                    if parameter.grad is not None:
+                        grad_squared_norm += float(parameter.grad.detach().norm(2).item() ** 2)
+                last_grad_norm = grad_squared_norm ** 0.5
             self.optimizer.step()
 
         # Copy new weights into old policy
         self.policy_old.load_state_dict(self.policy.state_dict())
 
+        parameter_delta = 0.0
+        for name, parameter in self.policy.named_parameters():
+            parameter_delta += float(
+                (parameter.detach() - parameters_before[name]).norm(2).item() ** 2
+            )
+        parameter_delta = parameter_delta ** 0.5
+        self.update_count += 1
+        metrics = {
+            "updated": True,
+            "update_count": self.update_count,
+            "rollout_size": rollout_size,
+            "loss": last_loss,
+            "grad_norm": last_grad_norm,
+            "parameter_delta": parameter_delta,
+        }
+        print(
+            f"[PPO UPDATE #{self.update_count}] rollout={rollout_size} "
+            f"loss={last_loss:.6f} grad_norm={last_grad_norm:.6f} "
+            f"parameter_delta={parameter_delta:.6e}"
+        )
+
         # clear buffer
         self.buffer.clear()
+        return metrics
 
     def save(self, checkpoint_path):
+        checkpoint_dir = os.path.dirname(str(checkpoint_path))
+        if checkpoint_dir:
+            os.makedirs(checkpoint_dir, exist_ok=True)
         torch.save(self.policy_old.state_dict(), checkpoint_path)
 
     def load(self, checkpoint_path):
@@ -398,6 +430,18 @@ class PPO:
         self.policy.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
 
 
-def preprocess_observation(obs):
-    obs = obs / np.array([10, 5, 2])
-    return torch.from_numpy(obs.flatten()).float().to(device)
+def preprocess_observation(obs, obs_norm_values=(10, 5, 3)):
+    """Standardized MiniGrid observation preprocessing:
+    1. Ensure channels-first (C, H, W) format.
+    2. Normalize per channel using obs_norm_values (default [10, 5, 3]).
+    3. Flatten into 1D float tensor on device.
+    """
+    from modelBased.common.utils import ColRowCanl_to_CanlRowCol, normalize_obs
+    if isinstance(obs, np.ndarray) and obs.ndim == 3 and obs.shape[0] != 3:
+        state = ColRowCanl_to_CanlRowCol(obs)
+    elif torch.is_tensor(obs) and obs.ndim == 3 and obs.shape[0] != 3:
+        state = ColRowCanl_to_CanlRowCol(obs)
+    else:
+        state = obs
+    normalized = normalize_obs(state.copy() if hasattr(state, 'copy') else state.clone(), obs_norm_values)
+    return torch.as_tensor(normalized.flatten(), dtype=torch.float32, device=device)
