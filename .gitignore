@@ -1,25 +1,59 @@
-/modelBased/wandb/
-wandb/
-outputs/
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local
+*.local.yaml
+*.local.yml
 
-# Ignore Python bytecode files
+# Editors and operating-system metadata
+.vscode/
+.idea/
+.DS_Store
+
+# Python build, cache, and test artifacts
 __pycache__/
-
 *.py[cod]
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
 
-# Ignore JetBrains IDE settings
-.idea/
+# Experiment trackers and Hydra outputs
+wandb/
+**/wandb/
+outputs/
+multirun/
+lightning_logs/
+**/lightning_logs/
 
-# ignore visualisation files
-modelBased/visulization
-generator/visualize
+# Training logs
+modelBased/log/
+trainer/logs/
+*.log
 
-# ignore model files
+# Generated model weights and checkpoints
 modelBased/models/
-lightning_logs
+generator/models/
+trainer/models/
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.safetensors
 
+# Generated visualizations and recorded rollouts
+modelBased/visulization/
+modelBased/visualization/
+generator/visualize/
+visualization/
+visualizations/
+videos/
+*.mp4
+*.avi
+*.webm
 
-# ignore trainer files
-trainer/logs
+# Temporary training data
 trainer/data/temp/
