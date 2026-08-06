@@ -5,13 +5,6 @@ pipeline:
   force: false
   force_policy: false  # Retrain only policy; keep the matching dataset and WM.
   skip_policy: false
-  domains:
-    minigrid:
-      policy_checkpoint: ${oc.env:MODEL_FPATH}/Policy/policy_minigrid_${domains.minigrid.task_name}_seed${PPO.seed}.ckpt
-    crafter:
-      policy_checkpoint: ${oc.env:MODEL_FPATH}/Policy/policy_crafter_${domains.crafter.task_name}_seed${PPO.seed}.ckpt
-    bipedalwalker:
-      policy_checkpoint: ${oc.env:MODEL_FPATH}/Policy/policy_bipedalwalker_${domains.bipedalwalker.task_name}_seed${PPO.seed}.ckpt
 
 domains:
   crafter:
@@ -31,27 +24,36 @@ domains:
     visualize_filename: ${domains.crafter.task_name}_${env.collect.data_type}_coverage.png
     env_visualize_filename: ${domains.crafter.task_name}_${env.collect.data_type}_env.png
     use_bipedal_attention: false
+    transition_balanced_sampling: false
     wm_data_type: discrete
-    use_weighted_loss: false
+    observation_schema:
+      - {name: layout_object, distribution: categorical, prediction_slice: [0, 20], target_index: 0, target_mode: absolute, classes: 20, label_smoothing: 0.1}
+      - {name: layout_direction, distribution: categorical, prediction_slice: [20, 25], target_index: 1, target_mode: absolute, classes: 5, label_smoothing: 0.1}
+      - {name: inventory, distribution: symlog_mse, prediction_source: auxiliary, target_source: inventory}
 
   minigrid:
     env_type: minigrid
-    task_name: Grid_11_11_KD_level1
+    task_name: Grid_11_11_KD_level3
     max_steps: 5000
     grid_shape: [3, 0, 0]
     attention_mask_size: 3
     obs_norm_values: [10, 5, 3]
-    action_norm_values: 7
+    action_norm_values: 6  # Compact IDs 0..5; native done (6) is excluded.
     # Canonical layout source. Normally only task_name needs to change.
     layout_path: ${oc.env:ENV_PATH}/minigrid/${domains.minigrid.task_name}.txt
-    data_save_path: ${oc.env:TRAIN_DATASET_PATH}/minigrid_${domains.minigrid.task_name}_${env.collect.data_type}.npz
-    world_model_checkpoint: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_minigrid_${domains.minigrid.task_name}.ckpt
+    data_save_path: ${oc.env:TRAIN_DATASET_PATH}/minigrid_${domains.minigrid.task_name}_inventory_v1_${env.collect.data_type}.npz
+    world_model_checkpoint: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_minigrid_${domains.minigrid.task_name}_inventory_v1.ckpt
     validation_data_dir: null
     visualize_filename: ${domains.minigrid.task_name}_${env.collect.data_type}_coverage.png
     env_visualize_filename: ${domains.minigrid.task_name}_${env.collect.data_type}_env.png
     use_bipedal_attention: false
+    transition_balanced_sampling: true
     wm_data_type: discrete
-    use_weighted_loss: false
+    observation_schema:
+      - {name: object, distribution: categorical, prediction_slice: [0, 11], target_index: 0, target_mode: current_plus_delta, classes: 11}
+      - {name: color, distribution: categorical, prediction_slice: [11, 17], target_index: 1, target_mode: current_plus_delta, classes: 6}
+      - {name: state, distribution: categorical, prediction_slice: [17, 21], target_index: 2, target_mode: current_plus_delta, classes: 4}
+      - {name: inventory, distribution: categorical, prediction_source: auxiliary, target_source: inventory, classes: 7}
     collection_replace_start_with_empty: true
 
   bipedalwalker:
@@ -82,7 +84,18 @@ domains:
     sb3_deterministic: false
     wm_data_type: norm
     use_bipedal_attention: true
-    use_weighted_loss: false
+    transition_balanced_sampling: false
+    observation_schema:
+      - {name: hull_pose, distribution: mse, indices: [0, 1]}
+      - {name: hull_vel, distribution: mse, indices: [2, 3]}
+      - {name: leg1_hip, distribution: mse, indices: [4, 5]}
+      - {name: leg1_knee, distribution: mse, indices: [6, 7]}
+      - {name: leg1_contact, distribution: bernoulli, indices: [8], prediction_source: contact_logits, target_mode: current_plus_delta}
+      - {name: leg2_hip, distribution: mse, indices: [9, 10]}
+      - {name: leg2_knee, distribution: mse, indices: [11, 12]}
+      - {name: leg2_contact, distribution: bernoulli, indices: [13], prediction_source: contact_logits, target_mode: current_plus_delta}
+      - {name: lidar_near, distribution: mse, indices: [14, 15, 16, 17, 18]}
+      - {name: lidar_far, distribution: mse, indices: [19, 20, 21, 22, 23]}
 
 
 attention_model:
@@ -104,11 +117,17 @@ attention_model:
   wd: 1e-5
   obs_norm_values: ${domains.${domain}.obs_norm_values}
   action_norm_values: ${domains.${domain}.action_norm_values}
+  observation_schema: ${domains.${domain}.observation_schema}
+  # Balance generic (action, state-changed) buckets. This teaches rare valid
+  # interactions without encoding pickup/drop/toggle rules in the collector.
+  transition_balanced_sampling: ${domains.${domain}.transition_balanced_sampling}
   # Cover the MiniGrid object/color vocabulary used by supported layouts.
   valid_values_obj: [1, 2, 3, 4, 5, 8, 10]
-  valid_values_color: [0, 1, 2, 4, 5]
+  valid_values_color: [0, 1, 2, 3, 4, 5]
   valid_values_state: [0, 1, 2, 3]
-  use_weighted_loss: ${domains.${domain}.use_weighted_loss}
+  # A single schema-driven observation objective is used in every domain.
+  # Categorical, binary, continuous, and count fields are normalized first,
+  # then averaged without domain-specific or rarity-specific multipliers.
   use_wandb: False
   enable_progress_bar: True
   log_every_n_steps: 10
@@ -128,9 +147,9 @@ attention_model:
   visualize_every: 50
   save_path: ${oc.env:PROJECT_ROOT}/modelBased/visulization
   direction_map: {0: 'right', 1: 'down', 2: 'left', 3: 'up'}
-  # Compact WM/PPO actions. Native MiniGrid IDs are [0, 1, 2, 3, 5];
-  # native drop (4) and done (6) are intentionally excluded.
-  action_map: {0: 'left', 1: 'right', 2: 'forward', 3: 'pickup', 4: 'toggle'}
+  # Compact WM/PPO actions preserve historical IDs 0-4 and append drop as 5.
+  # Native MiniGrid IDs are [0, 1, 2, 3, 5, 4]; only native done (6) is excluded.
+  action_map: {0: 'left', 1: 'right', 2: 'forward', 3: 'pickup', 4: 'toggle', 5: 'drop'}
   continue_learning: True
   lambda_ewc: 100         # EWC regularization strength
   ewc_ratio: 0.2           # Adaptive ratio target; set to `null` for manual control
@@ -179,7 +198,8 @@ env:
 PPO:
   # This is the only training-source switch. All PPO settings below are shared:
   # True = direct environment transitions; False = world-model transitions.
-  train_in_real_env: False
+  train_in_real_env: false
+  action_set: a6_drop_inventory  # Six actions + colour-aware inventory observation; preserves older checkpoints.
   # Change this value for independent runs. It controls PPO initialization,
   # stochastic actions, and MiniGrid reset randomness in both real and WM modes.
   seed: 4
@@ -215,9 +235,12 @@ PPO:
   step_penalty: 0.0  # Step penalty set to 0.0 (original reward already incorporates step decay)
   lr_actor: 0.0003  # learning rate for actor
   lr_critic: 0.001  # learning rate for critic
-  # Seed-specific paths preserve earlier checkpoints and prevent multi-seed
-  # experiments from overwriting one another.
-  checkpoint_path: ${oc.env:MODEL_FPATH}/Policy/policy_${domain}_${domains.${domain}.task_name}_seed${PPO.seed}.ckpt
+  # Leave null to select the matching source-specific path automatically.
+  # A command-line PPO.checkpoint_path=... override still takes precedence.
+  checkpoint_path: null
+  checkpoint_dir: ${oc.env:MODEL_FPATH}/Policy
+  checkpoint_path_real_env: ${oc.env:MODEL_FPATH}/Policy/policy_${domain}_${domains.${domain}.task_name}_realenv_seed${PPO.seed}.ckpt
+  checkpoint_path_planning: ${oc.env:MODEL_FPATH}/Policy/policy_${domain}_${domains.${domain}.task_name}_seed${PPO.seed}.ckpt
   checkpoint_path_wm: ${domains.${domain}.world_model_checkpoint}
   compute_regret: False
   regret_eval_freq: 5000
@@ -225,8 +248,9 @@ PPO:
   episodes_eval: 10
   wandb_project: minigrid_policy_training
   wandb_entity: null  # null uses the default entity from your `wandb login`
-  wandb_group: ${domain}_${domains.${domain}.task_name}_policy
-  wandb_run_name: ${PPO.wandb_group}_seed${PPO.seed}
+  # Runtime grouping is automatic and layout-specific. Planning preserves
+  # <domain>_<task_name>_policy; real training uses
+  # <domain>_<task_name>_realenv_policy. Each group contains its seed runs.
   rolling_window_episodes: 50  # WandB rolling metrics use the latest N episodes
   time_step: 0
   max_training_timesteps: 1e6  # Increase after validating the pipeline.

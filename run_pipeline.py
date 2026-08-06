@@ -10,6 +10,10 @@ from pathlib import Path
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from modelBased.common.dataset_identity import dataset_matches
+from modelBased.policy_training.experiment_naming import (
+    policy_checkpoint_is_compatible,
+    policy_checkpoint_path,
+)
 
 ROOT = Path(__file__).resolve().parent
 MODEL_DIR = ROOT / "modelBased" / "models"
@@ -30,7 +34,6 @@ def run_command(args: list[str], label: str, cfg: DictConfig) -> None:
 
 def run_domain(domain: str, cfg: DictConfig) -> None:
     domain_cfg = cfg.domains[domain]
-    pipeline_cfg = cfg.pipeline.domains[domain]
     force = bool(cfg.pipeline.force)
     force_policy = bool(getattr(cfg.pipeline, "force_policy", False))
     python = sys.executable
@@ -42,6 +45,15 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
     print(f"[{domain}] Canonical layout: {layout_path}", flush=True)
 
     train_in_real_env = getattr(cfg.PPO, "train_in_real_env", False)
+    policy_source_override = (
+        f"PPO.train_in_real_env={str(bool(train_in_real_env)).lower()}"
+    )
+    policy_identity_overrides = [
+        policy_source_override,
+        f"PPO.seed={int(cfg.PPO.seed)}",
+        f"PPO.action_set={cfg.PPO.action_set}",
+        f"domains.{domain}.task_name={domain_cfg.task_name}",
+    ]
     if train_in_real_env:
         print(f"[{domain}] PPO.train_in_real_env is True. Skipping data collection and world-model training.")
         data_recollected = False
@@ -93,8 +105,16 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
             "implementation is MiniGrid-specific."
         )
     else:
-        policy_path = Path(str(pipeline_cfg.policy_checkpoint))
-        if policy_path.exists() and not force and not force_policy and not data_recollected:
+        policy_path = policy_checkpoint_path(cfg, domain=domain)
+        policy_compatible = policy_checkpoint_is_compatible(
+            policy_path, cfg, domain=domain
+        )
+        if policy_path.exists() and not policy_compatible:
+            print(
+                f"[RETRAIN] Existing policy uses an incompatible observation/action "
+                f"shape: {policy_path}"
+            )
+        if policy_compatible and not force and not force_policy and not data_recollected:
             print(f"[SKIP] Policy checkpoint already exists: {policy_path}")
         else:
             if policy_path.exists() and data_recollected:
@@ -110,6 +130,7 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
                     "domain=minigrid",
                     f"PPO.checkpoint_path={policy_path}",
                     f"PPO.checkpoint_path_wm={world_model_path}",
+                    *policy_identity_overrides,
                 ],
                 f"{domain} / train policy",
                 cfg,
@@ -124,6 +145,7 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
                     "modelBased.policy_training.PPO_world_test",
                     "domain=minigrid",
                     f"PPO.checkpoint_path={policy_path}",
+                    *policy_identity_overrides,
                 ],
                 f"{domain} / test policy",
                 cfg,

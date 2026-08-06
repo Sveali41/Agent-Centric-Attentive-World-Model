@@ -19,7 +19,7 @@ from domain.minigrid import minigrid_support as minigrid_utils
 import modelBased.world_model.AttentionWM_support as AttentionWM_support
 import modelBased.world_model.Embedding_support as Embedding_support
 import modelBased.world_model.MLP_support as MLP_support
-from modelBased.policy_training.PPO_world_training import find_position, process_data, add_object_to_inventory
+from modelBased.policy_training.PPO_world_training import find_position, process_data
 import wandb
 
 
@@ -46,13 +46,23 @@ class GraphPlanner:
         for a in range(self.num_actions):
             masked = process_data(full_obs, self.mask_size)
             with torch.no_grad():
-                delta, _ = self.model(
+                prediction, _, _ = self.model(
                     torch.tensor(masked).unsqueeze(0).to(device),
                     torch.tensor([a]).to(device),
-                    {'carrying_key': False}  
+                    None,
+                    inv=torch.zeros(1, device=device, dtype=torch.long),
                 )
-            delta_np = delta.squeeze(0).cpu().numpy()
-            next_masked = masked + delta_np
+            if getattr(self.model, "out_channel", 3) == 21:
+                next_masked = torch.stack(
+                    (
+                        torch.argmax(prediction[:, 0:11], dim=1),
+                        torch.argmax(prediction[:, 11:17], dim=1),
+                        torch.argmax(prediction[:, 17:21], dim=1),
+                    ),
+                    dim=1,
+                ).squeeze(0).cpu().numpy()
+            else:
+                next_masked = masked + prediction.squeeze(0).cpu().numpy()
             next_masked = minigrid_utils.map_obs_to_nearest_value(
                 next_masked,
                 self.valid_values_obj,
@@ -146,7 +156,7 @@ def run_planner_rollout(cfg: DictConfig):
 
         planned_actions = planner.plan(state_0, goal_obs, k=max_len)
 
-        info = {'carrying_key': False}
+        inventory_token = torch.zeros(1, device=device, dtype=torch.long)
         
         if not planned_actions:
             print("No plan found.")
@@ -156,16 +166,30 @@ def run_planner_rollout(cfg: DictConfig):
             action = torch.tensor([action_id], device=device)
             masked = process_data(state_0, hparams_wm.attention_mask_size)
             with torch.no_grad():
-                delta, _ = model(masked.unsqueeze(0).to(device), action, info)
-            delta_np = delta.squeeze(0).cpu().numpy()
-            next_masked = masked + delta_np
+                prediction, _, inventory_logits = model(
+                    masked.unsqueeze(0).to(device),
+                    action,
+                    None,
+                    inv=inventory_token,
+                )
+            if getattr(model, "out_channel", 3) == 21:
+                next_masked = torch.stack(
+                    (
+                        torch.argmax(prediction[:, 0:11], dim=1),
+                        torch.argmax(prediction[:, 11:17], dim=1),
+                        torch.argmax(prediction[:, 17:21], dim=1),
+                    ),
+                    dim=1,
+                ).squeeze(0).cpu().numpy()
+            else:
+                next_masked = masked + prediction.squeeze(0).cpu().numpy()
             next_masked = minigrid_utils.map_obs_to_nearest_value(
                 next_masked,
                 hparams_wm.valid_values_obj,
                 hparams_wm.valid_values_color,
                 hparams_wm.valid_values_state
             )
-            info = add_object_to_inventory((next_masked - masked), info)
+            inventory_token = torch.argmax(inventory_logits, dim=1).long()
             agent_pos = minigrid_utils.get_agent_position(state_0)
             state_0 = minigrid_utils.put_back_masked_state(
                 next_masked,

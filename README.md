@@ -14,7 +14,7 @@ The same world-model pipeline is shared by all three domains, while the domain a
 
 | Domain | Environment characteristics | Observation representation | Action space | WM data | Typical tasks |
 | --- | --- | --- | --- | --- | --- |
-| **MiniGrid** | 2D discrete grid with walls, doors, keys, objects, and lava | Discrete grid with 3 channels | Discrete | `discrete` | Empty grids, mazes, key-door navigation, obstacle avoidance |
+| **MiniGrid** | 2D discrete grid with walls, doors, keys, objects, and lava | Discrete grid with 3 channels, plus colour-aware carried inventory | Discrete | `discrete` | Empty grids, mazes, key-door navigation, obstacle avoidance |
 | **Crafter** | 2D open-world survival/crafting environment with resources and entities | Discrete symbolic grid with 2 channels, plus inventory state | Discrete | `discrete` | Collecting resources, crafting, exploration, target-task layouts |
 | **BipedalWalker** | Continuous physics-based locomotion over custom terrain | Normalized continuous state vector | Continuous | `norm` | Walking over target terrain, mini-task terrain, stump/obstacle layouts |
 
@@ -184,7 +184,7 @@ python modelBased/data/data_collect.py domain=bipedalwalker
 
 The output is selected automatically from the active domain configuration and saved under `modelBased/data/train_world_model/`:
 
-- MiniGrid: `minigrid_train_random.npz`
+- MiniGrid: `minigrid_<task_name>_inventory_v1_<data_type>.npz`
 - Crafter: `crafter_*.npz`
 - BipedalWalker: `bipedalwalker_<task_group>_<task_name>_<data_type>.npz`
 
@@ -198,7 +198,31 @@ python modelBased/world_model/AttentionWM_training.py domain=crafter
 python modelBased/world_model/AttentionWM_training.py domain=bipedalwalker
 ```
 
-The model automatically uses discrete losses for MiniGrid and Crafter, and normalized continuous targets for BipedalWalker.
+All domains optimize the same schema-driven observation objective:
+
+```text
+observation_loss = mean(normalized_field_loss for field in observation_schema)
+```
+
+Categorical fields use cross-entropy normalized by `log(number_of_classes)`,
+binary fields use BCE normalized by `log(2)`, normalized continuous fields use
+MSE, and count-like Crafter inventory fields use symlog MSE. The field terms
+are averaged without domain-specific or rarity-specific multipliers. Training
+logs one public loss curve, `train/observation_loss`; validation uses the same
+objective as `val/observation_loss`. EWC, when enabled for continual learning,
+remains an optimization regularizer and is not reported as a second observation
+loss. Each domain declares only its fields in `domains.<domain>.observation_schema`
+inside `modelBased/config/config.yaml`; adding a domain does not require another
+loss implementation.
+
+MiniGrid treats carried inventory as part of the learned state: token `0`
+means empty hands and tokens `1..6` represent the six key colours. The WM
+receives `(layout_t, inventory_t, action_t)` and predicts both
+`layout_(t+1)` and `inventory_(t+1)`. All six actions, including pickup,
+toggle, and drop, use this learned transition; imagined planning does not call
+hand-written interaction dynamics. Training batches automatically balance
+generic `(action, state_changed)` buckets so rare successful interactions are
+not hidden by invalid no-op attempts.
 
 ### 3. Train a policy using the world model
 
@@ -224,7 +248,7 @@ The current world-model PPO implementation is MiniGrid-specific.
 `rollout_steps` and `max_training_timesteps` must be divisible by
 `num_imagined_envs`. Set `num_imagined_envs: 1` to reproduce serial imagined
 rollouts. Parallel environments keep independent episode lengths, rewards,
-terminal flags, carrying-key state, returns, and bootstrap values; PPO flattens
+terminal flags, learned colour-aware inventory state, returns, and bootstrap values; PPO flattens
 the resulting `[time, environment]` batch only after computing per-environment
 returns.
 
@@ -288,11 +312,32 @@ python -m modelBased.policy_training.PPO_world_training domain=minigrid PPO.seed
 python -m modelBased.policy_training.PPO_world_training domain=minigrid PPO.seed=2
 ```
 
-New runs are grouped in WandB as
-`<domain>_<task_name>_policy`, with run names ending in `_seed0`, `_seed1`, and
-so on. Policy checkpoints use the same seed suffix, so different seeds and the
-older checkpoint without a seed suffix are preserved independently. Use the
-same `PPO.seed=<N>` override when evaluating a particular checkpoint.
+WandB grouping and artifact names are derived automatically from
+`PPO.train_in_real_env`. Each layout has its own group, and different seeds are
+runs inside that group. WM planning preserves the historical group name;
+direct-environment training adds a `realenv` marker:
+
+```text
+planning: minigrid_Grid_11_11_KD_level2_policy
+real env: minigrid_Grid_11_11_KD_level2_realenv_policy
+```
+
+Runs and policy files keep only the layout, optional `realenv` marker, and seed:
+
+```text
+planning run: minigrid_Grid_11_11_KD_level2_seed4
+real run:     minigrid_Grid_11_11_KD_level2_realenv_seed4
+
+planning: policy_minigrid_Grid_11_11_KD_level2_seed4.ckpt
+real env: policy_minigrid_Grid_11_11_KD_level2_realenv_seed4.ckpt
+```
+
+Different seeds remain separate. If an old five-action checkpoint already has
+the simple planning filename, the pipeline detects its incompatible network
+shape and retrains it instead of silently skipping. Use the same
+`PPO.train_in_real_env` and `PPO.seed=<N>` settings when evaluating a specific
+checkpoint. Set `PPO.checkpoint_path=/custom/path.ckpt` only when an explicit
+override is needed.
 
 The same settings can be supplied without editing the YAML file:
 
@@ -323,9 +368,17 @@ python -m modelBased.policy_training.PPO_world_test domain=minigrid \
   PPO.total_test_episodes=1 PPO.render=false PPO.save_gif=true PPO.save_csv=false
 ```
 
-The evaluator loads `PPO.checkpoint_path`, reads the same configured layout as
-policy training, and maps compact actions `[0,1,2,3,4]` back to MiniGrid native
-actions `[0,1,2,3,5]` before calling the real environment's `step()` method.
+The evaluator automatically selects the matching `real_env` or `planning`
+checkpoint from `PPO.train_in_real_env`, reads the same configured layout as
+policy training, and maps compact actions `[0,1,2,3,4,5]` back to MiniGrid
+native actions `[0,1,2,3,5,4]` before calling the real environment's `step()`
+method. Historical compact IDs remain unchanged (`4=toggle`); `5=drop` is
+appended so an agent can free its single carrying slot when a task contains
+multiple keys. Earlier five-action PPO checkpoints remain under their old
+filenames and are not compatible with the new six-output, inventory-aware
+actor. MiniGrid datasets and WM checkpoints created before the colour-aware
+inventory representation must also be recollected/retrained; `run_pipeline.py`
+detects the dataset metadata version and does this automatically.
 Set `PPO.test_deterministic=false` to sample from the learned categorical
 policy, or `PPO.test_deterministic=true` to evaluate its argmax behavior. The
 default configuration evaluates the learned stochastic policy. Argmax remains

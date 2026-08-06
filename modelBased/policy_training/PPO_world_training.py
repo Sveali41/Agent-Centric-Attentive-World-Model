@@ -13,10 +13,19 @@ from minigrid.wrappers import FullyObsWrapper
 import torch
 import numpy as np
 from modelBased.policy_training.PPO import PPO
+from modelBased.policy_training.experiment_naming import (
+    policy_checkpoint_path,
+    policy_wandb_identity,
+)
 import hydra
 from datetime import datetime
 from modelBased.common import utils
-from domain.minigrid.action_codec import compact_to_native, MODEL_ACTION_COUNT
+from domain.minigrid.action_codec import (
+    INVENTORY_TOKEN_COUNT,
+    MODEL_ACTION_COUNT,
+    carrying_token_from_env,
+    compact_to_native,
+)
 
 from omegaconf import DictConfig, OmegaConf 
 from modelBased.world_model import AttentionWM_support
@@ -50,6 +59,15 @@ def seed_policy_training(seed):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
     return seed
+
+
+def append_inventory_to_policy_state(state_batch, carrying_key):
+    """Append a colour-aware one-hot inventory to flat PPO observations."""
+    tokens = carrying_key.long() + 1
+    inventory = torch.nn.functional.one_hot(
+        tokens, num_classes=INVENTORY_TOKEN_COUNT
+    ).to(dtype=state_batch.dtype, device=state_batch.device)
+    return torch.cat((state_batch, inventory), dim=-1)
 
 def get_destination(obs, episode, maxstep, destination):
     """
@@ -126,7 +144,12 @@ def evaluate_policy(policy, env, episodes, obs_norm_values):
         done = False
         ep_reward = 0
         for _ in range(env.max_steps):
-            state_tensor = torch.tensor(utils.normalize_obs(state, obs_norm_values)).to(device)
+            state_tensor = preprocess_observation(
+                state,
+                obs_norm_values,
+                inventory_token=carrying_token_from_env(env),
+                inventory_classes=INVENTORY_TOKEN_COUNT,
+            )
             action, _, _, _, _ = policy.select_action(state_tensor.flatten())
             obs, reward, done, _, _ = env.step(compact_to_native(action))
             state = utils.ColRowCanl_to_CanlRowCol(obs['image'])
@@ -135,122 +158,6 @@ def evaluate_policy(policy, env, episodes, obs_norm_values):
                 break
         total_reward += ep_reward
     return total_reward / episodes
-
-# add the function add objects into the inventory
-def add_object_to_inventory(delta_state, info):
-    """
-    Update the imagined MiniGrid inventory after a key is removed.
-    
-    Args:
-        for a keydoor environment
-        info['carrying_key'] (bool): Whether the agent is carrying a key.
-    """
-
-    # MiniGrid encodes key=5 and empty=1, hence pickup produces 1 - 5 = -4.
-    # Keep -5 for compatibility with older observations that used unseen=0.
-    if (delta_state[0, :, :] == -4).any() or (delta_state[0, :, :] == -5).any():
-        info['carrying_key'] = True
-    return info
-
-
-def apply_known_minigrid_interaction(state_masked, action, info):
-    """Apply deterministic pickup/toggle rules in compact action space.
-
-    Random WM data contains very few successful interaction transitions. These
-    rules prevent a missed pickup from blocking every subsequent imagined step;
-    movement and turning dynamics are still predicted by the world model.
-    """
-    action = int(action)
-    next_state = state_masked.clone()
-    next_info = dict(info or {})
-    carrying_key = bool(next_info.get('carrying_key', False))
-
-    center = state_masked.shape[-1] // 2
-    direction = int(state_masked[2, center, center].item())
-    direction_delta = {
-        0: (0, 1),   # right
-        1: (1, 0),   # down
-        2: (0, -1),  # left
-        3: (-1, 0),  # up
-    }
-    dy, dx = direction_delta[direction]
-    front_y, front_x = center + dy, center + dx
-    if not (0 <= front_y < state_masked.shape[-2] and 0 <= front_x < state_masked.shape[-1]):
-        return next_state, next_info
-
-    front_object = int(state_masked[0, front_y, front_x].item())
-    front_status = int(state_masked[2, front_y, front_x].item())
-
-    if action == 3 and front_object == 5 and not carrying_key:  # pickup key
-        next_state[:, front_y, front_x] = next_state.new_tensor([1, 0, 0])
-        next_info['carrying_key'] = True
-    elif action == 4 and front_object == 4:  # toggle door
-        if front_status == 2 and carrying_key:      # locked -> open
-            next_state[2, front_y, front_x] = 0
-        elif front_status == 0:                     # open -> closed
-            next_state[2, front_y, front_x] = 1
-        elif front_status == 1:                     # unlocked closed -> open
-            next_state[2, front_y, front_x] = 0
-
-    return next_state, next_info
-
-
-def apply_known_minigrid_interaction_batch(
-    state_masked, actions, carrying_key
-):
-    """Vectorized pickup/toggle dynamics for parallel imagined MiniGrid."""
-    next_state = state_masked.clone()
-    actions = actions.to(state_masked.device).long().reshape(-1)
-    carrying_key = carrying_key.to(state_masked.device).bool().reshape(-1).clone()
-    batch_size = state_masked.shape[0]
-    center_y = state_masked.shape[-2] // 2
-    center_x = state_masked.shape[-1] // 2
-
-    directions = state_masked[:, 2, center_y, center_x].long()
-    direction_deltas = torch.tensor(
-        [[0, 1], [1, 0], [0, -1], [-1, 0]],
-        device=state_masked.device,
-        dtype=torch.long,
-    )
-    deltas = direction_deltas[directions]
-    front_y = center_y + deltas[:, 0]
-    front_x = center_x + deltas[:, 1]
-    batch_ids = torch.arange(batch_size, device=state_masked.device)
-    front_object = state_masked[batch_ids, 0, front_y, front_x].long()
-    front_status = state_masked[batch_ids, 2, front_y, front_x].long()
-
-    pickup = (actions == 3) & (front_object == 5) & (~carrying_key)
-    if pickup.any():
-        pickup_ids = batch_ids[pickup]
-        pickup_y = front_y[pickup]
-        pickup_x = front_x[pickup]
-        next_state[pickup_ids, 0, pickup_y, pickup_x] = 1
-        next_state[pickup_ids, 1, pickup_y, pickup_x] = 0
-        next_state[pickup_ids, 2, pickup_y, pickup_x] = 0
-        carrying_key[pickup] = True
-
-    toggle = (actions == 4) & (front_object == 4)
-    open_door = toggle & (
-        ((front_status == 2) & carrying_key) | (front_status == 1)
-    )
-    close_door = toggle & (front_status == 0)
-    if open_door.any():
-        next_state[
-            batch_ids[open_door],
-            2,
-            front_y[open_door],
-            front_x[open_door],
-        ] = 0
-    if close_door.any():
-        next_state[
-            batch_ids[close_door],
-            2,
-            front_y[close_door],
-            front_x[close_door],
-        ] = 1
-
-    return next_state, carrying_key
-
 
 def _nearest_valid_values(values, valid_values):
     valid = torch.as_tensor(
@@ -270,41 +177,31 @@ def imagined_minigrid_step_batch(
     valid_values_color,
     valid_values_state,
 ):
-    """Advance B imagined states with one batched WM call.
-
-    Movement and turning use the learned model. Pickup and toggle retain the
-    same known interaction dynamics as the previous serial implementation.
-    """
+    """Advance B imagined states and inventories with one learned WM call."""
     agent_positions = utils.get_agent_position_torch(states)
     masked = utils.extract_masked_state_torch(
         states, attention_mask_size, agent_positions
     )
-    predicted = masked.clone().float()
-    learned = actions < 3
-
-    if learned.any():
-        learned_info = {"carrying_key": carrying_key[learned]}
-        wm_out, _, _ = model(masked[learned], actions[learned], learned_info)
-        if getattr(model, "out_channel", 3) == 21:
-            predicted[learned] = torch.stack(
-                (
-                    torch.argmax(wm_out[:, 0:11], dim=1),
-                    torch.argmax(wm_out[:, 11:17], dim=1),
-                    torch.argmax(wm_out[:, 17:21], dim=1),
-                ),
-                dim=1,
-            ).float()
-        else:
-            predicted[learned] = masked[learned] + wm_out
-
-    interactions = ~learned
-    if interactions.any():
-        interaction_state, interaction_keys = apply_known_minigrid_interaction_batch(
-            masked[interactions], actions[interactions], carrying_key[interactions]
+    inventory_tokens = carrying_key.long() + 1
+    wm_out, _, inventory_logits = model(
+        masked, actions, None, inv=inventory_tokens
+    )
+    if inventory_logits is None:
+        raise RuntimeError(
+            "MiniGrid WM must predict inventory logits for fully learned planning"
         )
-        predicted[interactions] = interaction_state.float()
-        carrying_key = carrying_key.clone()
-        carrying_key[interactions] = interaction_keys
+    if getattr(model, "out_channel", 3) == 21:
+        predicted = torch.stack(
+            (
+                torch.argmax(wm_out[:, 0:11], dim=1),
+                torch.argmax(wm_out[:, 11:17], dim=1),
+                torch.argmax(wm_out[:, 17:21], dim=1),
+            ),
+            dim=1,
+        ).float()
+    else:
+        predicted = masked + wm_out
+    carrying_key = torch.argmax(inventory_logits, dim=1).long() - 1
 
     predicted[:, 0] = _nearest_valid_values(
         predicted[:, 0], valid_values_obj
@@ -385,12 +282,11 @@ def run_ppo_wm(cfg):
     save_model_freq = int(hparams_PPO.save_model_freq)
     max_ep_len = int(hparams_PPO.max_ep_len)
     has_continuous_action_space = hparams_PPO.has_continuous_action_space
-    checkpoint_path = hparams_PPO.checkpoint_path
+    checkpoint_path = str(policy_checkpoint_path(cfg))
     env_path = hparams_PPO.env_path
     visualize_flag = hparams_PPO.visualize
     env_type =  hparams_PPO.env_type
     use_wandb = hparams_PPO.use_wandb
-    wandb_run_name = hparams_PPO.wandb_run_name
     update_timestep = int(getattr(hparams_PPO, "rollout_steps", 1024))
     if update_timestep < 2:
         raise ValueError("PPO.rollout_steps must be at least 2")
@@ -460,10 +356,10 @@ def run_ppo_wm(cfg):
     else:
         # Keep PPO's action IDs identical to the MiniGrid environment and WM
         # dataset (the full MiniGrid action space is normally 0..6).
-        # PPO/WM use the compact five-action space. ``drop`` and ``done`` are
-        # excluded during data collection and are mapped only at env.step().
+        # PPO/WM use six compact actions. Historical IDs 0-4 are unchanged;
+        # drop is appended as 5 and only native done is excluded.
         action_dim = MODEL_ACTION_COUNT
-    state_dim = np.prod(env.observation_space['image'].shape)
+    state_dim = np.prod(env.observation_space['image'].shape) + INVENTORY_TOKEN_COUNT
     # Constructing/loading the WM consumes PyTorch RNG. Re-seed immediately
     # before PPO construction so matched real/WM runs start from identical
     # actor and critic parameters.
@@ -506,8 +402,8 @@ def run_ppo_wm(cfg):
     goal_positions = torch.as_tensor(
         goal_position_yx, device=device, dtype=torch.long
     ).expand(num_imagined_envs, -1)
-    carrying_key = torch.zeros(
-        num_imagined_envs, device=device, dtype=torch.bool
+    carrying_key = torch.full(
+        (num_imagined_envs,), -1, device=device, dtype=torch.long
     )
     episode_rewards = torch.zeros(
         num_imagined_envs, device=device, dtype=torch.float32
@@ -546,6 +442,7 @@ def run_ppo_wm(cfg):
         state_norm = utils.normalize_obs(
             states.clone(), hparams_world_model.obs_norm_values
         ).reshape(num_imagined_envs, -1)
+        state_norm = append_inventory_to_policy_state(state_norm, carrying_key)
         (
             actions,
             state_buffer,
@@ -596,6 +493,9 @@ def run_ppo_wm(cfg):
             next_state_norm = utils.normalize_obs(
                 states.clone(), hparams_world_model.obs_norm_values
             ).reshape(num_imagined_envs, -1)
+            next_state_norm = append_inventory_to_policy_state(
+                next_state_norm, carrying_key
+            )
             bootstrap_values = ppo_agent.estimate_old_values_batch(next_state_norm)
             bootstrap_values[last_dones.detach().cpu()] = 0.0
             update_metrics = ppo_agent.update(
@@ -645,7 +545,7 @@ def run_ppo_wm(cfg):
                 [reset_imagined_state() for _ in range(completed.numel())], dim=0
             )
             states[completed] = reset_states
-            carrying_key[completed] = False
+            carrying_key[completed] = -1
             episode_rewards[completed] = 0.0
             episode_steps[completed] = 0
 
@@ -687,6 +587,9 @@ def run_ppo_wm(cfg):
         next_state_norm = utils.normalize_obs(
             states.clone(), hparams_world_model.obs_norm_values
         ).reshape(num_imagined_envs, -1)
+        next_state_norm = append_inventory_to_policy_state(
+            next_state_norm, carrying_key
+        )
         bootstrap_values = ppo_agent.estimate_old_values_batch(next_state_norm)
         bootstrap_values[last_dones.detach().cpu()] = 0.0
         update_metrics = ppo_agent.update(bootstrap_value=bootstrap_values)
@@ -711,21 +614,22 @@ def training_agent_real_env(cfg: DictConfig):
 def _init_policy_wandb_run(cfg, default_project):
     """Initialize WandB from the user's login without embedding credentials."""
     ppo_cfg = cfg.PPO
+    wandb_group, wandb_run_name, training_source = policy_wandb_identity(cfg)
+    task_name = str(cfg.domains[str(cfg.domain)].task_name)
     wandb.login()
     init_kwargs = {
         "project": str(getattr(ppo_cfg, "wandb_project", default_project)),
-        "name": str(ppo_cfg.wandb_run_name),
-        "group": str(
-            getattr(
-                ppo_cfg,
-                "wandb_group",
-                f"{cfg.domain}_{cfg.domains[str(cfg.domain)].task_name}_policy",
-            )
-        ),
+        "name": wandb_run_name,
+        "group": wandb_group,
+        "job_type": task_name,
+        "tags": [training_source, task_name],
         "reinit": True,
         "config": {
             "domain": str(cfg.domain),
-            "task_name": str(cfg.domains[str(cfg.domain)].task_name),
+            "task_name": task_name,
+            "layout_path": str(cfg.domains[str(cfg.domain)].layout_path),
+            "training_source": training_source,
+            "policy_checkpoint": str(policy_checkpoint_path(cfg)),
             "seed": int(getattr(ppo_cfg, "seed", 0)),
             "train_in_real_env": bool(ppo_cfg.train_in_real_env),
             "max_ep_len": int(ppo_cfg.max_ep_len),
@@ -770,14 +674,13 @@ def run_training_real_env(cfg):
     recent_successes = deque(maxlen=rolling_window_episodes)
     start_time = datetime.now().replace(microsecond=0)
     env_type =  hparams_PPO.env_type
-    wandb_run_name = hparams_PPO.wandb_run_name
 
     time_step = 0
     i_episode = 0
     action_std_decay_freq = hparams_PPO.action_std_decay_freq
     action_std_decay_rate = hparams_PPO.action_std_decay_rate
     min_action_std = hparams_PPO.min_action_std
-    checkpoint_path = hparams_PPO.checkpoint_path
+    checkpoint_path = str(policy_checkpoint_path(cfg))
 
     # param for agent
     K_epochs = hparams_PPO.K_epochs
@@ -807,7 +710,7 @@ def run_training_real_env(cfg):
         CustomMiniGridEnv(txt_file_path=env_path, custom_mission="Find the key and open the door.",
                         max_steps=max_ep_len, render_mode=None))
     
-    state_dim = np.prod(env.observation_space['image'].shape)
+    state_dim = np.prod(env.observation_space['image'].shape) + INVENTORY_TOKEN_COUNT
 
     # action space dimension
     if has_continuous_action_space:
@@ -838,7 +741,12 @@ def run_training_real_env(cfg):
 
         state = env.reset()
         current_ep_reward = 0
-        state = preprocess_observation(state[0]['image'], obs_norm_values).to(device)
+        state = preprocess_observation(
+            state[0]['image'],
+            obs_norm_values,
+            inventory_token=carrying_token_from_env(env),
+            inventory_classes=INVENTORY_TOKEN_COUNT,
+        ).to(device)
 
         for t in range(1, max_ep_len + 1):
 
@@ -847,7 +755,12 @@ def run_training_real_env(cfg):
             state, reward, terminated, truncated, _ = env.step(compact_to_native(action))
             reward += step_penalty
             done = terminated or truncated
-            state = preprocess_observation(state['image'], obs_norm_values).to(device)
+            state = preprocess_observation(
+                state['image'],
+                obs_norm_values,
+                inventory_token=carrying_token_from_env(env),
+                inventory_classes=INVENTORY_TOKEN_COUNT,
+            ).to(device)
             # saving reward and is_terminals
             ppo_agent.save_buffer(state_buffer, action_buffer, action_logprob, state_val, reward, done)
 
@@ -981,7 +894,7 @@ def run_policy_evaluation(cfg: DictConfig):
     eps_clip = hparams_PPO.eps_clip
     action_std = hparams_PPO.action_std
     has_continuous_action_space = hparams_PPO.has_continuous_action_space
-    checkpoint_path = hparams_PPO.checkpoint_path_wm
+    checkpoint_path = str(policy_checkpoint_path(cfg))
     env_path = hparams_PPO.env_path
     env_type =  hparams_PPO.env_type
     episodes = hparams_PPO.get("episodes_eval")
@@ -996,7 +909,7 @@ def run_policy_evaluation(cfg: DictConfig):
         action_dim = int(np.prod(env.action_space.shape))
     else:
         action_dim = MODEL_ACTION_COUNT
-    state_dim = np.prod(env.observation_space['image'].shape)
+    state_dim = np.prod(env.observation_space['image'].shape) + INVENTORY_TOKEN_COUNT
 
     policy_agent = PPO(state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip,
                     has_continuous_action_space, action_std)

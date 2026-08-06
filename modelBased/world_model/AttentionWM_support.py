@@ -184,7 +184,13 @@ class AttentionModule(nn.Module):
             else:
                 self.input_channel = (11 + 6 + 4) * frame_stack
                 self.action_embedding = nn.Embedding(7, embed_dim)
-            self.key_embedding = nn.Embedding(2, embed_dim)
+                # 0 = empty hands; 1..6 = key colour id + 1.
+                self.key_embedding = nn.Embedding(7, embed_dim)
+                self.inv_head = nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim),
+                    nn.ReLU(),
+                    nn.Linear(embed_dim, 7),
+                )
         else:
             if self.is_bipedal:
                 self.state_dim = int(grid_shape[-1]) if len(grid_shape) > 0 else 24
@@ -414,15 +420,16 @@ class AttentionModule(nn.Module):
             if context_emb.ndim == 1:
                 context_emb = context_emb.unsqueeze(0)
         else:
-            if info is not None and 'carrying_key' in info:
-                has_key = info['carrying_key']
-                if not torch.is_tensor(has_key):
-                    has_key = torch.tensor(has_key, device=state.device)
-                else:
-                    has_key = has_key.to(state.device)
-                context_emb = self.key_embedding(has_key.long())  # (B, D)
-                if context_emb.ndim == 1:
-                    context_emb = context_emb.unsqueeze(0)
+            if inv is not None:
+                carrying_token = torch.as_tensor(inv, device=state.device).long().reshape(-1)
+                context_emb = self.key_embedding(carrying_token)  # (B, D)
+            elif info is not None and 'carrying_key' in info:
+                # Compatibility fallback for callers that have not migrated to
+                # the explicit categorical inventory tensor yet.
+                has_key = torch.as_tensor(
+                    info['carrying_key'], device=state.device
+                ).long().reshape(-1)
+                context_emb = self.key_embedding(has_key)
             else:
                 context_emb = torch.zeros_like(action_emb[:, 0, :])  # (B, D)
 
@@ -444,10 +451,10 @@ class AttentionModule(nn.Module):
         x_out = self.fc(x)
         x_out = x_out.transpose(1, 2).reshape(B, self.out_channel, H, W)
 
-        if self.env_type == 'crafter':
-            # Mean pool over spatial patches to predict inventory
+        if self.env_type in ('crafter', 'minigrid'):
+            # Mean pool over spatial patches to predict the next inventory.
             x_pooled = x.mean(dim=1)  # (B, D)
-            inv_pred = self.inv_head(x_pooled) # (B, 16)
+            inv_pred = self.inv_head(x_pooled)
         else:
             inv_pred = None
 

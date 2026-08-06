@@ -41,6 +41,9 @@ def identity_from_config(cfg: Any, domain: str | None = None) -> dict[str, Any]:
         identity["collection_replace_start_with_empty"] = bool(
             getattr(collect_cfg, "replace_start_with_empty", False)
         )
+        # Version the transition state representation so datasets collected
+        # before colour-aware carried inventory are never silently reused.
+        identity["inventory_encoding"] = "key_color_token_v1"
     return identity
 
 

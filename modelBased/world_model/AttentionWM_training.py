@@ -185,7 +185,7 @@ def run(
         )
 
     # callbacks
-    metric_to_monitor = 'avg_val_loss_wm'
+    metric_to_monitor = 'val/observation_loss'
     early_stop_callback = EarlyStopping(
         monitor=metric_to_monitor,
         min_delta=0.00,
@@ -324,7 +324,7 @@ def run(
         best_score = trainer.checkpoint_callback.best_model_score
         result["best_loss"] = best_score.item() if best_score is not None else 0.0
         
-        # Capture all final metrics for logging (e.g. ce_loss, inv_loss, ewc_term)
+        # Capture the unified observation metric (and any non-loss diagnostics).
         for k, v in trainer.callback_metrics.items():
              # Strip 'train/' prefix if present for uniform UED logging
              clean_k = k.replace("train/", "")

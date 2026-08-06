@@ -319,7 +319,7 @@ def validate_on_target_task(cfg, old_params, data_save_dir, target_file, phase_n
 
     for v in range(VALID_TIMES):
         val_result, model = AttentionWM_training.train_api(cfg, old_params, None)
-        loss_val = float(val_result[0]['avg_val_loss_wm'])
+        loss_val = float(val_result[0]['val/observation_loss'])
         losses.append(loss_val)
 
         del model
@@ -515,8 +515,8 @@ def test_1(cfg: DictConfig):
             else:
                 sum_map += loss_map
 
-            if isinstance(val_result, list) and isinstance(val_result[0], dict) and 'avg_val_loss_wm' in val_result[0]:
-                loss_val = float(val_result[0]['avg_val_loss_wm'])
+            if isinstance(val_result, list) and isinstance(val_result[0], dict) and 'val/observation_loss' in val_result[0]:
+                loss_val = float(val_result[0]['val/observation_loss'])
                 all_loss_whole_map.append(loss_val)
             else:
                 raise ValueError(f"Unexpected validation return format: {val_result}")
@@ -767,7 +767,7 @@ def curriculum_learning_transitions(cfg: DictConfig):
         cfg.attention_model.freeze_weight = True
         cfg.attention_model.data_dir = os.path.join(data_save_dir, minitask_filename)
         val_result, model = AttentionWM_training.train_api(cfg, old_params, None)
-        loss_val = float(val_result[0]['avg_val_loss_wm'])
+        loss_val = float(val_result[0]['val/observation_loss'])
         print(f"[Forgetting Check] Minitask {step} Loss: {loss_val:.5f}")
 
 

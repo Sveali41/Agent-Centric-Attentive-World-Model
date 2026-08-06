@@ -21,13 +21,20 @@ from omegaconf import DictConfig
 
 from domain.minigrid.action_codec import (
     COMPACT_ACTION_NAMES,
+    INVENTORY_TOKEN_COUNT,
     MODEL_ACTION_COUNT,
+    carrying_token_from_env,
     compact_to_native,
 )
 from domain.minigrid.minigrid_custom_env import CustomMiniGridEnv
 from domain.minigrid.minigrid_support import ColRowCanl_to_CanlRowCol
 from modelBased.common.utils import normalize_obs
 from modelBased.policy_training.PPO import PPO
+from modelBased.policy_training.experiment_naming import (
+    policy_checkpoint_is_compatible,
+    policy_checkpoint_path,
+    policy_training_source,
+)
 
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -57,9 +64,14 @@ def validate_policy(cfg: DictConfig) -> float:
         raise ValueError("PPO_world_test currently supports the MiniGrid policy only.")
 
     ppo_cfg = cfg.PPO
-    checkpoint_path = Path(str(ppo_cfg.checkpoint_path)).expanduser().resolve()
+    checkpoint_path = policy_checkpoint_path(cfg)
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Policy checkpoint not found: {checkpoint_path}")
+    if not policy_checkpoint_is_compatible(checkpoint_path, cfg):
+        raise RuntimeError(
+            "Policy checkpoint uses an old observation/action shape. Retrain "
+            f"the current inventory-aware policy: {checkpoint_path}"
+        )
 
     render = bool(ppo_cfg.render)
     save_gif = bool(ppo_cfg.save_gif)
@@ -81,7 +93,7 @@ def validate_policy(cfg: DictConfig) -> float:
         )
     )
 
-    state_dim = int(np.prod(env.observation_space["image"].shape))
+    state_dim = int(np.prod(env.observation_space["image"].shape)) + INVENTORY_TOKEN_COUNT
     ppo_agent = PPO(
         state_dim,
         MODEL_ACTION_COUNT,
@@ -94,6 +106,7 @@ def validate_policy(cfg: DictConfig) -> float:
         ppo_cfg.action_std,
     )
     print(f"Loading policy: {checkpoint_path}")
+    print(f"Training source: {policy_training_source(cfg)}")
     print(f"Real layout:   {ppo_cfg.env_path}")
     print(f"Evaluation:    {'deterministic' if deterministic else 'stochastic'}")
     ppo_agent.load(str(checkpoint_path))
@@ -122,6 +135,13 @@ def validate_policy(cfg: DictConfig) -> float:
             state_tensor = torch.as_tensor(
                 normalized, dtype=torch.float32, device=device
             ).flatten()
+            inventory = torch.nn.functional.one_hot(
+                torch.as_tensor(
+                    carrying_token_from_env(env), device=device
+                ).long(),
+                num_classes=INVENTORY_TOKEN_COUNT,
+            ).float()
+            state_tensor = torch.cat((state_tensor, inventory), dim=0)
             compact_action = _select_eval_action(
                 ppo_agent, state_tensor, deterministic
             )

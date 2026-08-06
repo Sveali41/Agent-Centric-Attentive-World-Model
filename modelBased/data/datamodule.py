@@ -2,7 +2,7 @@ import os
 import torch
 import numpy as np
 import pytorch_lightning as pl
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from typing import Dict, Optional
 from modelBased.common.utils import get_env, normalize_obs
 from modelBased.common.utils import merge_data_dicts
@@ -127,6 +127,54 @@ class WMRLDataset(Dataset):
             np.clip(arr[:, 2], 0, 3, out=arr[:, 2])
         return arr
 
+    @staticmethod
+    def _minigrid_inventory_from_info(info, done=None):
+        """Decode colour-aware inventory tokens from transition metadata.
+
+        Token 0 means empty hands; tokens 1..6 represent MiniGrid key colours
+        0..5. New datasets store both sides of every transition explicitly.
+        The shift fallback keeps older sequential datasets readable.
+        """
+        if info is None:
+            return None, None
+        flat_info = np.asarray(info, dtype=object).reshape(-1)
+
+        def _as_dict(value):
+            if isinstance(value, dict):
+                return value
+            if isinstance(value, np.ndarray) and value.size == 1:
+                value = value.item()
+                if isinstance(value, dict):
+                    return value
+            return {}
+
+        records = [_as_dict(value) for value in flat_info]
+        current = np.asarray([
+            int(record.get("carrying_token", bool(record.get("carrying_key", False))))
+            for record in records
+        ], dtype=np.int64)
+
+        has_explicit_next = all("next_carrying_token" in record for record in records)
+        if has_explicit_next:
+            next_inventory = np.asarray([
+                int(record["next_carrying_token"]) for record in records
+            ], dtype=np.int64)
+        else:
+            next_inventory = np.zeros_like(current)
+            if len(current) > 1:
+                next_inventory[:-1] = current[1:]
+            if done is not None:
+                terminal = np.asarray(done).reshape(-1).astype(bool)
+                next_inventory[terminal] = 0
+            print(
+                "[DataModule][MiniGrid] Legacy inventory metadata detected; "
+                "deriving next inventory by temporal shift. Recollect data for "
+                "explicit colour-aware inventory targets."
+            )
+        np.clip(current, 0, 6, out=current)
+        np.clip(next_inventory, 0, 6, out=next_inventory)
+        return current, next_inventory
+
     def state_batch_preprocess(self, state):
         obs = np.zeros((state.shape[0], 3, 3, state.shape[-1])) # The mask will extract a 3x3 square around the agent
         for i in range(state.shape[0]):  # Loop over the last dimension (channels)
@@ -161,10 +209,13 @@ class WMRLDataset(Dataset):
         env_type  = self.hparams.env_type
         obs, obs_next, act = loaded['a'], loaded['b'], loaded['c']
         rew, done = loaded.get('d', None), loaded.get('e', None)
-        info = loaded.get('f', None) if env_type == 'with_obj' else None
-        # Crafter only: load inventory if available
-        inv     = loaded.get('g', None) if env_type == 'crafter' else None
+        info = loaded.get('f', None) if env_type in ('with_obj', 'minigrid') else None
+        # Crafter stores vector inventory in g/h. MiniGrid stores a compact,
+        # colour-aware categorical inventory in transition metadata.
+        inv = loaded.get('g', None) if env_type == 'crafter' else None
         inv_next = loaded.get('h', None) if env_type == 'crafter' else None
+        if env_type == 'minigrid':
+            inv, inv_next = self._minigrid_inventory_from_info(info, done)
 
         if env_type == 'crafter':
             obs = self._to_crafter_nchw(obs)
@@ -237,32 +288,42 @@ class WMRLDataset(Dataset):
                 r_obs_next = replay_data['obs_next'][idx]
                 r_act      = replay_data['act'][idx]
                 r_info     = (replay_data['info'][idx]
-                            if (env_type == 'with_obj' and 'info' in replay_data and replay_data['info'] is not None)
+                            if (env_type in ('with_obj', 'minigrid') and 'info' in replay_data and replay_data['info'] is not None)
                             else None)
                 r_inv      = replay_data['inv'][idx] if ('inv' in replay_data and replay_data['inv'] is not None) else None
                 r_inv_next = replay_data['inv_next'][idx] if ('inv_next' in replay_data and replay_data['inv_next'] is not None) else None
+                if env_type == 'minigrid' and r_inv is None:
+                    replay_done = replay_data.get('done', None)
+                    replay_done = replay_done[idx] if replay_done is not None else None
+                    r_inv, r_inv_next = self._minigrid_inventory_from_info(
+                        r_info, replay_done
+                    )
                 
                 # [Robustness] Handle cases where inventory is missing from replay data
-                if r_inv is None and inv is not None:
+                if r_inv is None and inv is not None and env_type != 'minigrid':
                     # Pad with zero inventory matching new data's feature dimension
                     inv_dim = inv.shape[-1]
                     r_inv = np.zeros((len(idx), inv_dim), dtype=np.float32)
-                if r_inv_next is None and inv_next is not None:
+                if r_inv_next is None and inv_next is not None and env_type != 'minigrid':
                     inv_dim = inv_next.shape[-1]
                     r_inv_next = np.zeros((len(idx), inv_dim), dtype=np.float32)
             else:
                 r_obs, r_obs_next, r_act = replay_data['obs'], replay_data['obs_next'], replay_data['act']
                 r_info = (replay_data['info']
-                        if (env_type == 'with_obj' and 'info' in replay_data and replay_data['info'] is not None)
+                        if (env_type in ('with_obj', 'minigrid') and 'info' in replay_data and replay_data['info'] is not None)
                         else None)
                 r_inv      = replay_data.get('inv', None)
                 r_inv_next = replay_data.get('inv_next', None)
+                if env_type == 'minigrid' and r_inv is None:
+                    r_inv, r_inv_next = self._minigrid_inventory_from_info(
+                        r_info, replay_data.get('done', None)
+                    )
                 
                 # [Robustness] Handle whole-batch missing inventory
-                if r_inv is None and inv is not None:
+                if r_inv is None and inv is not None and env_type != 'minigrid':
                     inv_dim = inv.shape[-1]
                     r_inv = np.zeros((len(r_obs), inv_dim), dtype=np.float32)
-                if r_inv_next is None and inv_next is not None:
+                if r_inv_next is None and inv_next is not None and env_type != 'minigrid':
                     inv_dim = inv_next.shape[-1]
                     r_inv_next = np.zeros((len(r_obs), inv_dim), dtype=np.float32)
 
@@ -280,7 +341,7 @@ class WMRLDataset(Dataset):
                 obs      = np.concatenate([obs,      r_obs     ], axis=0) if current_n > 0 else r_obs
                 obs_next = np.concatenate([obs_next, r_obs_next], axis=0) if current_n > 0 else r_obs_next
                 act      = np.concatenate([act,      r_act     ], axis=0) if current_n > 0 else r_act
-                if env_type == 'with_obj' and r_info is not None:
+                if env_type in ('with_obj', 'minigrid') and r_info is not None:
                     info = np.concatenate([info, r_info], axis=0) if info is not None else r_info
                 if r_inv is not None:
                     inv = np.concatenate([inv, r_inv], axis=0) if (current_n > 0 and inv is not None) else r_inv
@@ -294,7 +355,7 @@ class WMRLDataset(Dataset):
             if N > 0:
                 perm = rng.permutation(N)
                 obs, obs_next, act = obs[perm], obs_next[perm], act[perm]
-                if env_type == 'with_obj' and info is not None and len(info) == N:
+                if env_type in ('with_obj', 'minigrid') and info is not None and len(info) == N:
                     info = info[perm]
                 if inv is not None and len(inv) == N:
                     inv = inv[perm]
@@ -317,6 +378,18 @@ class WMRLDataset(Dataset):
         obs_latest = obs[:, -C_base:] if (obs.ndim > 1 and obs.shape[1] > C_base) else obs
 
         # ===== (2) Build training targets =====
+        transition_changed = None
+        if self.hparams.data_type == 'discrete':
+            change_axes = tuple(range(1, obs.ndim))
+            transition_changed = np.any(obs != obs_next, axis=change_axes)
+            if inv is not None and inv_next is not None:
+                inv_change_axes = tuple(range(1, inv.ndim))
+                if inv_change_axes:
+                    inventory_changed = np.any(inv != inv_next, axis=inv_change_axes)
+                else:
+                    inventory_changed = inv != inv_next
+                transition_changed |= inventory_changed
+
         if self.hparams.data_type == 'norm':
             obs_f      = normalize_obs(obs,      self.obs_norm_values).astype(np.float32)
             obs_next_f = normalize_obs(obs_next, self.obs_norm_values).astype(np.float32)
@@ -354,12 +427,18 @@ class WMRLDataset(Dataset):
 
         # ===== (3) Package the dataset =====
         data = {'obs': obs_f, 'obs_next': obs_delta, 'act': act_f}
-        if env_type == 'with_obj' and info is not None:
+        if transition_changed is not None:
+            action_ids = act_f.reshape(len(act_f), -1)[:, 0].astype(np.int64)
+            # Generic action/event buckets: no domain objects or action meanings
+            # are encoded here. Rare state-changing outcomes receive equal
+            # sampling opportunity alongside no-op outcomes for the same action.
+            data['_sampling_bucket'] = action_ids * 2 + transition_changed.astype(np.int64)
+        if env_type in ('with_obj', 'minigrid') and info is not None:
             data['info'] = info
-        # Crafter: add inventory
-        if env_type == 'crafter' and inv is not None:
-            data['inv']      = inv[:len(obs_f)].astype(np.float32)
-            data['inv_next'] = inv_next[:len(obs_f)].astype(np.float32)
+        if inv is not None:
+            inventory_dtype = np.int64 if env_type == 'minigrid' else np.float32
+            data['inv'] = inv[:len(obs_f)].astype(inventory_dtype)
+            data['inv_next'] = inv_next[:len(obs_f)].astype(inventory_dtype)
         return data
 
             
@@ -425,10 +504,31 @@ class WMRLDataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
         num_workers = int(getattr(self.cfg, "n_cpu", 0))
+        sampler = None
+        if bool(getattr(self.cfg, "transition_balanced_sampling", False)):
+            dataset = self.data_train.dataset
+            buckets = dataset.data.get('_sampling_bucket', None)
+            if buckets is not None:
+                indices = np.asarray(self.data_train.indices, dtype=np.int64)
+                train_buckets = np.asarray(buckets)[indices]
+                _, inverse, counts = np.unique(
+                    train_buckets, return_inverse=True, return_counts=True
+                )
+                weights = 1.0 / counts[inverse].astype(np.float64)
+                sampler = WeightedRandomSampler(
+                    torch.as_tensor(weights, dtype=torch.double),
+                    num_samples=len(indices),
+                    replacement=True,
+                )
+                print(
+                    f"[DataModule] Transition-balanced training over "
+                    f"{len(counts)} non-empty (action, changed) buckets."
+                )
         return DataLoader(
             self.data_train, 
             batch_size=self.cfg.batch_size, 
-            shuffle=True,
+            shuffle=sampler is None,
+            sampler=sampler,
             drop_last=True,
             num_workers=num_workers,
             pin_memory=True,

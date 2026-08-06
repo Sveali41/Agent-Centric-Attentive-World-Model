@@ -1,5 +1,6 @@
 import os
 import csv
+import math
 import torch
 from torch import nn
 import pytorch_lightning as pl
@@ -11,7 +12,6 @@ from modelBased.common import utils
 from domain.minigrid import minigrid_support as minigrid_utils
 from domain.crafter.crafter_support import (
     crafter_classification_loss,
-    crafter_reconstruct_from_logits,
     visualize_crafter_wm,
 )
 from . import AttentionWM_support
@@ -54,6 +54,9 @@ class AttentionWorldModel(pl.LightningModule):
         self.old_params = None
         self.env_type = hparams.env_type
         self.frame_stack = getattr(hparams, "frame_stack", 1)
+        self.observation_schema = list(getattr(hparams, "observation_schema", []))
+        if not self.observation_schema:
+            raise ValueError("attention_model.observation_schema must define at least one field")
         self.use_bipedal_flag = bool(getattr(hparams, "use_bipedal_attention", False))
         # Keep a single explicit flag for the vector-state BipedalWalker path.
         # Some call sites check `self.is_bipedal`, so define it before first use.
@@ -84,12 +87,10 @@ class AttentionWorldModel(pl.LightningModule):
 
         if hparams.freeze_weight:
             utils.load_model_weight(self.model, hparams.model_save_path)
-        self.loss = nn.MSELoss() # nn.SmoothL1Loss()
         self.visual_func = minigrid_utils.Visualization(hparams)
         self.train_token_loss_accumulator = {}
         self.train_token_acc_accumulator = {}
         self.train_token_loss_csv_path = None
-        self.bipedal_token_loss_weights = dict(getattr(hparams, "bipedal_token_loss_weights", {}))
         if self.is_bipedal and hasattr(self.model, "bipedal_token_specs"):
             self.train_token_loss_csv_path = os.path.join(
                 os.path.dirname(hparams.model_save_path),
@@ -105,9 +106,6 @@ class AttentionWorldModel(pl.LightningModule):
               for k, v in self.state_dict().items()}
         return old_params
 
-    def get_bipedal_token_weight(self, token_name: str) -> float:
-        return float(self.bipedal_token_loss_weights.get(token_name, 1.0))
-    
     # def load_old_params(self, old_params):
     #     """Load previous-task parameters into the current model."""
     #     for n, p in self.named_parameters():
@@ -226,7 +224,7 @@ class AttentionWorldModel(pl.LightningModule):
     #         act = act.to(device)
     #         obs_next = obs_next.to(device).float()
     #         obs_pred, _ = self(obs, act, info)
-    #         loss = scale_factor * self.loss_function_weight(obs_pred, obs_next, obs_masked)['loss_obs']
+    #         loss, _ = self.observation_loss(obs_pred, obs_next, obs_prev=obs)
     #         loss.backward(retain_graph=False)
     #         for n, p in self.named_parameters():
     #             if p.grad is not None:
@@ -295,32 +293,13 @@ class AttentionWorldModel(pl.LightningModule):
                 # Forward & Backward (fp32)
                 with torch.amp.autocast("cuda", enabled=False):
                     pred, _, s_inv_pred = self(s_obs, s_act, s_info, inv=s_inv)
-                    loss_dict = self.loss_function_weight(pred, s_obs_next, s_obs_masked, obs_prev=s_obs)
-                    loss_sample = loss_dict['loss_obs']
-
-                    if self.is_bipedal and isinstance(s_inv_pred, dict) and "contact_logits" in s_inv_pred:
-                        contact_bce_total = torch.zeros((), device=device, dtype=torch.float32)
-                        token_spec_map = dict(getattr(self.model, "bipedal_token_specs", []))
-                        for token_name in getattr(self.model, "contact_token_names", set()):
-                            token_indices = token_spec_map[token_name]
-                            next_contact_target = (s_obs[:, token_indices] + s_obs_next[:, token_indices]).clamp(0.0, 1.0)
-                            contact_logits = s_inv_pred["contact_logits"][token_name]
-                            token_bce = F.binary_cross_entropy_with_logits(
-                                contact_logits,
-                                next_contact_target,
-                            )
-                            contact_bce_total = contact_bce_total + self.get_bipedal_token_weight(token_name) * token_bce
-                        loss_sample = loss_sample + contact_bce_total
-                    
-                    if self.env_type == 'crafter' and s_inv_pred is not None and s_inv_next is not None:
-                        if s_inv is not None:
-                            inv_diff = torch.abs(s_inv_next - s_inv).float()
-                            # If an inventory element changes, hit it with x100 magnitude
-                            inv_w = 1.0 + (inv_diff > 1e-5).float() * 100.0
-                            loss_inv = (F.mse_loss(s_inv_pred, s_inv_next.float(), reduction='none') * inv_w).mean()
-                        else:
-                            loss_inv = F.mse_loss(s_inv_pred, s_inv_next.float())
-                        loss_sample = loss_sample + 10.0 * loss_inv
+                    loss_sample, _ = self.observation_loss(
+                        pred,
+                        s_obs_next,
+                        obs_prev=s_obs,
+                        aux_pred=s_inv_pred,
+                        inv_next=s_inv_next,
+                    )
                 
                 loss_sample.backward()
 
@@ -369,7 +348,7 @@ class AttentionWorldModel(pl.LightningModule):
         return fisher
 
 
-    
+
 
     # def ewc_loss(self, lambda_ewc):
     #     if self.fisher is None or self.old_params is None:
@@ -579,118 +558,108 @@ class AttentionWorldModel(pl.LightningModule):
             return next_state_pred, attentionWeight, None
 
 
-    def loss_function(self, next_observations_predict, next_observations_true):
-        loss_obs = self.loss(next_observations_predict.flatten(1), next_observations_true.flatten(1))
-        loss = {'loss_obs':loss_obs}
-        return loss
-    
+    @staticmethod
+    def _symlog(value: torch.Tensor) -> torch.Tensor:
+        """Scale count-like values without a domain-specific hand-tuned weight."""
+        return torch.sign(value) * torch.log1p(torch.abs(value))
 
-    def loss_function_weight(
+    @staticmethod
+    def _normalized_cross_entropy(
+        logits: torch.Tensor,
+        target: torch.Tensor,
+        num_classes: int,
+        label_smoothing: float = 0.0,
+    ) -> torch.Tensor:
+        """Categorical NLL normalized so a uniform predictor has loss 1."""
+        return F.cross_entropy(
+            logits,
+            target.long(),
+            label_smoothing=label_smoothing,
+        ) / math.log(num_classes)
+
+    def observation_loss(
         self,
-        next_observations_predict,
-        next_observations_true,
-        obs_masked=None,
-        obs_prev=None,
-        force_weighted: bool = False,
-    ):
+        obs_pred: torch.Tensor,
+        obs_next: torch.Tensor,
+        obs_prev: torch.Tensor | None = None,
+        aux_pred=None,
+        inv_next: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute one schema-driven observation prediction objective.
+
+        Every observation field contributes one normalized likelihood/error
+        term and the final objective is their unweighted mean.  Domain names
+        select the observation schema only; they do not introduce manually
+        tuned loss multipliers.
         """
-        Custom Loss with tiered aggressive weighting:
-        - If use_weighted_loss is True:
-          - Base=1.0, Move=+10, Interaction=+50 (MiniGrid)
-          - Tiered CE (Crafter)
-        - Else: 1.0 (Standard CE/MSE)
-        """
-        device = next_observations_predict.device 
-        use_weighted_loss = force_weighted or getattr(self.hparams, "use_weighted_loss", False)
-        if self.is_bipedal:
-            weighted_losses = []
-            for token_name, token_indices in getattr(self.model, "bipedal_token_specs", []):
-                if token_name in getattr(self.model, "contact_token_names", set()):
-                    continue
-                token_loss = F.mse_loss(
-                    next_observations_predict[:, token_indices],
-                    next_observations_true[:, token_indices],
+        fields: Dict[str, torch.Tensor] = {}
+        for spec in self.observation_schema:
+            name = str(spec["name"])
+            distribution = str(spec["distribution"])
+            prediction_source = str(spec.get("prediction_source", "state"))
+            target_source = str(spec.get("target_source", "observation"))
+            target_mode = str(spec.get("target_mode", "delta"))
+
+            if prediction_source == "state":
+                if "prediction_slice" in spec:
+                    start, stop = map(int, spec["prediction_slice"])
+                    prediction = obs_pred[:, start:stop]
+                else:
+                    indices = list(map(int, spec["indices"]))
+                    prediction = obs_pred[:, indices]
+            elif prediction_source == "auxiliary":
+                if aux_pred is None:
+                    raise ValueError(f"Missing auxiliary prediction for observation field '{name}'")
+                prediction = aux_pred
+            elif prediction_source == "contact_logits":
+                if not isinstance(aux_pred, dict) or "contact_logits" not in aux_pred:
+                    raise ValueError(f"Missing contact logits for observation field '{name}'")
+                prediction = aux_pred["contact_logits"][name]
+            else:
+                raise ValueError(f"Unknown prediction source '{prediction_source}' for field '{name}'")
+
+            if target_source == "inventory":
+                if inv_next is None:
+                    raise ValueError(f"Missing inventory target for observation field '{name}'")
+                target = inv_next.float()
+            else:
+                if "target_index" in spec:
+                    target_index = int(spec["target_index"])
+                    target = obs_next[:, target_index]
+                    if target_mode == "current_plus_delta":
+                        if obs_prev is None:
+                            raise ValueError(f"Field '{name}' requires the current observation")
+                        current = obs_prev[:, -obs_next.size(1):, ...][:, target_index]
+                        target = current + target
+                else:
+                    indices = list(map(int, spec["indices"]))
+                    target = obs_next[:, indices]
+                    if target_mode == "current_plus_delta":
+                        if obs_prev is None:
+                            raise ValueError(f"Field '{name}' requires the current observation")
+                        target = obs_prev[:, indices] + target
+
+            if distribution == "categorical":
+                fields[name] = self._normalized_cross_entropy(
+                    prediction,
+                    target,
+                    int(spec["classes"]),
+                    label_smoothing=float(spec.get("label_smoothing", 0.0)),
                 )
-                weighted_losses.append(self.get_bipedal_token_weight(token_name) * token_loss)
-            loss = torch.stack(weighted_losses).sum() if weighted_losses else F.mse_loss(
-                next_observations_predict, next_observations_true
-            )
-            return {"loss_obs": loss}
-        
-        # 1. Base Loss (MSE for MiniGrid, CrossEntropy for Crafter)
-        if self.env_type == 'crafter':
-            # Classification loss from crafter_support (with optional tiered weighting)
-            raw_error_map = crafter_classification_loss(
-                next_observations_predict, next_observations_true, reduction='none', weighted=use_weighted_loss
-            )  # (B, H, W)
-            weights = 1.0 # Tiered weights are already inside crafter_classification_loss
-        else:
-            if getattr(self.model, 'out_channel', 3) == 21:
-                # MiniGrid: Cross Entropy
-                C_target = next_observations_true.size(1)
-                C_prev = obs_prev.size(1)
-                obs_prev_latest = obs_prev[:, -C_target:] if C_prev > C_target else obs_prev
-                true_abs = (obs_prev_latest + next_observations_true).long()
-                
-                loss_obj = F.cross_entropy(next_observations_predict[:, 0:11, ...], true_abs[:, 0, ...], reduction='none')
-                loss_color = F.cross_entropy(next_observations_predict[:, 11:17, ...], true_abs[:, 1, ...], reduction='none')
-                loss_state = F.cross_entropy(next_observations_predict[:, 17:21, ...], true_abs[:, 2, ...], reduction='none')
-                
-                raw_error_map = loss_obj + loss_color + loss_state
-                weights = 1.0
+            elif distribution == "bernoulli":
+                fields[name] = F.binary_cross_entropy_with_logits(
+                    prediction, target.clamp(0.0, 1.0)
+                ) / math.log(2.0)
+            elif distribution == "mse":
+                fields[name] = F.mse_loss(prediction, target)
+            elif distribution == "symlog_mse":
+                fields[name] = F.mse_loss(self._symlog(prediction), self._symlog(target))
             else:
-                # MiniGrid: Standard Regression
-                raw_sq_error = (next_observations_predict - next_observations_true) ** 2
-                raw_error_map = raw_sq_error.mean(dim=1)  # (B, H, W)
-                weights = 1.0
+                raise ValueError(f"Unknown distribution '{distribution}' for field '{name}'")
 
-        # 2. Aggressive Spatial/Change Weighting (Only if use_weighted_loss is True and NOT handled by CE)
-        if use_weighted_loss and self.env_type != 'crafter':
-            if obs_prev is not None:
-                 if obs_prev.dtype != next_observations_true.dtype:
-                     obs_prev = obs_prev.float() 
-                 
-                 C_target = next_observations_true.size(1)
-                 C_prev = obs_prev.size(1)
-                 obs_prev_latest = obs_prev[:, -C_target:] if C_prev > C_target else obs_prev
-                 
-                 # For MiniGrid, next_observations_true is already the DELTA, so diff is just its absolute value.
-                 diff = torch.abs(next_observations_true).sum(dim=1, keepdim=True)
-                 change_mask = (diff > 1e-5).float()
-                 
-                 if C_target > 2:
-                      state_change_mask = (torch.abs(next_observations_true[:, 2:3, :, :]) > 1e-5).float()
-                 else:
-                      state_change_mask = torch.zeros_like(change_mask)
-            else:
-                 change_mask = (next_observations_true.abs() > 1e-6).any(dim=1, keepdim=True).float()
-                 state_change_mask = torch.zeros_like(change_mask)
-
-            weights = 1.0 + (change_mask * 3.0) + (state_change_mask * 10.0)
-            
-            if obs_masked is not None:
-                 if obs_masked.ndim == 3:
-                     static_mask = obs_masked.unsqueeze(1).float()
-                 else:
-                     static_mask = obs_masked.float()
-                 interaction_mask = change_mask * static_mask
-                 weights = weights + (interaction_mask * 20.0)
-
-        # 5. Weighted reduction
-        if torch.is_tensor(weights) and weights.ndim > raw_error_map.ndim:
-             weights = weights.squeeze(1) # [B, 1, H, W] -> [B, H, W]
-
-        if torch.is_tensor(weights):
-            if bool(getattr(self.hparams, "normalize_weighted_loss", True)):
-                weighted_error = raw_error_map * weights
-                loss = weighted_error.sum() / weights.sum().clamp_min(1.0)
-            else:
-                loss = (raw_error_map * weights).mean()
-        else:
-            loss = (raw_error_map * weights).mean()
-        
-        return {"loss_obs": loss}
-
+        if not fields:
+            raise ValueError("The observation schema produced no loss fields")
+        return torch.stack(list(fields.values())).mean(), fields
 
 
     def configure_optimizers(self):
@@ -703,7 +672,7 @@ class AttentionWorldModel(pl.LightningModule):
             if not param.requires_grad:
                 continue
             # `fc` is the output head that predicts tile classes.
-            if 'model.fc.' in name:
+            if 'model.fc.' in name or 'model.inv_head.' in name:
                 head_params.append(param)
             else:
                 base_params.append(param)
@@ -718,7 +687,7 @@ class AttentionWorldModel(pl.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": reduce_lr_on_plateau,
-                "monitor": 'avg_val_loss_wm',
+                "monitor": 'val/observation_loss',
                 "frequency": 1
             },
         }
@@ -731,8 +700,8 @@ class AttentionWorldModel(pl.LightningModule):
         obs = batch['obs']
         act = batch['act']
         obs_next = batch['obs_next']
-        if self.env_type == 'with_obj':
-            info = batch['info']
+        if self.env_type in ('with_obj', 'minigrid'):
+            info = batch.get('info', None)
         else:
             info = None
         
@@ -799,124 +768,40 @@ class AttentionWorldModel(pl.LightningModule):
         if obs.dtype != obs_pred.dtype:
             obs = obs.float()
 
-        # [TRAINING] Aggressive Weighted Loss for Optimization
-        loss_dict = self.loss_function_weight(obs_pred, obs_next, elements_mask, obs_prev=obs)
-        weighted_obs_loss = loss_dict['loss_obs']
-        
-        # [LOGGING] Metrics for Scientific Reporting
-        if self.env_type == 'crafter':
-            obs_pred_reconst = crafter_reconstruct_from_logits(obs_pred)
-            raw_mse = F.mse_loss(obs_pred_reconst, obs_next)
-            # Raw (unweighted) CE loss — the true training signal for Crafter
-            from domain.crafter.crafter_support import crafter_classification_loss
-            raw_ce = crafter_classification_loss(obs_pred, obs_next, reduction='mean')
-        else:
-            if self.is_bipedal and hasattr(self.model, "contact_indices"):
-                contact_indices = self.model.contact_indices
-                continuous_mask = torch.ones(obs_pred.size(1), dtype=torch.bool, device=obs_pred.device)
-                continuous_mask[contact_indices] = False
-                raw_mse = F.mse_loss(obs_pred[:, continuous_mask], obs_next[:, continuous_mask])
-            else:
-                if getattr(self.model, 'out_channel', 3) == 21:
-                    C_target = obs_next.size(1)
-                    C_prev = obs.size(1)
-                    obs_prev_latest = obs[:, -C_target:] if C_prev > C_target else obs
-                    true_abs = (obs_prev_latest + obs_next).long()
-                    
-                    loss_obj = F.cross_entropy(obs_pred[:, 0:11, ...], true_abs[:, 0, ...])
-                    loss_color = F.cross_entropy(obs_pred[:, 11:17, ...], true_abs[:, 1, ...])
-                    loss_state = F.cross_entropy(obs_pred[:, 17:21, ...], true_abs[:, 2, ...])
-                    
-                    raw_ce = loss_obj + loss_color + loss_state
-                    
-                    # Compute synthetic MSE for backward compatibility
-                    obj_pred = torch.argmax(obs_pred[:, 0:11, ...], dim=1, keepdim=True)
-                    color_pred = torch.argmax(obs_pred[:, 11:17, ...], dim=1, keepdim=True)
-                    state_pred = torch.argmax(obs_pred[:, 17:21, ...], dim=1, keepdim=True)
-                    state_pre_masked = torch.cat([obj_pred, color_pred, state_pred], dim=1).float()
-                    delta_pred = state_pre_masked - obs_prev_latest
-                    raw_mse = F.mse_loss(delta_pred, obs_next)
-                else:
-                    raw_mse = F.mse_loss(obs_pred, obs_next)
-                    raw_ce = None
-            if self.is_bipedal and hasattr(self.model, "bipedal_token_specs"):
-                for token_name, token_indices in self.model.bipedal_token_specs:
-                    if token_name in getattr(self.model, "contact_token_names", set()):
-                        contact_logits = aux_pred["contact_logits"][token_name]
-                        next_contact_target = (obs[:, token_indices] + obs_next[:, token_indices]).clamp(0.0, 1.0)
-                        token_loss = F.binary_cross_entropy_with_logits(contact_logits, next_contact_target)
-                        token_pred = (torch.sigmoid(contact_logits) >= 0.5).float()
-                        token_acc = (token_pred == next_contact_target).float().mean()
-                        log_name = f"train/token_{token_name}_bce"
-                        self.train_token_acc_accumulator[token_name].append(float(token_acc.detach().cpu()))
-                    else:
-                        token_loss = F.mse_loss(obs_pred[:, token_indices], obs_next[:, token_indices])
-                        log_name = f"train/token_{token_name}_mse"
-                    self.train_token_loss_accumulator[token_name].append(float(token_loss.detach().cpu()))
-        
-        # Raw EWC term before multiplying by lambda.
+        observation_loss, field_losses = self.observation_loss(
+            obs_pred,
+            obs_next,
+            obs_prev=obs,
+            aux_pred=aux_pred,
+            inv_next=inv_next,
+        )
+
+        # Preserve field-level values only in the local Bipedal diagnostics CSV.
+        if self.is_bipedal and hasattr(self.model, "bipedal_token_specs"):
+            for token_name, token_indices in self.model.bipedal_token_specs:
+                self.train_token_loss_accumulator[token_name].append(
+                    float(field_losses[token_name].detach().cpu())
+                )
+                if token_name in getattr(self.model, "contact_token_names", set()):
+                    target = (obs[:, token_indices] + obs_next[:, token_indices]).clamp(0.0, 1.0)
+                    logits = aux_pred["contact_logits"][token_name]
+                    accuracy = ((torch.sigmoid(logits) >= 0.5).float() == target).float().mean()
+                    self.train_token_acc_accumulator[token_name].append(float(accuracy.detach().cpu()))
+
+        # EWC remains an optimization regularizer, not a second observation objective.
         ewc_raw = self.ewc_loss()
+        self.update_lambda_ewc_by_ratio(observation_loss, ewc_raw, self.ewc_ratio)
+        optimization_objective = observation_loss + self.lambda_ewc * ewc_raw
 
-        # Fast controller: balance EWC against the weighted optimization loss.
-        self.update_lambda_ewc_by_ratio(weighted_obs_loss, ewc_raw, self.ewc_ratio)
-
-        # Compose the total loss.
-        ewc_term = self.lambda_ewc * ewc_raw
-        loss_total = weighted_obs_loss + ewc_term
-        if self.is_bipedal and aux_pred is not None and "contact_logits" in aux_pred:
-            contact_bce_total = torch.zeros((), device=obs.device, dtype=obs.dtype)
-            total_contact_correct = torch.zeros((), device=obs.device, dtype=obs.dtype)
-            total_contact_count = torch.zeros((), device=obs.device, dtype=obs.dtype)
-            for token_name in getattr(self.model, "contact_token_names", set()):
-                token_indices = dict(self.model.bipedal_token_specs)[token_name]
-                next_contact_target = (obs[:, token_indices] + obs_next[:, token_indices]).clamp(0.0, 1.0)
-                contact_logits = aux_pred["contact_logits"][token_name]
-                token_bce = F.binary_cross_entropy_with_logits(
-                    contact_logits,
-                    next_contact_target,
-                )
-                token_pred = (torch.sigmoid(contact_logits) >= 0.5).float()
-                total_contact_correct = total_contact_correct + (token_pred == next_contact_target).float().sum()
-                total_contact_count = total_contact_count + torch.tensor(
-                    next_contact_target.numel(), device=obs.device, dtype=obs.dtype
-                )
-                contact_bce_total = contact_bce_total + self.get_bipedal_token_weight(token_name) * token_bce
-            loss_total = loss_total + contact_bce_total
-            contact_acc = total_contact_correct / total_contact_count.clamp_min(1.0)
-            self.log("train/contact_bce", contact_bce_total.detach(), on_step=True, on_epoch=True)
-            self.log("train/contact_acc", contact_acc.detach(), on_step=True, on_epoch=True)
-        
-        # Add inventory MSE loss dynamically if applicable
-        if self.env_type == 'crafter' and aux_pred is not None and inv_next is not None:
-            inv_pred = aux_pred
-            if inv is not None:
-                inv_diff = torch.abs(inv_next - inv).float()
-                inv_weights = 1.0 + (inv_diff > 1e-5).float() * 20.0
-                inv_loss = (F.mse_loss(inv_pred, inv_next.float(), reduction='none') * inv_weights).mean()
-            else:
-                inv_loss = F.mse_loss(inv_pred, inv_next.float())
-            # Keep the inventory term amplified so it stays competitive with map prediction.
-            loss_total = loss_total + 5.0 * inv_loss
-            self.log("train/inv_loss", inv_loss, prog_bar=True, on_step=True, on_epoch=True)
-
-        # Unified logging.
-        # Log raw_mse as 'loss_obs' for compatibility
-        self.log("loss_obs", raw_mse, prog_bar=True, on_step=True, on_epoch=True)
-        
-        if raw_ce is not None:
-            # Crafter: also log raw CE separately for clear monitoring
-            self.log("train/ce_loss", raw_ce, prog_bar=True, on_step=True, on_epoch=True)
-        
-        # Log weighted loss separately for debugging
-        self.log("train/loss_weighted", weighted_obs_loss, on_step=True, on_epoch=True)
-        
-        self.log("train/ewc_raw", ewc_raw.detach(), on_step=True, on_epoch=True)
-        self.log("train/lambda_ewc", torch.tensor(self.lambda_ewc, device=obs.device),
-                on_step=True, on_epoch=True)
-        self.log("train/ewc_term", ewc_term.detach(), on_step=True, on_epoch=True)
-        self.log("train/loss_total", loss_total.detach(), on_step=True, on_epoch=True)
-
-        return loss_total
+        # One public training-loss curve for every domain.
+        self.log(
+            "train/observation_loss",
+            observation_loss,
+            prog_bar=True,
+            on_step=True,
+            on_epoch=False,
+        )
+        return optimization_objective
 
     def on_train_epoch_start(self):
         if self.is_bipedal and hasattr(self.model, "bipedal_token_specs"):
@@ -1039,83 +924,14 @@ class AttentionWorldModel(pl.LightningModule):
         if obs.dtype != obs_pred.dtype:
             obs = obs.float()
 
-        # [VALIDATION METRIC]
-        # Crafter → CE is the correct metric (discrete IDs, not numeric)
-        # MiniGrid → MSE as before
-        if self.env_type == 'crafter':
-            from domain.crafter.crafter_support import crafter_classification_loss
-            val_ce = crafter_classification_loss(obs_pred, obs_next, reduction='mean')
-            loss_val = val_ce
-            
-            if inv_pred is not None and inv_next is not None:
-                val_inv_loss = F.mse_loss(inv_pred, inv_next.float())
-                loss_val = loss_val + val_inv_loss
-                self.log("val/inv_loss", val_inv_loss, on_step=False, on_epoch=True)
-
-            self.log("val/ce_loss", val_ce, on_step=False, on_epoch=True)
-        else:
-            val_metric = str(getattr(self.hparams, "validation_metric", "mse")).lower()
-            if self.is_bipedal and hasattr(self.model, "contact_indices"):
-                contact_indices = self.model.contact_indices
-                continuous_mask = torch.ones(obs_pred.size(1), dtype=torch.bool, device=obs_pred.device)
-                continuous_mask[contact_indices] = False
-                raw_mse = F.mse_loss(obs_pred[:, continuous_mask], obs_next[:, continuous_mask])
-            else:
-                if getattr(self.model, 'out_channel', 3) == 21:
-                    C_target = obs_next.size(1)
-                    C_prev = obs.size(1)
-                    obs_prev_latest = obs[:, -C_target:] if C_prev > C_target else obs
-                    true_abs = (obs_prev_latest + obs_next).long()
-                    
-                    loss_obj = F.cross_entropy(obs_pred[:, 0:11, ...], true_abs[:, 0, ...])
-                    loss_color = F.cross_entropy(obs_pred[:, 11:17, ...], true_abs[:, 1, ...])
-                    loss_state = F.cross_entropy(obs_pred[:, 17:21, ...], true_abs[:, 2, ...])
-                    
-                    raw_ce = loss_obj + loss_color + loss_state
-                    raw_mse = raw_ce  # Map to raw_mse variable to ensure val_loss works
-                else:
-                    raw_mse = F.mse_loss(obs_pred, obs_next)
-            loss_val = raw_mse
-            # Optional: weighted validation metric for MiniGrid comparison.
-            # Keep default behavior unchanged unless validation_metric explicitly requests it.
-            if (self.env_type == "minigrid") and (val_metric == "mse_weighted"):
-                weighted_res = self.loss_function_weight(
-                    obs_pred,
-                    obs_next,
-                    elements_mask,
-                    obs_prev=obs,
-                    force_weighted=True,
-                )
-                weighted_val = weighted_res["loss_obs"]
-                loss_val = weighted_val
-                self.log("val/mse_weighted", weighted_val, on_step=False, on_epoch=True)
-                
-            if self.is_bipedal and hasattr(self.model, "bipedal_token_specs"):
-                total_contact_bce = torch.zeros((), device=obs.device, dtype=obs.dtype)
-                total_contact_correct = torch.zeros((), device=obs.device, dtype=obs.dtype)
-                total_contact_count = torch.zeros((), device=obs.device, dtype=obs.dtype)
-                for token_name, token_indices in self.model.bipedal_token_specs:
-                    if token_name in getattr(self.model, "contact_token_names", set()):
-                        contact_logits = inv_pred["contact_logits"][token_name]
-                        next_contact_target = (obs[:, token_indices] + obs_next[:, token_indices]).clamp(0.0, 1.0)
-                        token_loss = F.binary_cross_entropy_with_logits(contact_logits, next_contact_target)
-                        token_pred = (torch.sigmoid(contact_logits) >= 0.5).float()
-                        token_acc = (token_pred == next_contact_target).float().mean()
-                        self.log(f"val/token_{token_name}_bce", token_loss, on_step=False, on_epoch=True)
-                        self.log(f"val/token_{token_name}_acc", token_acc, on_step=False, on_epoch=True)
-                        total_contact_bce = total_contact_bce + token_loss
-                        total_contact_correct = total_contact_correct + (token_pred == next_contact_target).float().sum()
-                        total_contact_count = total_contact_count + torch.tensor(
-                            next_contact_target.numel(), device=obs.device, dtype=obs.dtype
-                        )
-                    else:
-                        token_loss = F.mse_loss(obs_pred[:, token_indices], obs_next[:, token_indices])
-                        self.log(f"val/token_{token_name}_mse", token_loss, on_step=False, on_epoch=True)
-                self.log("val/contact_bce", total_contact_bce, on_step=False, on_epoch=True)
-                contact_acc = total_contact_correct / total_contact_count.clamp_min(1.0)
-                self.log("val/contact_acc", contact_acc, on_step=False, on_epoch=True)
-
-        # No longer logging redundant "val_loss" here as we log "avg_val_loss_wm" at epoch end.
+        # Validation uses exactly the same observation objective as training.
+        loss_val, _ = self.observation_loss(
+            obs_pred,
+            obs_next,
+            obs_prev=obs,
+            aux_pred=inv_pred,
+            inv_next=inv_next,
+        )
 
         self._val_step_outputs.append(loss_val.detach())
 
@@ -1167,7 +983,7 @@ class AttentionWorldModel(pl.LightningModule):
         else:
             avg_loss = torch.tensor(0.0, device=self.device)
 
-        self.log("avg_val_loss_wm", avg_loss)
+        self.log("val/observation_loss", avg_loss)
         self._val_step_outputs = []
 
     def on_save_checkpoint(self, checkpoint):
@@ -1191,18 +1007,24 @@ class AttentionWorldModel(pl.LightningModule):
             'info': trajectory_data['info']
         }
         
-        if self.env_type != 'with_obj':
+        if self.env_type not in ('with_obj', 'minigrid'):
              batch['info'] = None
 
         obs_masked, act, obs_next_masked, info, elements_mask, _, inv, inv_next = self.preprocess_batch(batch, training=False)
         
-        obs_pred, _, _ = self(obs_masked, act, info, inv=inv)
+        obs_pred, _, aux_pred = self(obs_masked, act, info, inv=inv)
         
         if obs_next_masked.dtype != obs_pred.dtype:
             obs_next_masked = obs_next_masked.float()
             
-        loss_dict = self.loss_function_weight(obs_pred, obs_next_masked, elements_mask)
-        return loss_dict
+        loss_obs, _ = self.observation_loss(
+            obs_pred,
+            obs_next_masked,
+            obs_prev=obs_masked,
+            aux_pred=aux_pred,
+            inv_next=inv_next,
+        )
+        return {"loss_obs": loss_obs}
 
     def on_train_end(self):
         """Save a final visualization at the end of training."""

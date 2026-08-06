@@ -554,7 +554,12 @@ class PPO:
         self.policy.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
 
 
-def preprocess_observation(obs, obs_norm_values=(10, 5, 3)):
+def preprocess_observation(
+    obs,
+    obs_norm_values=(10, 5, 3),
+    inventory_token=None,
+    inventory_classes=7,
+):
     """Standardized MiniGrid observation preprocessing:
     1. Ensure channels-first (C, H, W) format.
     2. Normalize per channel using obs_norm_values (default [10, 5, 3]).
@@ -568,4 +573,13 @@ def preprocess_observation(obs, obs_norm_values=(10, 5, 3)):
     else:
         state = obs
     normalized = normalize_obs(state.copy() if hasattr(state, 'copy') else state.clone(), obs_norm_values)
-    return torch.as_tensor(normalized.flatten(), dtype=torch.float32, device=device)
+    state_tensor = torch.as_tensor(
+        normalized.flatten(), dtype=torch.float32, device=device
+    )
+    if inventory_token is not None:
+        inventory = torch.nn.functional.one_hot(
+            torch.as_tensor(inventory_token, device=device).long(),
+            num_classes=int(inventory_classes),
+        ).float().reshape(-1)
+        state_tensor = torch.cat((state_tensor, inventory), dim=0)
+    return state_tensor

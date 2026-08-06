@@ -57,3 +57,4 @@ videos/
 
 # Temporary training data
 legacy/trainer/data/temp/
+modelBased/data/train_world_model/

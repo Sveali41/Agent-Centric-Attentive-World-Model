@@ -12,7 +12,11 @@ except ImportError:
     # Script import (e.g., `python modelBased/data/data_collect.py`)
     from modelBased.common.utils import normalize_obs, WORLD_MODEL_PATH, PROJECT_ROOT
 from modelBased.common.dataset_identity import metadata_array
-from domain.minigrid.action_codec import compact_to_native, native_to_compact
+from domain.minigrid.action_codec import (
+    carrying_token_from_env,
+    compact_to_native,
+    native_to_compact,
+)
 from domain.minigrid.minigrid_support import (
     ColRowCanl_to_CanlRowCol,
     Visualization,
@@ -351,7 +355,14 @@ def run_env_vectorized(env, cfg: DictConfig, wandb_run, policy=None, rmax_explor
     obs_batch = envs.reset()  # shape: (num_envs, H, W, C)
     episodes_done = [0] * num_envs
     obs_list, obs_next_list, act_list, rew_list, done_list, info_list = [], [], [], [], [], []
-    meaningful_actions = [env.unwrapped.actions.forward, env.unwrapped.actions.left, env.unwrapped.actions.right, env.unwrapped.actions.pickup, env.unwrapped.actions.toggle]
+    meaningful_actions = [
+        env.unwrapped.actions.forward,
+        env.unwrapped.actions.left,
+        env.unwrapped.actions.right,
+        env.unwrapped.actions.pickup,
+        env.unwrapped.actions.toggle,
+        env.unwrapped.actions.drop,
+    ]
 
     # Continue until each env has completed desired episodes
     while any(ed < cfg.collect.episodes for ed in episodes_done):
@@ -360,7 +371,7 @@ def run_env_vectorized(env, cfg: DictConfig, wandb_run, policy=None, rmax_explor
             acts = np.random.choice(
                 meaningful_actions,
                 size=num_envs,
-                p=[0.3,0.15,0.15,0.2,0.2]
+                p=[1.0 / len(meaningful_actions)] * len(meaningful_actions)
             )
         else:
             # Batch forward
@@ -557,6 +568,10 @@ def run_env(
     maximum_dataset_size = getattr(collect_cfg, "maximum_dataset_size", None)
     domain_cfg = getattr(getattr(cfg, "domains", None), "bipedalwalker", None) if is_bipedal else None
 
+    def _minigrid_carrying_token():
+        """Return 0 for empty hands, otherwise key-colour-id + 1."""
+        return carrying_token_from_env(env) if is_minigrid else 0
+
     if policy is not None and hasattr(policy, "begin_rollout"):
         rollout_budget = (
             maximum_dataset_size
@@ -711,6 +726,7 @@ def run_env(
             env.unwrapped.actions.right,
             env.unwrapped.actions.pickup,
             env.unwrapped.actions.toggle,
+            env.unwrapped.actions.drop,
         ]
 
     # Use tqdm for progress tracking
@@ -739,7 +755,10 @@ def run_env(
         return torch.tensor(obs_chw, dtype=torch.float32, device=device)
 
     with tqdm(total=target_episodes, desc="Collecting Episodes") as pbar:
-        info_list.append([{'carrying_key': False}])  
+        info_list.append([{
+            'carrying_key': False,
+            'carrying_token': _minigrid_carrying_token(),
+        }])
 
         # Condition: Keep collecting if (episodes < target) OR (total_steps < mini_dataset_size)
         # We check len(obs_list) for total steps.
@@ -816,7 +835,9 @@ def run_env(
                     act = np.asarray(act, dtype=np.float32).reshape(env.action_space.shape)
                     act = np.clip(act, env.action_space.low, env.action_space.high)
             else:
-                action_probs = [0.2, 0.2, 0.2, 0.2, 0.2] # simplified for demo
+                action_probs = np.full(
+                    len(meaningful_actions), 1.0 / len(meaningful_actions)
+                )
                 if policy is None:
                     act = np.random.choice(meaningful_actions, p=action_probs)
                 else:
@@ -880,8 +901,14 @@ def run_env(
                         done = True
                         stuck_terminated = True
 
-            if is_minigrid and hasattr(env, "env") and getattr(env.env, "carrying", None) is not None:
-                info['carrying_key'] = (env.env.carrying.type == 'key')
+            if is_minigrid:
+                next_carrying_token = _minigrid_carrying_token()
+                info['carrying_key'] = next_carrying_token > 0
+                info['carrying_token'] = next_carrying_token
+                # info_list is aligned with the current observation. Attach the
+                # post-action inventory target to that same transition.
+                info_list[-1][0]['next_carrying_key'] = next_carrying_token > 0
+                info_list[-1][0]['next_carrying_token'] = next_carrying_token
             else:
                 info['carrying_key'] = False
             if policy is not None and hasattr(policy, "set_carrying_key"):
@@ -1013,7 +1040,10 @@ def run_env(
                     # Sync observation after injection
                     obs = env.unwrapped._extract_obs()
 
-                info_list.append([{'carrying_key': False}])  
+                info_list.append([{
+                    'carrying_key': False,
+                    'carrying_token': _minigrid_carrying_token(),
+                }])
                 has_carried_key_this_episode = False  # Reset per-episode state.
                 step_in_episode = 0
             else:
@@ -1178,7 +1208,8 @@ def run_env_uniform(env, cfg, wandb_run, log_name, policy=None, rmax_exploration
         env.unwrapped.actions.left,
         env.unwrapped.actions.right,
         env.unwrapped.actions.pickup,
-        env.unwrapped.actions.toggle
+        env.unwrapped.actions.toggle,
+        env.unwrapped.actions.drop,
     ]
 
     # Optional W&B image logging
@@ -1337,7 +1368,9 @@ def uniformize_dataset_by_position(obs, obs_next, act, rew, done, info):
     )
 
 def uniform_collect_data_postprocess(env, cfg, wandb_run, log_name, policy=None, rmax_exploration=None, save_img=False):
-    obs, obs_next, act, rew, done, info = run_env(env, cfg, wandb_run, log_name, save_img=save_img)
+    obs, obs_next, act, rew, done, info, _, _ = run_env(
+        env, cfg, wandb_run, log_name, save_img=save_img
+    )
     obs_u, obsn_u, act_u, rew_u, done_u, info_u = uniformize_dataset_by_position(
                                                 obs, obs_next, act, rew, done, info
                                                 )
@@ -1414,7 +1447,11 @@ def sample_keydoor_pref(
 
     num = obs.shape[0]
     flat_act = act.reshape(num)
-    KEYDOOR_ACTIONS = [env.unwrapped.actions.pickup, env.unwrapped.actions.toggle]
+    KEYDOOR_ACTIONS = [
+        env.unwrapped.actions.pickup,
+        env.unwrapped.actions.toggle,
+        env.unwrapped.actions.drop,
+    ]
 
     is_keydoor = np.zeros(num, dtype=bool)
  
@@ -1473,7 +1510,11 @@ def filter_keydoor_only(env, obs, obs_next, act, rew, done, info, move_keep_rati
     flat_act = act.reshape(num)
 
     # Key interaction actions (key / door related).
-    KEYDOOR_ACTIONS = [env.unwrapped.actions.pickup, env.unwrapped.actions.toggle]
+    KEYDOOR_ACTIONS = [
+        env.unwrapped.actions.pickup,
+        env.unwrapped.actions.toggle,
+        env.unwrapped.actions.drop,
+    ]
 
     is_keydoor = np.zeros(num, dtype=bool)
     for a in KEYDOOR_ACTIONS:

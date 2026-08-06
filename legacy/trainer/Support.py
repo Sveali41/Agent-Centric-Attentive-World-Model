@@ -243,7 +243,7 @@ class Support:
 
         entity = {
             "map": env_map,                      # Environment layout array
-            "score": wm_loss[0]['avg_val_loss_wm'],  # World Model evaluation metric
+            "score": wm_loss[0]['val/observation_loss'],  # Unified world-model observation objective.
             "data": samples
         }
 
@@ -384,7 +384,7 @@ class Support:
             
     #         cfg.attention_model.data_dir = save_path
     #         loss = self.validate_world_model(cfg, old_params=None, fisher=None, env_layout=final_task)
-    #         loss_set.append(loss[0]['avg_val_loss_wm'])
+    #         loss_set.append(loss[0]['val/observation_loss'])
     #     avg_loss = sum(loss_set) / len(loss_set)
     #     print(f"Average loss on final task set: {avg_loss}")
 
@@ -405,7 +405,7 @@ class Support:
             env = self.wrap_env(torch.tensor(final_task_set[final_task]).unsqueeze(0))
             self.collect_data_from_env(env, wandb_run, validate=True, save_img=save_img, log_name="final_task", max_steps=1e4)
             loss = self.validate_world_model(cfg, old_params=None, fisher=None, env_layout=final_task)
-            loss_set.append(loss[0]['avg_val_loss_wm'])
+            loss_set.append(loss[0]['val/observation_loss'])
         avg_loss = sum(loss_set) / len(loss_set)
         print(f"Average loss on final task set: {avg_loss}")
         return avg_loss
@@ -451,4 +451,3 @@ class Support:
         return start_step, old_params, fisher
 
         
-
