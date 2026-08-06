@@ -91,7 +91,7 @@ For a longer policy run after validating the setup, override the PPO budget expl
 
 ```bash
 python run_pipeline.py pipeline.label=minigrid \
-  PPO.max_training_timesteps=300000 \
+  PPO.max_training_timesteps=320000 \
   PPO.max_ep_len=512
 ```
 
@@ -137,6 +137,10 @@ disabled:
 ```yaml
 PPO:
   train_in_real_env: false
+  # GPU-batched imagined trajectories. This setting is used only by WM PPO.
+  num_imagined_envs: 64
+  # Total transitions per PPO update, so 4096 / 64 = 64 temporal WM steps.
+  rollout_steps: 4096
 ```
 
 Then run:
@@ -146,6 +150,12 @@ python -m modelBased.policy_training.PPO_world_training domain=minigrid
 ```
 
 The current world-model PPO implementation is MiniGrid-specific.
+`rollout_steps` and `max_training_timesteps` must be divisible by
+`num_imagined_envs`. Set `num_imagined_envs: 1` to reproduce serial imagined
+rollouts. Parallel environments keep independent episode lengths, rewards,
+terminal flags, carrying-key state, returns, and bootstrap values; PPO flattens
+the resulting `[time, environment]` batch only after computing per-environment
+returns.
 
 ### 3a. Train model-free PPO directly in the real environment
 
@@ -197,6 +207,21 @@ to 100%, and episode steps decreasing to a stable range.
 WandB prints the run URL in the terminal but does not necessarily open a web
 browser automatically. The same `PPO.use_wandb` setting is respected when
 training through `run_pipeline.py`.
+
+For controlled multi-seed experiments, set `PPO.seed` in the YAML or override
+it on the command line:
+
+```bash
+python -m modelBased.policy_training.PPO_world_training domain=minigrid PPO.seed=0
+python -m modelBased.policy_training.PPO_world_training domain=minigrid PPO.seed=1
+python -m modelBased.policy_training.PPO_world_training domain=minigrid PPO.seed=2
+```
+
+New runs are grouped in WandB as
+`<domain>_<task_name>_policy`, with run names ending in `_seed0`, `_seed1`, and
+so on. Policy checkpoints use the same seed suffix, so different seeds and the
+older checkpoint without a seed suffix are preserved independently. Use the
+same `PPO.seed=<N>` override when evaluating a particular checkpoint.
 
 The same settings can be supplied without editing the YAML file:
 

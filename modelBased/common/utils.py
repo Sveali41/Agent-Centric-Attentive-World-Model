@@ -126,17 +126,31 @@ def extract_masked_state_torch(state, mask_size, agent_position_yx=None, pad_val
     )
     bsz, channels, rows, cols = batch.shape
     half = mask_size // 2
-    output = torch.empty((bsz, channels, mask_size, mask_size), device=batch.device, dtype=batch.dtype)
-    for i in range(bsz):
-        y, x = int(positions[i, 0].item()), int(positions[i, 1].item())
-        fill = batch[i, :, 0, 0] if pad_value is None else torch.full(
-            (channels,), pad_value, device=batch.device, dtype=batch.dtype
+    offsets = torch.arange(
+        -half, mask_size - half, device=batch.device, dtype=positions.dtype
+    )
+    ys = positions[:, 0, None, None] + offsets[None, :, None]
+    xs = positions[:, 1, None, None] + offsets[None, None, :]
+    ys = ys.expand(-1, mask_size, mask_size)
+    xs = xs.expand(-1, mask_size, mask_size)
+    valid = (ys >= 0) & (ys < rows) & (xs >= 0) & (xs < cols)
+    batch_ids = torch.arange(bsz, device=batch.device)[:, None, None]
+    gathered = batch[
+        batch_ids,
+        :,
+        ys.clamp(0, rows - 1),
+        xs.clamp(0, cols - 1),
+    ].permute(0, 3, 1, 2)
+    if pad_value is None:
+        fill = batch[:, :, 0, 0, None, None]
+    else:
+        fill = torch.full(
+            (bsz, channels, 1, 1),
+            pad_value,
+            device=batch.device,
+            dtype=batch.dtype,
         )
-        output[i] = fill[:, None, None].expand(-1, mask_size, mask_size)
-        sy0, sy1 = max(y - half, 0), min(y + half + 1, rows)
-        sx0, sx1 = max(x - half, 0), min(x + half + 1, cols)
-        dy0, dx0 = max(half - y, 0), max(half - x, 0)
-        output[i, :, dy0:dy0 + sy1 - sy0, dx0:dx0 + sx1 - sx0] = batch[i, :, sy0:sy1, sx0:sx1]
+    output = torch.where(valid[:, None, :, :], gathered, fill)
     return output[0] if single else output
 
 
@@ -145,16 +159,27 @@ def put_back_masked_state_torch(state_masked, original_state, mask_size, agent_p
     single = original_state.ndim == 3
     masked = state_masked.unsqueeze(0) if state_masked.ndim == 3 else state_masked
     original = original_state.unsqueeze(0) if single else original_state
-    positions = agent_position_yx.reshape(-1, 2)
+    positions = agent_position_yx.reshape(-1, 2).to(original.device)
     output = original.clone()
-    rows, cols = output.shape[-2:]
+    bsz, channels, rows, cols = output.shape
     half = mask_size // 2
-    for i in range(output.shape[0]):
-        y, x = int(positions[i, 0].item()), int(positions[i, 1].item())
-        sy0, sy1 = max(y - half, 0), min(y + half + 1, rows)
-        sx0, sx1 = max(x - half, 0), min(x + half + 1, cols)
-        dy0, dx0 = max(half - y, 0), max(half - x, 0)
-        output[i, :, sy0:sy1, sx0:sx1] = masked[i, :, dy0:dy0 + sy1 - sy0, dx0:dx0 + sx1 - sx0]
+    offsets = torch.arange(
+        -half, mask_size - half, device=output.device, dtype=positions.dtype
+    )
+    ys = positions[:, 0, None, None] + offsets[None, :, None]
+    xs = positions[:, 1, None, None] + offsets[None, None, :]
+    ys = ys.expand(-1, mask_size, mask_size)
+    xs = xs.expand(-1, mask_size, mask_size)
+    valid = (ys >= 0) & (ys < rows) & (xs >= 0) & (xs < cols)
+    batch_ids = torch.arange(bsz, device=output.device)[:, None, None]
+    expanded_batch_ids = batch_ids.expand_as(ys)
+    for channel in range(channels):
+        output[
+            expanded_batch_ids[valid],
+            channel,
+            ys[valid],
+            xs[valid],
+        ] = masked[:, channel][valid].to(output.dtype)
     return output[0] if single else output
 
 def put_back_masked_state(state_masked, orginal_state, mask_size, agent_position_yx):
@@ -839,5 +864,4 @@ GENERATOR_PATH : Path = Path(get_env("GENERATOR_PATH"))
 TRAINER_PATH : Path = Path(get_env("TRAINER_PATH"))
 WORLD_MODEL_PATH = Path(get_env("WORLD_MODEL_PATH"))
 sys.path.append(str(PROJECT_ROOT.resolve()))	
-
 

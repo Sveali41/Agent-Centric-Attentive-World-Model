@@ -1,4 +1,5 @@
 import sys
+import random
 from collections import deque
 from pathlib import Path
 
@@ -36,6 +37,19 @@ if torch.cuda.is_available():
     print("Device set to : " + str(torch.cuda.get_device_name(device)))
 else:
     print("Device set to : cpu")
+
+
+def seed_policy_training(seed):
+    """Seed policy initialization, action sampling, and environment resets."""
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    return seed
 
 def get_destination(obs, episode, maxstep, destination):
     """
@@ -181,6 +195,132 @@ def apply_known_minigrid_interaction(state_masked, action, info):
     return next_state, next_info
 
 
+def apply_known_minigrid_interaction_batch(
+    state_masked, actions, carrying_key
+):
+    """Vectorized pickup/toggle dynamics for parallel imagined MiniGrid."""
+    next_state = state_masked.clone()
+    actions = actions.to(state_masked.device).long().reshape(-1)
+    carrying_key = carrying_key.to(state_masked.device).bool().reshape(-1).clone()
+    batch_size = state_masked.shape[0]
+    center_y = state_masked.shape[-2] // 2
+    center_x = state_masked.shape[-1] // 2
+
+    directions = state_masked[:, 2, center_y, center_x].long()
+    direction_deltas = torch.tensor(
+        [[0, 1], [1, 0], [0, -1], [-1, 0]],
+        device=state_masked.device,
+        dtype=torch.long,
+    )
+    deltas = direction_deltas[directions]
+    front_y = center_y + deltas[:, 0]
+    front_x = center_x + deltas[:, 1]
+    batch_ids = torch.arange(batch_size, device=state_masked.device)
+    front_object = state_masked[batch_ids, 0, front_y, front_x].long()
+    front_status = state_masked[batch_ids, 2, front_y, front_x].long()
+
+    pickup = (actions == 3) & (front_object == 5) & (~carrying_key)
+    if pickup.any():
+        pickup_ids = batch_ids[pickup]
+        pickup_y = front_y[pickup]
+        pickup_x = front_x[pickup]
+        next_state[pickup_ids, 0, pickup_y, pickup_x] = 1
+        next_state[pickup_ids, 1, pickup_y, pickup_x] = 0
+        next_state[pickup_ids, 2, pickup_y, pickup_x] = 0
+        carrying_key[pickup] = True
+
+    toggle = (actions == 4) & (front_object == 4)
+    open_door = toggle & (
+        ((front_status == 2) & carrying_key) | (front_status == 1)
+    )
+    close_door = toggle & (front_status == 0)
+    if open_door.any():
+        next_state[
+            batch_ids[open_door],
+            2,
+            front_y[open_door],
+            front_x[open_door],
+        ] = 0
+    if close_door.any():
+        next_state[
+            batch_ids[close_door],
+            2,
+            front_y[close_door],
+            front_x[close_door],
+        ] = 1
+
+    return next_state, carrying_key
+
+
+def _nearest_valid_values(values, valid_values):
+    valid = torch.as_tensor(
+        valid_values, device=values.device, dtype=values.dtype
+    )
+    indices = torch.argmin(torch.abs(values.unsqueeze(-1) - valid), dim=-1)
+    return valid[indices]
+
+
+def imagined_minigrid_step_batch(
+    model,
+    states,
+    actions,
+    carrying_key,
+    attention_mask_size,
+    valid_values_obj,
+    valid_values_color,
+    valid_values_state,
+):
+    """Advance B imagined states with one batched WM call.
+
+    Movement and turning use the learned model. Pickup and toggle retain the
+    same known interaction dynamics as the previous serial implementation.
+    """
+    agent_positions = utils.get_agent_position_torch(states)
+    masked = utils.extract_masked_state_torch(
+        states, attention_mask_size, agent_positions
+    )
+    predicted = masked.clone().float()
+    learned = actions < 3
+
+    if learned.any():
+        learned_info = {"carrying_key": carrying_key[learned]}
+        wm_out, _, _ = model(masked[learned], actions[learned], learned_info)
+        if getattr(model, "out_channel", 3) == 21:
+            predicted[learned] = torch.stack(
+                (
+                    torch.argmax(wm_out[:, 0:11], dim=1),
+                    torch.argmax(wm_out[:, 11:17], dim=1),
+                    torch.argmax(wm_out[:, 17:21], dim=1),
+                ),
+                dim=1,
+            ).float()
+        else:
+            predicted[learned] = masked[learned] + wm_out
+
+    interactions = ~learned
+    if interactions.any():
+        interaction_state, interaction_keys = apply_known_minigrid_interaction_batch(
+            masked[interactions], actions[interactions], carrying_key[interactions]
+        )
+        predicted[interactions] = interaction_state.float()
+        carrying_key = carrying_key.clone()
+        carrying_key[interactions] = interaction_keys
+
+    predicted[:, 0] = _nearest_valid_values(
+        predicted[:, 0], valid_values_obj
+    )
+    predicted[:, 1] = _nearest_valid_values(
+        predicted[:, 1], valid_values_color
+    )
+    predicted[:, 2] = _nearest_valid_values(
+        predicted[:, 2], valid_values_state
+    )
+    next_states = utils.put_back_masked_state_torch(
+        predicted, states, attention_mask_size, agent_positions
+    )
+    return next_states, carrying_key
+
+
 
 
 @hydra.main(version_base=None, config_path=str(PROJECT_ROOT / "modelBased/config"), config_name="config")
@@ -223,6 +363,7 @@ def run_ppo_wm(cfg):
     # hyperparameters
     # compute regret
     hparams_PPO = hparams.PPO
+    seed = int(getattr(hparams_PPO, "seed", 0))
     compute_regret = hparams_PPO.compute_regret
     if compute_regret:
         regret_eval_freq = hparams_PPO.get("regret_eval_freq", 5000)
@@ -253,6 +394,18 @@ def run_ppo_wm(cfg):
     update_timestep = int(getattr(hparams_PPO, "rollout_steps", 1024))
     if update_timestep < 2:
         raise ValueError("PPO.rollout_steps must be at least 2")
+    num_imagined_envs = int(getattr(hparams_PPO, "num_imagined_envs", 1))
+    if num_imagined_envs < 1:
+        raise ValueError("PPO.num_imagined_envs must be at least 1")
+    if update_timestep % num_imagined_envs != 0:
+        raise ValueError(
+            "PPO.rollout_steps must be divisible by PPO.num_imagined_envs"
+        )
+    if max_training_timesteps % num_imagined_envs != 0:
+        raise ValueError(
+            "PPO.max_training_timesteps must be divisible by "
+            "PPO.num_imagined_envs"
+        )
     entropy_coef = float(getattr(hparams_PPO, "entropy_coef", 0.01))
     normalize_advantages = bool(getattr(hparams_PPO, "normalize_advantages", True))
     normalize_returns = bool(getattr(hparams_PPO, "normalize_returns", False))
@@ -271,8 +424,16 @@ def run_ppo_wm(cfg):
 
     # training_agent()
 
+    if visualize_flag and num_imagined_envs > 1:
+        print(
+            "[WM PPO] Disabling per-step visualization for parallel imagined "
+            "rollouts. Set PPO.num_imagined_envs=1 to visualize every step."
+        )
+        visualize_flag = False
     if visualize_flag:
         visualize = utils.Visualization(hparams_world_model)
+    seed_policy_training(seed)
+    print(f"[PPO] Seed: {seed}")
     # 3. Real environment
     env = FullyObsWrapper(
         CustomMiniGridEnv(txt_file_path=env_path, custom_mission="Find the key and open the door.",
@@ -289,6 +450,7 @@ def run_ppo_wm(cfg):
     recent_steps = deque(maxlen=rolling_window_episodes)
     recent_successes = deque(maxlen=rolling_window_episodes)
     time_step = 0
+    next_save_timestep = save_model_freq
     step_penalty = float(getattr(hparams_PPO, "step_penalty", 0.0))
     final_norm_regret = None
     
@@ -302,6 +464,10 @@ def run_ppo_wm(cfg):
         # excluded during data collection and are mapped only at env.step().
         action_dim = MODEL_ACTION_COUNT
     state_dim = np.prod(env.observation_space['image'].shape)
+    # Constructing/loading the WM consumes PyTorch RNG. Re-seed immediately
+    # before PPO construction so matched real/WM runs start from identical
+    # actor and critic parameters.
+    seed_policy_training(seed)
     ppo_agent = PPO(
         state_dim,
         action_dim,
@@ -324,164 +490,169 @@ def run_ppo_wm(cfg):
 
     
 
-    # training loop
-    done = False
-    state_0 = None
-    while time_step < max_training_timesteps:
+    def reset_imagined_state():
+        observation = env.reset()[0]["image"]
+        return torch.as_tensor(
+            utils.ColRowCanl_to_CanlRowCol(observation), device=device
+        )
 
-        state_init = env.reset()[0]['image']
-        if time_step == 0 and sub_run is not None:
-            img = env.get_frame()
-            sub_run.log({"final_tasks": wandb.Image(img)})
-        state_0 = utils.ColRowCanl_to_CanlRowCol(state_init)
-        goal_position_yx = find_position(state_0, (8, 1, 0)) # find the goal position
-        current_ep_reward = 0
-        info = {'carrying_key': False}
-        for t in range(1, max_ep_len + 1):
-            # self.buffer.states = [state.squeeze(0) if state.dim() > 1 else state for state in self.buffer.states]
-            if t==1:
-                # state = utils.normalize_obs(state_0, hparams_world_model.obs_norm_values)
-                state_0 = torch.tensor(state_0).to(device)
-            
-            # Keep the raw discrete state for the WM and reward detector.
-            # normalize_obs operates in-place on tensors, so passing state_0
-            # directly here corrupts the state used by the next WM step.
-            state_norm = utils.normalize_obs(
-                state_0.clone(), hparams_world_model.obs_norm_values
-            )
-            action, state_buffer, action_buffer, action_logprob, state_val = ppo_agent.select_action(state_norm.flatten()) # state is the dimension of flatten
+    states = torch.stack(
+        [reset_imagined_state() for _ in range(num_imagined_envs)], dim=0
+    )
+    first_state_numpy = states[0].detach().cpu().numpy()
+    goal_position_yx = find_position(first_state_numpy, (8, 1, 0))
+    if goal_position_yx is None:
+        raise ValueError("The imagined MiniGrid layout does not contain a goal")
+    goal_positions = torch.as_tensor(
+        goal_position_yx, device=device, dtype=torch.long
+    ).expand(num_imagined_envs, -1)
+    carrying_key = torch.zeros(
+        num_imagined_envs, device=device, dtype=torch.bool
+    )
+    episode_rewards = torch.zeros(
+        num_imagined_envs, device=device, dtype=torch.float32
+    )
+    episode_steps = torch.zeros(
+        num_imagined_envs, device=device, dtype=torch.long
+    )
+    last_dones = torch.zeros(
+        num_imagined_envs, device=device, dtype=torch.bool
+    )
 
- 
-            state_masked = process_data(state_0.clone(), hparams_world_model.attention_mask_size)
-            if int(action) in (3, 4):
-                state_pre_masked, info = apply_known_minigrid_interaction(
-                    state_masked, int(action), info
-                )
-            else:
-                with torch.no_grad():
-                    # The WM was trained with compact dataset action IDs.
-                    wm_out, _, _ = model(state_masked, int(action), info)
-                
-                if getattr(model, 'out_channel', 3) == 21:
-                    # Cross Entropy mode: output is categorical logits
-                    # wm_out shape is (21, H, W) because batch dim is squeezed
-                    obj_pred = torch.argmax(wm_out[0:11, ...], dim=0, keepdim=True)
-                    color_pred = torch.argmax(wm_out[11:17, ...], dim=0, keepdim=True)
-                    state_pred = torch.argmax(wm_out[17:21, ...], dim=0, keepdim=True)
-                    state_pre_masked = torch.cat([obj_pred, color_pred, state_pred], dim=0).float()
-                else:
-                    # Legacy MSE mode: output is continuous delta
-                    delta_masked = wm_out
-                    state_pre_masked = state_masked + delta_masked
-            if visualize_flag:
-                visualize.compare_states(state_masked, state_pre_masked, action, t, True)
-            # delta_state_pre = delta_state_pre.to(dtype=torch.float32)
-            # denorm the state
-            # state_pre_denorm = utils.denormalize_obj(state_pre, hparams_world_model.obs_norm_values)
+    if sub_run is not None:
+        sub_run.log({"final_tasks": wandb.Image(env.get_frame())})
 
-            state_pre_masked = utils.map_obs_to_nearest_value(state_pre_masked, 
-                                                              hparams_world_model.valid_values_obj,
-                                                              hparams_world_model.valid_values_color,
-                                                              hparams_world_model.valid_values_state)
+    print(
+        f"[WM PPO] Parallel imagined environments: {num_imagined_envs}; "
+        f"temporal rollout: {update_timestep // num_imagined_envs}; "
+        f"transitions/update: {update_timestep}"
+    )
 
-            info = add_object_to_inventory((state_pre_masked - state_masked), info)
-            agent_postion_yx = utils.get_agent_position_torch(state_0)
-            state_pre = utils.put_back_masked_state_torch(
-                state_pre_masked,
-                state_0,
-                hparams_world_model.attention_mask_size,
-                agent_postion_yx,
-            )
-            
-
-                
-            state_0 = state_pre
-            # obtain reward from the state representation & done
-            reached_goal, reward = get_destination(
-                state_0, t, max_ep_len, goal_position_yx
-            )
-            reward += step_penalty
-            # Match Gymnasium's real-env semantics: the horizon is a terminal
-            # truncation for the trajectory even when the goal was not reached.
-            done = reached_goal or t == max_ep_len
-            # saving reward and is_terminals
-            ppo_agent.save_buffer(state_buffer, action_buffer, action_logprob, state_val, reward, done)
-            
-
-            time_step += 1
-            current_ep_reward += reward
-    
-            # Use the same fixed-size rollout/update schedule as direct
-            # real-environment training. Episode boundaries stay in the buffer.
-            if time_step % update_timestep == 0:
-                if len(ppo_agent.buffer.rewards) > 1:
-                    next_state_norm = utils.normalize_obs(
-                        state_0.clone(), hparams_world_model.obs_norm_values
-                    ).flatten()
-                    bootstrap_value = (
-                        0.0
-                        if done
-                        else ppo_agent.estimate_old_value(next_state_norm)
-                    )
-                    update_metrics = ppo_agent.update(
-                        bootstrap_value=bootstrap_value
-                    )
-                    if sub_run is not None and update_metrics.get("updated", False):
-                        sub_run.log(
-                            {
-                                "ppo/loss": update_metrics["loss"],
-                                "ppo/grad_norm": update_metrics["grad_norm"],
-                                "ppo/parameter_delta": update_metrics["parameter_delta"],
-                                "ppo/rollout_size": update_metrics["rollout_size"],
-                                "ppo/update_count": update_metrics["update_count"],
-                            },
-                            step=time_step,
-                        )
-
-            if has_continuous_action_space and time_step % action_std_decay_freq == 0:
-                ppo_agent.decay_action_std(action_std_decay_rate, min_action_std)
-
-            if time_step % save_model_freq == 0:
-                print("--------------------------------------------------------------------------------------------")
-                print("saving model at : " + checkpoint_path)
-                ppo_agent.save(checkpoint_path)
-                print("model saved")
-                print("Elapsed Time  : ", datetime.now().replace(microsecond=0) - start_time)
-                print("--------------------------------------------------------------------------------------------")
-
-            budget_exhausted = time_step >= max_training_timesteps
-            if done or budget_exhausted:
-                break
-
-        print_running_reward += current_ep_reward
-        print_running_episodes += 1
-        print_running_steps += t
-        success = int(reached_goal)
-        print_running_successes += success
-        recent_rewards.append(float(current_ep_reward))
-        recent_steps.append(int(t))
-        recent_successes.append(success)
-
-        rolling_avg_reward = sum(recent_rewards) / len(recent_rewards)
-        rolling_avg_steps = sum(recent_steps) / len(recent_steps)
-        rolling_success_rate = sum(recent_successes) / len(recent_successes)
-
-        if sub_run is not None:
+    def log_ppo_update(update_metrics):
+        if sub_run is not None and update_metrics.get("updated", False):
             sub_run.log(
                 {
-                    "episode/reward": current_ep_reward,
-                    "episode/success": success,
-                    "episode/steps": t,
-                    "episode/index": i_episode,
-                    "rolling/average_reward": rolling_avg_reward,
-                    "rolling/success_rate": rolling_success_rate,
-                    "rolling/average_episode_steps": rolling_avg_steps,
-                    "rolling/window_episode_count": len(recent_rewards),
+                    "ppo/loss": update_metrics["loss"],
+                    "ppo/grad_norm": update_metrics["grad_norm"],
+                    "ppo/parameter_delta": update_metrics["parameter_delta"],
+                    "ppo/rollout_size": update_metrics["rollout_size"],
+                    "ppo/update_count": update_metrics["update_count"],
                 },
                 step=time_step,
             )
 
+    # Each loop advances B independent trajectories by one imagined step.
+    while time_step < max_training_timesteps:
+        state_norm = utils.normalize_obs(
+            states.clone(), hparams_world_model.obs_norm_values
+        ).reshape(num_imagined_envs, -1)
+        (
+            actions,
+            state_buffer,
+            action_buffer,
+            action_logprobs,
+            state_values,
+        ) = ppo_agent.select_action_batch(state_norm)
+
+        # no_grad keeps the resulting state mutable so completed batch slots
+        # can be reset in place. inference_mode tensors forbid that update.
+        with torch.no_grad():
+            states, carrying_key = imagined_minigrid_step_batch(
+                model,
+                states,
+                actions,
+                carrying_key,
+                hparams_world_model.attention_mask_size,
+                hparams_world_model.valid_values_obj,
+                hparams_world_model.valid_values_color,
+                hparams_world_model.valid_values_state,
+            )
+
+        episode_steps += 1
+        agent_positions = utils.get_agent_position_torch(states)
+        reached_goal = torch.all(agent_positions == goal_positions, dim=1)
+        rewards = torch.where(
+            reached_goal,
+            1.0 - 0.9 * episode_steps.float() / float(max_ep_len),
+            torch.zeros_like(episode_rewards),
+        )
+        rewards = rewards + step_penalty
+        truncated = episode_steps >= max_ep_len
+        dones = reached_goal | truncated
+        episode_rewards += rewards
+
+        ppo_agent.save_buffer_batch(
+            state_buffer,
+            action_buffer,
+            action_logprobs,
+            state_values,
+            rewards,
+            dones,
+        )
+        time_step += num_imagined_envs
+        last_dones = dones.clone()
+
+        if time_step % update_timestep == 0:
+            next_state_norm = utils.normalize_obs(
+                states.clone(), hparams_world_model.obs_norm_values
+            ).reshape(num_imagined_envs, -1)
+            bootstrap_values = ppo_agent.estimate_old_values_batch(next_state_norm)
+            bootstrap_values[last_dones.detach().cpu()] = 0.0
+            update_metrics = ppo_agent.update(
+                bootstrap_value=bootstrap_values
+            )
+            log_ppo_update(update_metrics)
+
+        completed = torch.nonzero(dones, as_tuple=False).reshape(-1)
+        if completed.numel() > 0:
+            completed_rewards = episode_rewards[completed].detach().cpu().tolist()
+            completed_steps = episode_steps[completed].detach().cpu().tolist()
+            completed_successes = reached_goal[completed].detach().cpu().int().tolist()
+            for ep_reward, ep_steps, ep_success in zip(
+                completed_rewards, completed_steps, completed_successes
+            ):
+                print_running_reward += float(ep_reward)
+                print_running_steps += int(ep_steps)
+                print_running_successes += int(ep_success)
+                print_running_episodes += 1
+                recent_rewards.append(float(ep_reward))
+                recent_steps.append(int(ep_steps))
+                recent_successes.append(int(ep_success))
+                i_episode += 1
+
+            rolling_avg_reward = sum(recent_rewards) / len(recent_rewards)
+            rolling_avg_steps = sum(recent_steps) / len(recent_steps)
+            rolling_success_rate = sum(recent_successes) / len(recent_successes)
+            if sub_run is not None:
+                sub_run.log(
+                    {
+                        "episode/reward": sum(completed_rewards) / len(completed_rewards),
+                        "episode/success": sum(completed_successes) / len(completed_successes),
+                        "episode/steps": sum(completed_steps) / len(completed_steps),
+                        "episode/completed_count": len(completed_rewards),
+                        "episode/index": i_episode,
+                        "rolling/average_reward": rolling_avg_reward,
+                        "rolling/success_rate": rolling_success_rate,
+                        "rolling/average_episode_steps": rolling_avg_steps,
+                        "rolling/window_episode_count": len(recent_rewards),
+                    },
+                    step=time_step,
+                )
+
+            # Reset only completed slots; all other imagined trajectories keep
+            # their current states and episode statistics.
+            reset_states = torch.stack(
+                [reset_imagined_state() for _ in range(completed.numel())], dim=0
+            )
+            states[completed] = reset_states
+            carrying_key[completed] = False
+            episode_rewards[completed] = 0.0
+            episode_steps[completed] = 0
+
         if time_step >= next_print_timestep and print_running_episodes > 0:
+            rolling_avg_reward = sum(recent_rewards) / len(recent_rewards)
+            rolling_avg_steps = sum(recent_steps) / len(recent_steps)
+            rolling_success_rate = sum(recent_successes) / len(recent_successes)
             print_avg_reward = print_running_reward / print_running_episodes
             print_avg_steps = print_running_steps / print_running_episodes
             print_success_rate = print_running_successes / print_running_episodes
@@ -501,28 +672,25 @@ def run_ppo_wm(cfg):
             while next_print_timestep <= time_step:
                 next_print_timestep += print_freq
 
-        i_episode += 1
+        if time_step >= next_save_timestep:
+            print("--------------------------------------------------------------------------------------------")
+            print("saving model at : " + checkpoint_path)
+            ppo_agent.save(checkpoint_path)
+            print("model saved")
+            print("Elapsed Time  : ", datetime.now().replace(microsecond=0) - start_time)
+            print("--------------------------------------------------------------------------------------------")
+            while next_save_timestep <= time_step:
+                next_save_timestep += save_model_freq
 
     # Train once more on the partial fixed-size rollout at the budget boundary.
-    if len(ppo_agent.buffer.rewards) >= 2:
+    if ppo_agent.buffer.transition_count() >= 2:
         next_state_norm = utils.normalize_obs(
-            state_0.clone(), hparams_world_model.obs_norm_values
-        ).flatten()
-        bootstrap_value = (
-            0.0 if done else ppo_agent.estimate_old_value(next_state_norm)
-        )
-        update_metrics = ppo_agent.update(bootstrap_value=bootstrap_value)
-        if sub_run is not None and update_metrics.get("updated", False):
-            sub_run.log(
-                {
-                    "ppo/loss": update_metrics["loss"],
-                    "ppo/grad_norm": update_metrics["grad_norm"],
-                    "ppo/parameter_delta": update_metrics["parameter_delta"],
-                    "ppo/rollout_size": update_metrics["rollout_size"],
-                    "ppo/update_count": update_metrics["update_count"],
-                },
-                step=time_step,
-            )
+            states.clone(), hparams_world_model.obs_norm_values
+        ).reshape(num_imagined_envs, -1)
+        bootstrap_values = ppo_agent.estimate_old_values_batch(next_state_norm)
+        bootstrap_values[last_dones.detach().cpu()] = 0.0
+        update_metrics = ppo_agent.update(bootstrap_value=bootstrap_values)
+        log_ppo_update(update_metrics)
     else:
         ppo_agent.buffer.clear()
 
@@ -547,13 +715,24 @@ def _init_policy_wandb_run(cfg, default_project):
     init_kwargs = {
         "project": str(getattr(ppo_cfg, "wandb_project", default_project)),
         "name": str(ppo_cfg.wandb_run_name),
+        "group": str(
+            getattr(
+                ppo_cfg,
+                "wandb_group",
+                f"{cfg.domain}_{cfg.domains[str(cfg.domain)].task_name}_policy",
+            )
+        ),
         "reinit": True,
         "config": {
             "domain": str(cfg.domain),
             "task_name": str(cfg.domains[str(cfg.domain)].task_name),
+            "seed": int(getattr(ppo_cfg, "seed", 0)),
             "train_in_real_env": bool(ppo_cfg.train_in_real_env),
             "max_ep_len": int(ppo_cfg.max_ep_len),
             "rollout_steps": int(getattr(ppo_cfg, "rollout_steps", 1024)),
+            "num_imagined_envs": int(
+                getattr(ppo_cfg, "num_imagined_envs", 1)
+            ),
             "max_training_timesteps": int(ppo_cfg.max_training_timesteps),
         },
     }
@@ -567,6 +746,7 @@ def run_training_real_env(cfg):
     # parameters
     hparams = cfg
     hparams_PPO = hparams.PPO
+    seed = int(getattr(hparams_PPO, "seed", 0))
     has_continuous_action_space = hparams_PPO.has_continuous_action_space
     max_ep_len = int(hparams_PPO.max_ep_len)
     max_training_timesteps = int(hparams_PPO.max_training_timesteps)
@@ -621,6 +801,8 @@ def run_training_real_env(cfg):
 
 
     # state space dimension
+    seed_policy_training(seed)
+    print(f"[PPO] Seed: {seed}")
     env = FullyObsWrapper(
         CustomMiniGridEnv(txt_file_path=env_path, custom_mission="Find the key and open the door.",
                         max_steps=max_ep_len, render_mode=None))
@@ -633,6 +815,7 @@ def run_training_real_env(cfg):
     else:
         action_dim = MODEL_ACTION_COUNT
 
+    seed_policy_training(seed)
     ppo_agent = PPO(
         state_dim,
         action_dim,

@@ -37,6 +37,13 @@ class RolloutBuffer:
         del self.state_values[:]
         del self.is_terminals[:]
 
+    def transition_count(self):
+        """Return transitions, not merely the number of temporal batches."""
+        total = 0
+        for reward in self.rewards:
+            total += int(reward.numel()) if torch.is_tensor(reward) else 1
+        return total
+
 
 class ActorCritic(nn.Module):
     def __init__(self, state_dim, action_dim, has_continuous_action_space, action_std_init):
@@ -263,6 +270,22 @@ class PPO:
                 action, action_logprob, state_val = self.policy_old.act(state)
             return action.item(), state, action, action_logprob, state_val
 
+    def select_action_batch(self, states):
+        """Sample one action for every state in a vectorized environment."""
+        if states.ndim != 2:
+            raise ValueError(
+                f"Expected batched states shaped (B, state_dim), got {tuple(states.shape)}"
+            )
+        with torch.no_grad():
+            actions, action_logprobs, state_values = self.policy_old.act(states)
+        return (
+            actions.detach(),
+            states.detach(),
+            actions.detach(),
+            action_logprobs.detach(),
+            state_values.detach(),
+        )
+
     def save_buffer(self, state=None, action=None, logprob=None, state_value=None, reward=None, is_terminal=None):
         def _buffer_tensor(x, ensure_1d=False):
             if torch.is_tensor(x):
@@ -282,6 +305,55 @@ class PPO:
         self.buffer.state_values.append(_buffer_tensor(state_value, ensure_1d=True))
         self.buffer.rewards.append(reward)
         self.buffer.is_terminals.append(is_terminal)
+
+    def save_buffer_batch(
+        self,
+        states,
+        actions,
+        logprobs,
+        state_values,
+        rewards,
+        is_terminals,
+    ):
+        """Save one temporal slice from B parallel trajectories.
+
+        Entries retain their batch dimension in the buffer as ``[T, B, ...]``.
+        ``update`` computes returns independently along T for every environment
+        before flattening T and B for the standard PPO loss.
+        """
+        batch_size = int(states.shape[0])
+        tensors = {
+            "actions": actions,
+            "logprobs": logprobs,
+            "state_values": state_values,
+            "rewards": rewards,
+            "is_terminals": is_terminals,
+        }
+        for name, value in tensors.items():
+            value = torch.as_tensor(value)
+            if value.reshape(-1).numel() != batch_size:
+                raise ValueError(
+                    f"Parallel PPO {name} has {value.reshape(-1).numel()} values; "
+                    f"expected batch size {batch_size}"
+                )
+
+        buffer_device = states.device
+        self.buffer.states.append(states.detach())
+        self.buffer.actions.append(actions.detach().reshape(batch_size))
+        self.buffer.logprobs.append(logprobs.detach().reshape(batch_size))
+        self.buffer.state_values.append(
+            state_values.detach().reshape(batch_size)
+        )
+        self.buffer.rewards.append(
+            torch.as_tensor(
+                rewards, dtype=torch.float32, device=buffer_device
+            ).reshape(batch_size)
+        )
+        self.buffer.is_terminals.append(
+            torch.as_tensor(
+                is_terminals, dtype=torch.bool, device=buffer_device
+            ).reshape(batch_size)
+        )
         
 
     def estimate_old_value(self, state):
@@ -292,6 +364,14 @@ class PPO:
             value = self.policy_old.critic(state.to(device))
         return float(value.reshape(-1)[0].detach().cpu().item())
 
+    def estimate_old_values_batch(self, states):
+        """Return V(s) for every state in a vectorized environment."""
+        if not torch.is_tensor(states):
+            states = torch.as_tensor(states, dtype=torch.float32)
+        with torch.no_grad():
+            values = self.policy_old.critic(states.to(device))
+        return values.detach().reshape(-1).cpu()
+
     def update(self, bootstrap_value=0.0):
         """
         Update PPO from the current rollout buffer.
@@ -301,7 +381,7 @@ class PPO:
         return to zero. This lets P2E update within one environment without
         pretending that the environment ended at each online update boundary.
         """
-        rollout_size = len(self.buffer.rewards)
+        rollout_size = self.buffer.transition_count()
         if rollout_size == 0:
             return {
                 "updated": False,
@@ -310,30 +390,74 @@ class PPO:
                 "reason": "empty_buffer",
             }
 
-        # Monte Carlo estimate of returns, optionally bootstrapped at a
-        # non-terminal rollout boundary.
-        rewards = []
-        discounted_reward = float(bootstrap_value)
-        for reward, is_terminal in zip(reversed(self.buffer.rewards), reversed(self.buffer.is_terminals)):
-            if is_terminal:
-                discounted_reward = 0
-            discounted_reward = reward + (self.gamma * discounted_reward)
-            rewards.insert(0, discounted_reward)
+        parallel_rollout = torch.is_tensor(self.buffer.rewards[0])
+
+        # Monte Carlo returns, optionally bootstrapped at a non-terminal
+        # rollout boundary. For vectorized environments, every column is an
+        # independent trajectory and terminal markers reset only that column.
+        if parallel_rollout:
+            rewards_tb = torch.stack(self.buffer.rewards, dim=0).float()
+            terminals_tb = torch.stack(self.buffer.is_terminals, dim=0).bool()
+            batch_size = rewards_tb.shape[1]
+            discounted_reward = torch.as_tensor(
+                bootstrap_value,
+                dtype=torch.float32,
+                device=rewards_tb.device,
+            ).reshape(-1)
+            if discounted_reward.numel() == 1:
+                discounted_reward = discounted_reward.expand(batch_size).clone()
+            elif discounted_reward.numel() != batch_size:
+                raise ValueError(
+                    f"Expected {batch_size} bootstrap values, got "
+                    f"{discounted_reward.numel()}"
+                )
+            returns = []
+            for reward_t, terminal_t in zip(
+                reversed(rewards_tb), reversed(terminals_tb)
+            ):
+                discounted_reward = torch.where(
+                    terminal_t,
+                    torch.zeros_like(discounted_reward),
+                    discounted_reward,
+                )
+                discounted_reward = reward_t + self.gamma * discounted_reward
+                returns.append(discounted_reward)
+            rewards = torch.stack(list(reversed(returns)), dim=0).reshape(-1).to(device)
+        else:
+            rewards = []
+            discounted_reward = float(bootstrap_value)
+            for reward, is_terminal in zip(
+                reversed(self.buffer.rewards), reversed(self.buffer.is_terminals)
+            ):
+                if is_terminal:
+                    discounted_reward = 0
+                discounted_reward = reward + (self.gamma * discounted_reward)
+                rewards.insert(0, discounted_reward)
+            rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
 
         # Return normalization is retained by default for backwards
         # compatibility. P2E disables it so critic values and bootstrap values
         # remain on the same intrinsic-return scale.
-        rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
         if self.normalize_returns:
             rewards = (
                 rewards - rewards.mean()
             ) / (rewards.std(unbiased=False) + 1e-7)
 
         # convert list to tensor
-        old_states = torch.squeeze(torch.stack(self.buffer.states, dim=0)).detach().to(device)
-        old_actions = torch.squeeze(torch.stack(self.buffer.actions, dim=0)).detach().to(device)
-        old_logprobs = torch.squeeze(torch.stack(self.buffer.logprobs, dim=0)).detach().to(device)
-        old_state_values = torch.squeeze(torch.stack(self.buffer.state_values, dim=0)).detach().to(device)
+        if parallel_rollout:
+            old_states = torch.stack(self.buffer.states, dim=0).reshape(
+                rollout_size, -1
+            ).detach().to(device)
+            old_actions = torch.stack(self.buffer.actions, dim=0).reshape(-1).detach().to(device)
+            old_logprobs = torch.stack(self.buffer.logprobs, dim=0).reshape(-1).detach().to(device)
+            old_state_values = torch.stack(
+                self.buffer.state_values, dim=0
+            ).reshape(-1).detach().to(device)
+        else:
+            old_states = torch.squeeze(torch.stack(self.buffer.states, dim=0)).detach().to(device)
+            old_actions = torch.squeeze(torch.stack(self.buffer.actions, dim=0)).detach().to(device)
+            old_logprobs = torch.squeeze(torch.stack(self.buffer.logprobs, dim=0)).detach().to(device)
+            old_state_values = torch.squeeze(torch.stack(self.buffer.state_values, dim=0)).detach().to(device)
 
         # calculate advantages
         advantages = rewards.detach() - old_state_values.detach()

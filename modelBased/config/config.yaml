@@ -7,11 +7,11 @@ pipeline:
   skip_policy: false
   domains:
     minigrid:
-      policy_checkpoint: ${oc.env:MODEL_FPATH}/Policy/policy_minigrid_${domains.minigrid.task_name}.ckpt
+      policy_checkpoint: ${oc.env:MODEL_FPATH}/Policy/policy_minigrid_${domains.minigrid.task_name}_seed${PPO.seed}.ckpt
     crafter:
-      policy_checkpoint: ${oc.env:MODEL_FPATH}/Policy/policy_crafter_${domains.crafter.task_name}.ckpt
+      policy_checkpoint: ${oc.env:MODEL_FPATH}/Policy/policy_crafter_${domains.crafter.task_name}_seed${PPO.seed}.ckpt
     bipedalwalker:
-      policy_checkpoint: ${oc.env:MODEL_FPATH}/Policy/policy_bipedalwalker_${domains.bipedalwalker.task_name}.ckpt
+      policy_checkpoint: ${oc.env:MODEL_FPATH}/Policy/policy_bipedalwalker_${domains.bipedalwalker.task_name}_seed${PPO.seed}.ckpt
 
 domains:
   crafter:
@@ -180,6 +180,9 @@ PPO:
   # This is the only training-source switch. All PPO settings below are shared:
   # True = direct environment transitions; False = world-model transitions.
   train_in_real_env: False
+  # Change this value for independent runs. It controls PPO initialization,
+  # stochastic actions, and MiniGrid reset randomness in both real and WM modes.
+  seed: 1
   env_type: ${domains.${domain}.env_type}
   has_continuous_action_space: False
   # Maximum actions before an unfinished episode resets. Increase this with
@@ -198,6 +201,11 @@ PPO:
   # Standard PPO rollout/update settings. A rollout spans multiple episodes;
   # never run eight optimizer epochs on a single 3- or 4-step episode.
   rollout_steps: 4096
+  # Number of GPU-batched imagined trajectories used only by WM training.
+  # rollout_steps and max_training_timesteps must both be divisible by this.
+  # Set to 1 for serial behavior. Reduce to 16/32 for a longer temporal
+  # rollout (better sparse-reward credit assignment) or use 64 for throughput.
+  num_imagined_envs: 64
   # Zero is the usual choice when deterministic argmax performance matters;
   # positive entropy explicitly rewards keeping the policy stochastic.
   entropy_coef: 0.0
@@ -207,7 +215,9 @@ PPO:
   step_penalty: 0.0  # Step penalty set to 0.0 (original reward already incorporates step decay)
   lr_actor: 0.0003  # learning rate for actor
   lr_critic: 0.001  # learning rate for critic
-  checkpoint_path: ${oc.env:MODEL_FPATH}/Policy/policy_${domain}_${domains.${domain}.task_name}.ckpt
+  # Seed-specific paths preserve earlier checkpoints and prevent multi-seed
+  # experiments from overwriting one another.
+  checkpoint_path: ${oc.env:MODEL_FPATH}/Policy/policy_${domain}_${domains.${domain}.task_name}_seed${PPO.seed}.ckpt
   checkpoint_path_wm: ${domains.${domain}.world_model_checkpoint}
   compute_regret: False
   regret_eval_freq: 5000
@@ -215,7 +225,8 @@ PPO:
   episodes_eval: 10
   wandb_project: minigrid_policy_training
   wandb_entity: null  # null uses the default entity from your `wandb login`
-  wandb_run_name: ${domain}_${domains.${domain}.task_name}_policy
+  wandb_group: ${domain}_${domains.${domain}.task_name}_policy
+  wandb_run_name: ${PPO.wandb_group}_seed${PPO.seed}
   rolling_window_episodes: 50  # WandB rolling metrics use the latest N episodes
   time_step: 0
   max_training_timesteps: 1e6  # Increase after validating the pipeline.
