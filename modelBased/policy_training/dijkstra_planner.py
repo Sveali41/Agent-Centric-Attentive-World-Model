@@ -89,7 +89,7 @@ class GraphPlanner:
         return actions[:k]
 
 
-@hydra.main(version_base=None, config_path=str(PROJECT_ROOT / "trainer/conf"), config_name="config_test")
+@hydra.main(version_base=None, config_path=str(PROJECT_ROOT / "legacy/trainer/conf"), config_name="config_test")
 def run_planner_rollout(cfg: DictConfig):
     hparams = cfg
     hparams_wm = hparams.attention_model

@@ -31,14 +31,14 @@ lightning_logs/
 
 # Training logs
 modelBased/log/
-trainer/logs/
+legacy/trainer/logs/
 path/to/logdir/
 *.log
 
 # Generated model weights and checkpoints
 modelBased/models/
 generator/models/
-trainer/models/
+legacy/trainer/models/
 *.ckpt
 *.pt
 *.pth
@@ -57,4 +57,4 @@ videos/
 *.webm
 
 # Temporary training data
-trainer/data/temp/
+legacy/trainer/data/temp/

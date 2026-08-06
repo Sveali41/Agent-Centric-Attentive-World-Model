@@ -28,9 +28,9 @@ domain: minigrid  # minigrid | crafter | bipedalwalker
 
 The main differences are already defined under `domains:` in the same file:
 
-- **MiniGrid** uses a `3`-channel discrete grid, an attention mask size of `3`, and level files under `trainer/level/`.
-- **Crafter** uses a `2`-channel discrete symbolic grid, an attention mask size of `5`, and custom layouts under `trainer/level/crafter/`. Its custom environment creates the world from the layout, so `env_path` is kept only for compatibility.
-- **BipedalWalker** uses a normalized continuous state with shape `[1, 1, 24]`, an attention mask size of `5`, and terrain files under `trainer/level/bipedal_walker/`. Data collection can use either the heuristic behavior policy or a pretrained SB3 policy.
+- **MiniGrid** uses a `3`-channel discrete grid, an attention mask size of `3`, and active level files under `level/`.
+- **Crafter** uses a `2`-channel discrete symbolic grid, an attention mask size of `5`, and custom layouts under `legacy/trainer/level/crafter/`. Its custom environment creates the world from the layout, so `env_path` is kept only for compatibility.
+- **BipedalWalker** uses a normalized continuous state with shape `[1, 1, 24]`, an attention mask size of `5`, and terrain files under `legacy/trainer/level/bipedal_walker/`. Data collection can use either the heuristic behavior policy or a pretrained SB3 policy.
 
 Available task groups include:
 
@@ -50,15 +50,29 @@ Available task groups include:
 2. **Install the requirements:**
 
    ```bash
+   # For GPU training, install the PyTorch build matching your CUDA version
+   # first: https://pytorch.org/get-started/locally/
    pip3 install -r requirements.txt
    pip install -e .
    ```
 
+`requirements.txt` contains the direct dependencies for the supported
+MiniGrid, Crafter, and BipedalWalker pipeline. It intentionally does not pin
+transitive packages, Jupyter tooling, or CUDA runtime wheels from one specific
+machine.
+
 3. **Load the repository-local paths before running experiments:**
 
    ```bash
+   cp .env.example .env
+   # Edit PROJECT_ROOT in .env to point to this clone.
    source .env
    ```
+
+The active pipeline lives under `modelBased/`, `domain/`, and `generator/`.
+Older curriculum and continual-learning experiments are retained under
+`legacy/trainer/`; `TRAINER_PATH` points there for compatibility with their
+configs and with the Crafter/BipedalWalker layout collection.
 
 All documented entry points add the repository root automatically, so they can be run from the repository root with either direct script syntax or Python module syntax. Module syntax is also supported:
 
@@ -264,11 +278,11 @@ not change the observation.
 
 ## Recommended Workflow by Domain
 
-For **MiniGrid**, choose a text layout in `trainer/level/`, set `domain: minigrid`, and use the discrete world-model pipeline. This is the simplest domain for checking grid transitions and key-door or obstacle behavior.
+For **MiniGrid**, choose a text layout in `level/`, set `domain: minigrid`, and use the discrete world-model pipeline. This is the simplest domain for checking grid transitions and key-door or obstacle behavior.
 
-For **Crafter**, choose a layout from `trainer/level/crafter/`, set `domain: crafter`, and keep `env.crafter.stochastic: false` for deterministic initial experiments. Set it to `true` when evaluating robustness to moving entities and stochastic behavior.
+For **Crafter**, choose a layout from `legacy/trainer/level/crafter/`, set `domain: crafter`, and keep `env.crafter.stochastic: false` for deterministic initial experiments. Set it to `true` when evaluating robustness to moving entities and stochastic behavior.
 
-For **BipedalWalker**, choose a terrain from `trainer/level/bipedal_walker/`, set `domain: bipedalwalker`, and use normalized data. The default `behavior_policy: heuristic` is suitable for initial data collection; set `behavior_policy: pretrained_sb3` and provide `sb3_model_path` when using a trained continuous-control policy.
+For **BipedalWalker**, choose a terrain from `legacy/trainer/level/bipedal_walker/`, set `domain: bipedalwalker`, and use normalized data. The default `behavior_policy: heuristic` is suitable for initial data collection; set `behavior_policy: pretrained_sb3` and provide `sb3_model_path` when using a trained continuous-control policy.
 
 ## Configuring Environment Layouts
 
@@ -374,7 +388,7 @@ drink: 9
 energy: 9
 ```
 
-Place the file under `trainer/level/crafter/target_tasks/` and set
+Place the file under `legacy/trainer/level/crafter/target_tasks/` and set
 `domains.crafter.task_name` to its filename stem. Crafter's `layout_path`,
 dataset, checkpoints, and visualization filenames are derived from that name.
 Override `domains.crafter.layout_path` only for a file outside the default

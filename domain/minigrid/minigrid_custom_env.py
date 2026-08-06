@@ -8,6 +8,7 @@ from PIL import Image, ImageDraw
 from minigrid.wrappers import FullyObsWrapper, RGBImgObsWrapper
 import numpy as np  # Ensure numpy is imported
 import textwrap
+from pathlib import Path
 
 
 def char_to_color(char: str) -> Optional[str]:
@@ -378,8 +379,8 @@ if __name__ == "__main__":
 
 
     # 2. generate env from text file
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    level_path = os.path.join(BASE_DIR, "trainer", "level", "env1_keydoor.txt")
+    project_root = Path(__file__).resolve().parents[2]
+    level_path = project_root / "legacy" / "trainer" / "level" / "env1_keydoor.txt"
     env = FullyObsWrapper(CustomMiniGridEnv(txt_file_path=level_path, 
                                         custom_mission="Find the key and open the door.",
                                         max_steps=5000, render_mode='human'))

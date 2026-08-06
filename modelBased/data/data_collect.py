@@ -135,7 +135,7 @@ class SB3BipedalPolicy:
 def _resolve_coverage_vis_target(cfg):
     collect_cfg = cfg.env.collect if hasattr(cfg.env, "collect") else cfg.env
     filename = getattr(collect_cfg, "visualize_filename", "coverage.png")
-    vis_save_path = getattr(collect_cfg, "visualize_save_path", "trainer/logs/dataset_visualization")
+    vis_save_path = getattr(collect_cfg, "visualize_save_path", "outputs/dataset_visualization")
     env_type = str(getattr(cfg.env, "env_type", "")).lower()
     data_type = str(getattr(collect_cfg, "data_type", "random")).lower()
 
@@ -662,7 +662,7 @@ def run_env(
         img = _coerce_render_image(img)
         
         # --- save locally ---
-        env_vis_path = getattr(collect_cfg, "env_visualize_save_path", getattr(cfg.env, "visualize_save_path", "trainer/logs/env_visualization"))
+        env_vis_path = getattr(collect_cfg, "env_visualize_save_path", getattr(cfg.env, "visualize_save_path", "outputs/env_visualization"))
         os.makedirs(env_vis_path, exist_ok=True)
         img_filename = getattr(collect_cfg, "env_visualize_filename", f"{log_name}_env.png")
         save_path = os.path.join(env_vis_path, img_filename)

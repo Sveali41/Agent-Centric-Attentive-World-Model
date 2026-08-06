@@ -169,10 +169,10 @@ env:
     maximum_dataset_size: 40000 
     data_save_path: ${domains.${domain}.data_save_path}
     save_coverage_visualize: False
-    visualize_save_path: ${oc.env:PROJECT_ROOT}/trainer/logs/dataset_visualization
+    visualize_save_path: ${oc.env:PROJECT_ROOT}/outputs/dataset_visualization
     visualize_filename: ${domains.${domain}.visualize_filename}
     save_env_visualize: False
-    env_visualize_save_path: ${oc.env:PROJECT_ROOT}/trainer/logs/env_visualization
+    env_visualize_save_path: ${oc.env:PROJECT_ROOT}/outputs/env_visualization
     env_visualize_filename: ${domains.${domain}.env_visualize_filename}
 
 # 4. PPO model
@@ -182,7 +182,7 @@ PPO:
   train_in_real_env: False
   # Change this value for independent runs. It controls PPO initialization,
   # stochastic actions, and MiniGrid reset randomness in both real and WM modes.
-  seed: 1
+  seed: 4
   env_type: ${domains.${domain}.env_type}
   has_continuous_action_space: False
   # Maximum actions before an unfinished episode resets. Increase this with

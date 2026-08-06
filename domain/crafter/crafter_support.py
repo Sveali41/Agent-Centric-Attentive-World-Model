@@ -276,7 +276,7 @@ def visualize_crafter_wm(
     obs_pred_logits: torch.Tensor,
     action: int,
     step: int,
-    save_dir: str = "trainer/logs/wm_visual",
+    save_dir: str = "outputs/wm_visual",
     full_map_size: tuple = (64, 64),
     agent_pos: tuple = (32, 32),
     inv: np.ndarray = None,
