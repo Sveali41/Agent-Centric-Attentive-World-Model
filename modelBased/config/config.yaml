@@ -198,7 +198,7 @@ env:
 PPO:
   # This is the only training-source switch. All PPO settings below are shared:
   # True = direct environment transitions; False = world-model transitions.
-  train_in_real_env: false
+  train_in_real_env: True
   action_set: a6_drop_inventory  # Six actions + colour-aware inventory observation; preserves older checkpoints.
   # Change this value for independent runs. It controls PPO initialization,
   # stochastic actions, and MiniGrid reset randomness in both real and WM modes.
@@ -228,7 +228,7 @@ PPO:
   num_imagined_envs: 64
   # Zero is the usual choice when deterministic argmax performance matters;
   # positive entropy explicitly rewards keeping the policy stochastic.
-  entropy_coef: 0.0
+  entropy_coef: 0.01
   normalize_advantages: True
   normalize_returns: False
   max_grad_norm: 0.5
@@ -253,8 +253,7 @@ PPO:
   # <domain>_<task_name>_realenv_policy. Each group contains its seed runs.
   rolling_window_episodes: 50  # WandB rolling metrics use the latest N episodes
   time_step: 0
-  max_training_timesteps: 1e6  # Increase after validating the pipeline.
-  # max_training_timesteps: 3e5
+  max_training_timesteps: 1.5e6  # 3M steps for key-door tasks with sparse reward.
   action_std_decay_freq: 2.5e5
   action_std_decay_rate: 0.05
   min_action_std: 0.1

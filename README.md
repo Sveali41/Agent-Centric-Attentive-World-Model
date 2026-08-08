@@ -429,6 +429,25 @@ For example, `level/minigrid/Grid_11_11_KD_level1.txt` uses symbols such as:
 
 The second block specifies colors character-by-character. Supported color symbols include `R` (red), `G` (green), `B` (blue), `Y` (yellow), `M` (purple), and `W`/`E`/`S` (grey). Both blocks must have the same number of rows and columns.
 
+#### Locked vs unlocked doors
+
+MiniGrid supports two door types, selected by the layout character:
+
+| Layout char | Constructor | Initial state | Interaction |
+| --- | --- | --- | --- |
+| `D` | `Door(color, is_locked=True)` | **Locked** (state=2) | Agent must carry a key of the **same colour**, then `toggle` to unlock and open |
+| `O` | `Door(color, is_locked=False)` | **Closed** (state=1) | Agent can `toggle` to open without any key |
+
+In the fully-observed 3-channel grid encoding used by the WM, a door cell is represented as:
+
+| Channel | Field | Values |
+| --- | --- | --- |
+| 0 — object | object type | `4` (door) |
+| 1 — color | door colour | `0`=red, `1`=green, `2`=blue, `3`=purple, `4`=yellow, `5`=grey |
+| 2 — state | door state | `0`=open, `1`=closed, `2`=locked |
+
+The WM predicts all three channels as categorical distributions (`observation_schema` classes 11+6+4). During imagined rollouts the WM learns the state transition `locked(2) → open(0)` conditioned on the agent's inventory token (carrying the matching key) and the `toggle` action. The inventory itself is predicted by a separate `inv_head` as a 7-class categorical output (empty + 6 key colours).
+
 ```text
 WWWWW
 WSEKW
