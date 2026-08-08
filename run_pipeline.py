@@ -164,12 +164,24 @@ def main(cfg: DictConfig) -> None:
     if label not in valid_labels:
         raise ValueError(f"pipeline.label must be one of {sorted(valid_labels)}, got {label!r}")
 
+    import time
+    from datetime import timedelta
+    
     print("Pipeline configuration:")
     print(OmegaConf.to_yaml(cfg.pipeline, resolve=True))
+    
+    pipeline_start = time.time()
 
     domains = ["minigrid", "crafter", "bipedalwalker"] if label == "full" else [label]
     for domain in domains:
         run_domain(domain, cfg)
+        
+    pipeline_end = time.time()
+    elapsed = pipeline_end - pipeline_start
+    print("\n========================================================")
+    print("🎉 MBRL Pipeline Completed!")
+    print(f"Total time (Data Collection -> WM Train -> Planning): {timedelta(seconds=int(elapsed))}")
+    print("========================================================\n")
 
 
 if __name__ == "__main__":

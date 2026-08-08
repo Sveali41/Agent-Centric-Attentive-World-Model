@@ -54,7 +54,7 @@ domains:
       - {name: color, distribution: categorical, prediction_slice: [11, 17], target_index: 1, target_mode: current_plus_delta, classes: 6}
       - {name: state, distribution: categorical, prediction_slice: [17, 21], target_index: 2, target_mode: current_plus_delta, classes: 4}
       - {name: inventory, distribution: categorical, prediction_source: auxiliary, target_source: inventory, classes: 7}
-    collection_replace_start_with_empty: true
+    collection_replace_start_with_empty: false
 
   bipedalwalker:
     env_type: bipedalwalker
@@ -202,7 +202,7 @@ PPO:
   action_set: a6_drop_inventory  # Six actions + colour-aware inventory observation; preserves older checkpoints.
   # Change this value for independent runs. It controls PPO initialization,
   # stochastic actions, and MiniGrid reset randomness in both real and WM modes.
-  seed: 4
+  seed: 8
   env_type: ${domains.${domain}.env_type}
   has_continuous_action_space: False
   # Maximum actions before an unfinished episode resets. Increase this with
