@@ -185,7 +185,7 @@ env:
     uniform_reset_steps: 5000
     episodes: 1000
     mini_dataset_size: 8000
-    maximum_dataset_size: 40000 
+    maximum_dataset_size: 60000 
     data_save_path: ${domains.${domain}.data_save_path}
     save_coverage_visualize: False
     visualize_save_path: ${oc.env:PROJECT_ROOT}/outputs/dataset_visualization
@@ -198,7 +198,7 @@ env:
 PPO:
   # This is the only training-source switch. All PPO settings below are shared:
   # True = direct environment transitions; False = world-model transitions.
-  train_in_real_env: True
+  train_in_real_env: False
   action_set: a6_drop_inventory  # Six actions + colour-aware inventory observation; preserves older checkpoints.
   # Change this value for independent runs. It controls PPO initialization,
   # stochastic actions, and MiniGrid reset randomness in both real and WM modes.
@@ -253,7 +253,7 @@ PPO:
   # <domain>_<task_name>_realenv_policy. Each group contains its seed runs.
   rolling_window_episodes: 50  # WandB rolling metrics use the latest N episodes
   time_step: 0
-  max_training_timesteps: 1.5e6  # 3M steps for key-door tasks with sparse reward.
+  max_training_timesteps: 1536000  # 64 × 24000; must be divisible by num_imagined_envs.
   action_std_decay_freq: 2.5e5
   action_std_decay_rate: 0.05
   min_action_std: 0.1

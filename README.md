@@ -38,6 +38,14 @@ Available task groups include:
 - Crafter: `crafter_minitask_*.txt` and `target_tasks/crafter_target_task_*.txt`.
 - BipedalWalker: `minitasks/minitask_*.txt` and `target_tasks/bipedal_target_task_*.txt`.
 
+### Demonstration: MiniGrid Locked Door (Level 3)
+
+The following GIF demonstrates a policy evaluated in the challenging `Grid_11_11_KD_level3` environment (locked door). The agent successfully learns the causal chain required to solve the task: `navigate to key → pickup key → navigate to door → toggle (unlock) door → navigate to goal`.
+
+![MiniGrid Level 3 Locked Door Policy Evaluation](modelBased/visulization/PPO/PPO_gif/ppo_real_env_test.gif)
+
+*By utilizing the Attentive World Model for planning and adjusting PPO exploration parameters (e.g., `entropy_coef=0.01`) to handle extreme reward sparsity, the agent can achieve a stable ~100% success rate on this long-horizon task.*
+
 ## Environment Setup
 
 1. **Clone this repository:**
