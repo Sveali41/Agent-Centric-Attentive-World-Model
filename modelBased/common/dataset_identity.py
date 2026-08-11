@@ -44,6 +44,49 @@ def identity_from_config(cfg: Any, domain: str | None = None) -> dict[str, Any]:
         # Version the transition state representation so datasets collected
         # before colour-aware carried inventory are never silently reused.
         identity["inventory_encoding"] = "key_color_token_v1"
+    elif domain == "crafter":
+        # Crafter datasets contain native simulator reward and the 16-slot
+        # inventory transition used by the auxiliary WM head. Achievements
+        # remain planner history and are deliberately not a WM target.
+        identity["reward_schema"] = "crafter_native_v1"
+        identity["inventory_encoding"] = "crafter_inventory_v1"
+        # The per-episode horizon changes how often collection resets before
+        # reaching a long-horizon crafting interaction. Include it in the
+        # dataset contract so changing max_steps cannot silently reuse an old
+        # P2E artifact collected with a shorter horizon.
+        data_collection = getattr(domain_cfg, "data_collection", None)
+        if data_collection is not None:
+            identity["episode_max_steps"] = int(
+                getattr(data_collection, "max_steps", 0)
+            )
+        continual_cfg = getattr(domain_cfg, "continual_learning", None)
+        continual_enabled = bool(
+            continual_cfg is not None
+            and getattr(continual_cfg, "enabled", False)
+        )
+        p2e_cfg = getattr(cfg, "p2e", None)
+        p2e_enabled = bool(
+            p2e_cfg is not None and getattr(p2e_cfg, "enabled", False)
+        )
+        if p2e_enabled or continual_enabled:
+            # Acquisition policy is part of the data contract. This protects
+            # both single-environment P2E and continual phase datasets from
+            # accidentally reusing random data with the same layout.
+            identity["collection_policy"] = (
+                "crafter_p2e_task_aware_v3"
+                if p2e_enabled
+                else "crafter_uniform_random_v1"
+            )
+        # Non-empty starting inventories define distinct continual-learning
+        # phases even when the layout is identical.  Keep the empty/default
+        # phase backward compatible with datasets collected before this field
+        # existed in the metadata schema.
+        initial_inventory = getattr(domain_cfg, "initial_inventory", None)
+        if initial_inventory:
+            identity["initial_inventory"] = {
+                str(key): float(value)
+                for key, value in sorted(dict(initial_inventory).items())
+            }
     return identity
 
 

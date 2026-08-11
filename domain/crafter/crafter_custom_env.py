@@ -310,7 +310,13 @@ class CustomCrafterEnv(gym.Env):
         self.layout_str = layout_str
         self.max_steps = max_steps or 10000
         self.current_step = 0
-        self.initial_inventory = kwargs.get('initial_inventory', {}) or {}
+        # A layout may provide baseline stats in its second block. Explicit
+        # constructor values are curriculum overrides and must take priority.
+        explicit_initial_inventory = {
+            str(key).lower(): float(value)
+            for key, value in (kwargs.get('initial_inventory', {}) or {}).items()
+        }
+        self.initial_inventory = {}
         
         # ========== Alignment: Parse Layout Input ==========
         if self.txt_file_path:
@@ -345,6 +351,8 @@ class CustomCrafterEnv(gym.Env):
         elif not self.layout_str:
             # Fallback tiny map if nothing is provided
             self.layout_str = "GGGGGGG\nGGGGGGG\nGGGPGGG\nGGGGGGG\nGGGGGGG"
+
+        self.initial_inventory.update(explicit_initial_inventory)
             
         # Filter lines to strictly include only map characters, exclude stats lines (e.g., 'health: 9')
         map_lines = []
@@ -374,6 +382,27 @@ class CustomCrafterEnv(gym.Env):
         self.slippery_prob = float(slippery_prob)
         # Crafter movement action IDs: 1=move_left, 2=move_right, 3=move_up, 4=move_down
         self._move_actions = [1, 2, 3, 4]
+
+    def _reset_native_bookkeeping(self):
+        """Reset the native reward counters after replacing Crafter's world."""
+        self.env._step = 0
+        self.env._last_health = self.env._player.health
+        self.env._unlocked = set()
+
+    def _native_info(self, reward, terminated, truncated, newly_unlocked):
+        player = self.env._player
+        return {
+            "inventory": player.inventory.copy(),
+            "achievements": player.achievements.copy(),
+            "newly_unlocked": list(newly_unlocked),
+            "health": float(player.health),
+            "native_reward": float(reward),
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
+            "episode_done": bool(terminated or truncated),
+            "player_pos": np.asarray(player.pos).copy(),
+            "sleeping": bool(getattr(player, "sleeping", False)),
+        }
 
     def _extract_obs(self):
         # Replace the RGB view with the native symbolic extraction `(H, W, 2)`.
@@ -446,7 +475,7 @@ class CustomCrafterEnv(gym.Env):
 
         
         if target_dir is not None:
-             player.facing = np.array(target_dir, dtype=np.float32)
+             player.facing = tuple(int(v) for v in target_dir)
 
         self.env._world = world
         self.env._player = player
@@ -468,10 +497,18 @@ class CustomCrafterEnv(gym.Env):
         # Inject custom initial inventory
         if hasattr(self, 'initial_inventory') and self.initial_inventory:
             for item, amount in self.initial_inventory.items():
-                if item in ['health', 'food', 'drink', 'energy']:
-                    setattr(self.env._player, item, max(0, min(9, amount)))
+                # Crafter's renderer expects item counts to be integer texture
+                # keys ("0" ... "9"), while layout stats are parsed as floats.
+                amount = int(round(float(amount)))
+                if item == 'health':
+                    self.env._player.health = max(0, min(9, amount))
                 else:
-                    self.env._player.inventory[item] = amount
+                    # Crafter exposes food, drink and energy through the
+                    # inventory dict; assigning Player attributes would not
+                    # change the observation or the native survival logic.
+                    self.env._player.inventory[item] = max(0, min(9, amount))
+
+        self._reset_native_bookkeeping()
 
         return self._extract_obs(), {}
 
@@ -491,9 +528,15 @@ class CustomCrafterEnv(gym.Env):
                 # Replace with a random movement action (could be same or different)
                 action = np.random.choice(self._move_actions)
 
+        # Match the pinned Crafter Env ordering: advance time before updating
+        # the player, then calculate reward from the resulting state.
+        self.env._step += 1
+        if hasattr(self.env, "_update_time"):
+            self.env._update_time()
+        previous_health = float(self.env._last_health)
+        previous_achievements = self.env._player.achievements.copy()
+
         # --- 2. Apply player action ---
-        # Map the discrete action ID to the Crafter action constant
-        # and update the player’s state accordingly.
         self.env._player.action = constants.actions[action]
         self.env._player.update()
 
@@ -504,23 +547,34 @@ class CustomCrafterEnv(gym.Env):
                 if obj is not self.env._player:
                     obj.update()
 
-        # --- 3. Update environment time/daylight cycle ---
-        # Keep the world visually consistent even if other entities are frozen.
-        if hasattr(self.env, "_update_time"):
-            self.env._update_time()
-
         # --- 4. Get the new observation ---
         obs = self._extract_obs()
 
         # --- 5. Return standard Gym-style outputs ---
         self.current_step += 1
-        
-        # Episode terminates when the step budget is exhausted or the player dies.
-        reward = 0.0
-        done = (self.current_step >= self.max_steps) or (self.env._player.health <= 0)
-        info = {}
-
-        return obs, reward, done, False, info
+        next_health = float(self.env._player.health)
+        next_achievements = self.env._player.achievements.copy()
+        unlocked = getattr(self.env, "_unlocked", set())
+        newly_unlocked = [
+            name for name, count in next_achievements.items()
+            if int(count) > 0 and name not in unlocked
+        ]
+        unlocked.update(newly_unlocked)
+        self.env._unlocked = unlocked
+        # Native Crafter adds one reward when a step unlocks any new
+        # achievement, even in the rare case where that step unlocks several.
+        reward = (next_health - previous_health) / 10.0 + float(bool(newly_unlocked))
+        self.env._last_health = next_health
+        terminated = next_health <= 0
+        truncated = self.current_step >= self.max_steps and not terminated
+        info = self._native_info(reward, terminated, truncated, newly_unlocked)
+        info["achievement_delta"] = {
+            name: int(next_achievements[name] - previous_achievements.get(name, 0))
+            for name in next_achievements
+            if int(next_achievements[name] - previous_achievements.get(name, 0)) != 0
+        }
+        info["health_reward"] = (next_health - previous_health) / 10.0
+        return obs, float(reward), bool(terminated), bool(truncated), info
 
 
     def render(self, mode="rgb_array"):

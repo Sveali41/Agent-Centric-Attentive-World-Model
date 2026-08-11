@@ -5,6 +5,7 @@ from typing import List, Dict, Tuple
 from domain.minigrid import minigrid_support as minigrid_utils
 import random
 import os
+import tempfile
 
 
 class FisherReplayBuffer:
@@ -104,7 +105,7 @@ class FisherReplayBuffer:
                     batch, training=False
                 )
                 pred, _, aux_pred = model(obs_masked, act, info, inv=inv)
-                pred_for_loss = aux_pred if (getattr(model, "env_type", "") == "crafter" and aux_pred is not None) else pred
+                pred_for_loss = pred
             else:
                 obs = batch["obs"].float()
                 act = batch["act"]
@@ -116,10 +117,25 @@ class FisherReplayBuffer:
                 pred_for_loss, _ = model(obs_masked, act, info)
 
             if getattr(model, "env_type", "") == "crafter":
-                from domain.crafter.crafter_support import crafter_classification_loss
-                per_cell = crafter_classification_loss(
-                    pred_for_loss, obs_next_masked, reduction="none", weighted=False
+                from domain.crafter.crafter_support import (
+                    CRAFTER_EFFECT_CHANNELS,
+                    crafter_classification_loss,
+                    crafter_effect_loss,
                 )
+                if pred_for_loss.shape[1] == CRAFTER_EFFECT_CHANNELS:
+                    per_cell = crafter_effect_loss(
+                        pred_for_loss,
+                        obs_masked,
+                        obs_next_masked,
+                        reduction="none",
+                    )
+                else:
+                    per_cell = crafter_classification_loss(
+                        pred_for_loss,
+                        obs_next_masked,
+                        reduction="none",
+                        weighted=False,
+                    )
                 loss = per_cell.mean(dim=(1, 2)).detach().cpu().tolist()
             else:
                 loss = [F.mse_loss(pred_for_loss[i], obs_next_masked[i]).item() for i in range(len(pred_for_loss))]
@@ -252,10 +268,18 @@ class FisherReplayBuffer:
         obs: Tensor of shape (B, C, H, W) or (B, H, W, C)
         return: BoolTensor of shape (B,)
         """
-        if obs.dim() == 4 and obs.shape[1] != obs.shape[-1]:  # (B, C, H, W)
-            obj_map = obs[:, 0]  # Object channel
-        else:  # (B, H, W, C)
-            obj_map = obs[..., 0]  # Object channel
+        if obs.dim() != 4:
+            raise ValueError(f"Expected 4D image batch, got {tuple(obs.shape)}")
+        channel_first = obs.shape[1] in (2, 3, 4) and obs.shape[-1] > 4
+        channel_last = obs.shape[-1] in (2, 3, 4) and obs.shape[1] > 4
+        if channel_first:
+            obj_map = obs[:, 0]
+        elif channel_last:
+            obj_map = obs[..., 0]
+        else:
+            raise ValueError(
+                f"Cannot infer image layout for saliency mask: {tuple(obs.shape)}"
+            )
 
         B, H, W = obj_map.shape
         near_mask = torch.zeros(B, dtype=torch.bool, device=obs.device)
@@ -537,35 +561,71 @@ class FisherReplayBuffer:
     def export_dict(self) -> Dict[str, np.ndarray]:
         if not self.buffer:
             raise ValueError("Replay buffer is empty.")
-        keys = self.buffer[0].keys()
-        return {k: np.stack([s[k] for s in self.buffer]) for k in keys}
+        required = {"obs", "obs_next", "act"}
+        available = set(self.buffer[0].keys())
+        for sample in self.buffer[1:]:
+            available.intersection_update(sample.keys())
+        missing = required - available
+        if missing:
+            raise ValueError(f"Replay samples are missing required keys: {sorted(missing)}")
+
+        # Optional fields are exported only when every sample has them.  This
+        # keeps arrays aligned and avoids object arrays containing a mixture of
+        # real values and None after several curriculum phases.
+        exported = {}
+        for key in sorted(available):
+            try:
+                exported[key] = np.stack([sample[key] for sample in self.buffer])
+            except (ValueError, TypeError):
+                # Scalar/object metadata can still be represented as an object
+                # array, provided it has one entry per transition.
+                exported[key] = np.asarray([sample[key] for sample in self.buffer], dtype=object)
+        return exported
 
     def load_from_dict(self, data_dict: Dict[str, np.ndarray]):
         self.buffer = []
+        required = ("obs", "obs_next", "act")
+        missing = [key for key in required if key not in data_dict]
+        if missing:
+            raise KeyError(f"Replay data is missing required keys: {missing}")
         length = len(data_dict['obs'])
+        for key in required:
+            if len(data_dict[key]) != length:
+                raise ValueError(f"Replay field '{key}' has inconsistent length")
+
+        optional_keys = [
+            key for key in data_dict
+            if key not in required and data_dict[key] is not None
+        ]
         for i in range(length):
-            sample = {
-                'obs': data_dict['obs'][i],
-                'act': data_dict['act'][i],
-                'obs_next': data_dict['obs_next'][i]
-            }
-            if 'info' in data_dict and data_dict['info'] is not None:
-                sample['info'] = data_dict['info'][i]
-            if 'inv' in data_dict and data_dict['inv'] is not None:
-                sample['inv'] = data_dict['inv'][i]
-            if 'inv_next' in data_dict and data_dict['inv_next'] is not None:
-                sample['inv_next'] = data_dict['inv_next'][i]
+            sample = {key: data_dict[key][i] for key in required}
+            for key in optional_keys:
+                if len(data_dict[key]) != length:
+                    raise ValueError(f"Replay field '{key}' has inconsistent length")
+                sample[key] = data_dict[key][i]
             self.buffer.append(sample)
 
     def save_to_file(self, path: str):
         data = self.export_dict()
-        torch.save(data, path)
+        target = os.path.abspath(os.path.expanduser(str(path)))
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{os.path.basename(target)}.", suffix=".tmp",
+            dir=os.path.dirname(target),
+        )
+        os.close(fd)
+        try:
+            torch.save(data, temporary)
+            os.replace(temporary, target)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
         print(f"Fisher buffer saved to: {path}")
 
     def load_from_file(self, path: str):
         if not os.path.exists(path):
             raise FileNotFoundError(f"No buffer file found at {path}")
-        data = torch.load(path)
+        data = torch.load(path, weights_only=False)
         self.load_from_dict(data)
         print(f"Fisher buffer loaded from: {path}")
 

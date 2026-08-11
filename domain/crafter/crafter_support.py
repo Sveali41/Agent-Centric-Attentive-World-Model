@@ -161,10 +161,16 @@ def plot_crafter_coverage_from_npz(data_path: str, save_path: str | None = None,
 
 
 # ============================================================
-#  World Model Support Functions for Crafter (Classification)
+#  World Model Support Functions for Crafter (Categorical Effects)
 # ============================================================
 import torch
 import torch.nn.functional as F
+
+from modelBased.common.categorical_effects import (
+    apply_categorical_effect,
+    balanced_categorical_effect_loss,
+    categorical_effect_target,
+)
 
 # CustomCrafterEnv Object IDs (matching original Crafter mat_ids + shifted entities):
 # 0=None/empty, 1=water, 2=grass, 3=stone, 4=path, 5=sand, 6=tree,
@@ -174,6 +180,10 @@ import torch.nn.functional as F
 # Direction IDs: 0=none, 1=up, 2=down, 3=left, 4=right  →  5 classes
 CRAFTER_OBJ_CLASSES = 20
 CRAFTER_DIR_CLASSES = 5
+CRAFTER_OBJ_EFFECT_CLASSES = CRAFTER_OBJ_CLASSES + 1
+CRAFTER_DIR_EFFECT_CLASSES = CRAFTER_DIR_CLASSES + 1
+CRAFTER_EFFECT_CHANNELS = CRAFTER_OBJ_EFFECT_CLASSES + CRAFTER_DIR_EFFECT_CLASSES
+CRAFTER_ABSOLUTE_CHANNELS = CRAFTER_OBJ_CLASSES + CRAFTER_DIR_CLASSES
 CRAFTER_ACTION_NAMES = [
     'noop', 'move_left', 'move_right', 'move_up', 'move_down', 'do', 'sleep',
     'place_stone', 'place_table', 'place_furnace', 'place_plant',
@@ -255,20 +265,84 @@ def crafter_classification_loss(
     return total
 
 
-def crafter_reconstruct_from_logits(next_pred: torch.Tensor) -> torch.Tensor:
-    """
-    Reconstruct integer observation channels from logits using argmax.
-    Used for pseudo-MSE metric logging.
+def crafter_effect_loss(
+    effect_logits: torch.Tensor,
+    current: torch.Tensor,
+    following: torch.Tensor,
+    *,
+    reduction: str = "balanced_mean",
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    """Loss for Crafter KEEP/SET_TO effects.
 
-    Args:
-        next_pred: (B, 22, H, W)
-
-    Returns:
-        (B, 2, H, W) float tensor: [obj_id, dir_id]
+    The object and direction fields are balanced independently so their
+    unchanged cells cannot drown out sparse transitions.
     """
-    obj_pred = next_pred[:, :CRAFTER_OBJ_CLASSES].argmax(dim=1).float()  # (B, H, W)
-    dir_pred = next_pred[:, CRAFTER_OBJ_CLASSES:].argmax(dim=1).float()  # (B, H, W)
-    return torch.stack([obj_pred, dir_pred], dim=1)  # (B, 2, H, W)
+    if effect_logits.shape[1] != CRAFTER_EFFECT_CHANNELS:
+        raise ValueError(
+            f"Crafter effect logits require {CRAFTER_EFFECT_CHANNELS} channels, "
+            f"got {effect_logits.shape[1]}"
+        )
+    obj_logits = effect_logits[:, :CRAFTER_OBJ_EFFECT_CLASSES]
+    dir_logits = effect_logits[:, CRAFTER_OBJ_EFFECT_CLASSES:]
+    obj_target = categorical_effect_target(current[:, 0], following[:, 0])
+    dir_target = categorical_effect_target(current[:, 1], following[:, 1])
+    obj_loss = balanced_categorical_effect_loss(
+        obj_logits,
+        obj_target,
+        reduction=reduction,
+        label_smoothing=label_smoothing,
+    )
+    dir_loss = balanced_categorical_effect_loss(
+        dir_logits,
+        dir_target,
+        reduction=reduction,
+        label_smoothing=label_smoothing,
+    )
+    return (obj_loss + dir_loss) / 2.0
+
+
+def crafter_reconstruct_from_logits(
+    prediction: torch.Tensor,
+    current: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Reconstruct Crafter channels from effect logits.
+
+    Legacy 25-channel absolute checkpoints remain decodable when ``current``
+    is omitted or supplied, which lets an already-running old pipeline finish
+    without being confused with the new 27-channel effect artifacts.
+    """
+    channels = int(prediction.shape[1])
+    if channels == CRAFTER_ABSOLUTE_CHANNELS:
+        obj_pred = prediction[:, :CRAFTER_OBJ_CLASSES].argmax(dim=1)
+        dir_pred = prediction[:, CRAFTER_OBJ_CLASSES:].argmax(dim=1)
+        return torch.stack([obj_pred, dir_pred], dim=1).float()
+    if channels != CRAFTER_EFFECT_CHANNELS:
+        raise ValueError(
+            "Unsupported Crafter prediction width: "
+            f"{channels}; expected {CRAFTER_EFFECT_CHANNELS} effect or "
+            f"{CRAFTER_ABSOLUTE_CHANNELS} legacy absolute channels"
+        )
+    if current is None:
+        raise ValueError("Current Crafter state is required to apply categorical effects")
+    obj_effect = prediction[:, :CRAFTER_OBJ_EFFECT_CLASSES].argmax(dim=1)
+    dir_effect = prediction[:, CRAFTER_OBJ_EFFECT_CLASSES:].argmax(dim=1)
+    obj_pred = apply_categorical_effect(current[:, 0], obj_effect)
+    dir_pred = apply_categorical_effect(current[:, 1], dir_effect)
+    return torch.stack([obj_pred, dir_pred], dim=1).float()
+
+
+def crafter_output_mode_from_state_dict(state_dict: dict[str, torch.Tensor]) -> str:
+    """Infer legacy absolute versus categorical-effect output from FC width."""
+    for key, value in state_dict.items():
+        if key.endswith("fc.weight") and value.ndim == 2:
+            width = int(value.shape[0])
+            if width == CRAFTER_EFFECT_CHANNELS:
+                return "effect"
+            if width == CRAFTER_ABSOLUTE_CHANNELS:
+                return "absolute"
+    raise ValueError("Checkpoint does not contain a recognized Crafter fc.weight")
     
 def visualize_crafter_wm(
     obs_masked: torch.Tensor, 
@@ -293,10 +367,23 @@ def visualize_crafter_wm(
     if obs_next_masked.ndim == 4: obs_next_masked = obs_next_masked[0]
     if obs_pred_logits.ndim == 4: obs_pred_logits = obs_pred_logits[0]
         
-    # 1. Extract predicted IDs and uncertainty.
-    obj_logits = obs_pred_logits[:CRAFTER_OBJ_CLASSES]  
-    obj_probs = F.softmax(obj_logits, dim=0)
-    obj_pred = obj_probs.argmax(dim=0).detach().cpu().numpy()
+    # 1. Reconstruct the next object map. New checkpoints emit effects; keep
+    # legacy absolute logits readable for old artifacts and visual comparisons.
+    if obs_pred_logits.shape[0] == CRAFTER_EFFECT_CHANNELS:
+        obj_logits = obs_pred_logits[:CRAFTER_OBJ_EFFECT_CLASSES]
+        obj_probs = F.softmax(obj_logits, dim=0)
+        obj_effect = obj_probs.argmax(dim=0)
+        obj_pred = apply_categorical_effect(
+            obs_masked[0], obj_effect
+        ).detach().cpu().numpy()
+    elif obs_pred_logits.shape[0] == CRAFTER_ABSOLUTE_CHANNELS:
+        obj_logits = obs_pred_logits[:CRAFTER_OBJ_CLASSES]
+        obj_probs = F.softmax(obj_logits, dim=0)
+        obj_pred = obj_probs.argmax(dim=0).detach().cpu().numpy()
+    else:
+        raise ValueError(
+            f"Unsupported Crafter visualization output width {obs_pred_logits.shape[0]}"
+        )
     confidence = obj_probs.max(dim=0)[0].detach().cpu().numpy()
     uncertainty = 1.0 - confidence
     

@@ -135,7 +135,8 @@ def run(
     fisher=None,
     layout=None,
     replay_data=None,
-    direct_data=None
+    direct_data=None,
+    fit_ckpt_path=None,
 ):
     if net is None:
         from modelBased.world_model.AttentionWM import AttentionWorldModel
@@ -148,11 +149,19 @@ def run(
     print(f'*************************Data set: {cfg.attention_model.data_dir}************************')
 
     if not dataset_matches(cfg.attention_model.data_dir, cfg):
-        raise RuntimeError(
-            "Dataset identity does not match the selected domain/task/layout. "
-            "Recollect data with: python -m modelBased.data.data_collect "
-            f"domain={cfg.domain}"
-        )
+        allow_legacy = bool(getattr(cfg.attention_model, "allow_legacy_dataset", False))
+        from modelBased.common.dataset_identity import dataset_metadata
+        if allow_legacy and dataset_metadata(cfg.attention_model.data_dir) is None:
+            print(
+                "[WM] WARNING: using a legacy dataset without identity metadata. "
+                "Verify task_name/layout_path manually."
+            )
+        else:
+            raise RuntimeError(
+                "Dataset identity does not match the selected domain/task/layout. "
+                "Recollect data with: python -m modelBased.data.data_collect "
+                f"domain={cfg.domain}"
+            )
 
     use_wandb = cfg.attention_model.use_wandb
     fisher_beta = float(getattr(cfg.attention_model, "fisher_beta", 0.5))
@@ -163,7 +172,7 @@ def run(
     if should_use_validation_mode:
         # Validation-only mode uses 100% of the data without a train/val split.
         datamodule = ValidationDataModule(hparams=cfg.attention_model, data=direct_data, replay_data=None)
-    elif cfg.attention_model.continue_learning:
+    elif bool(getattr(cfg.attention_model, "continue_learning", False)):
         datamodule = WMRLDataModule(hparams=cfg.attention_model, data=direct_data, replay_data=replay_data)
     else:
         datamodule = WMRLDataModule(hparams=cfg.attention_model, data=direct_data, replay_data=None)
@@ -199,16 +208,21 @@ def run(
     except Exception as e:
         print("EXCEPTION AT E1:", e)
         
+    checkpoint_dir = getattr(cfg.attention_model, "checkpoint_dir", None)
+    checkpoint_dir = str(checkpoint_dir) if checkpoint_dir else tmp_dir
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
     checkpoint_callback = ModelCheckpoint(
         save_top_k=1,
         monitor=metric_to_monitor,
         mode="min",
-        dirpath=tmp_dir,
+        dirpath=checkpoint_dir,
         # Keep exactly one temporary checkpoint for this run.  The best
         # weights are copied to model_save_path below and the temporary file
         # is removed afterwards.
         filename=f"best-{str(cfg.domain)}",
         auto_insert_metric_name=False,
+        save_last=True,
         verbose=False
     )
 
@@ -251,7 +265,20 @@ def run(
 
     else:
         # ===== training =====
-        trainer.fit(net, datamodule)
+        resume_fit_path = None
+        if fit_ckpt_path:
+            candidate = Path(str(fit_ckpt_path)).expanduser().resolve()
+            if candidate.is_file():
+                resume_fit_path = str(candidate)
+                print(f"[WM] Resuming Lightning phase checkpoint: {resume_fit_path}")
+        if resume_fit_path:
+            # PyTorch 2.6 changed torch.load's implicit default to
+            # weights_only=True. The pinned Lightning version restores its
+            # trainer checkpoint with torch.load() without an explicit flag,
+            # so trusted local phase checkpoints would fail on resume when
+            # they contain the OmegaConf objects stored by Lightning.
+            os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+        trainer.fit(net, datamodule, ckpt_path=resume_fit_path)
 
         # Lightning leaves the module at the last epoch, while the desired
         # artifact is the best validation checkpoint. Load that checkpoint
@@ -274,23 +301,32 @@ def run(
         # Save the current parameters as the consolidation anchor.
         old_params = net.save_old_params()
 
-        # Estimate the Fisher information matrix.
-        fisher_samples = int(getattr(cfg.attention_model, "fisher_samples", 3000))
-        scale_factor = cfg.attention_model.scale_factor
-        new_fisher = net.compute_fisher(
-            datamodule.train_dataloader(),
-            samples=fisher_samples,
-            scale_factor=scale_factor
-        )
+        if bool(getattr(cfg.attention_model, "compute_fisher", True)):
+            # Estimate the Fisher information matrix for a later continual phase.
+            # Lightning moves the module back to CPU when fit() tears down. Move
+            # it explicitly so the expensive per-sample backward passes do not
+            # silently run on CPU.
+            fisher_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            net.to(fisher_device)
+            print(f"[Fisher] Using device: {fisher_device}")
+            fisher_samples = int(getattr(cfg.attention_model, "fisher_samples", 3000))
+            scale_factor = cfg.attention_model.scale_factor
+            new_fisher = net.compute_fisher(
+                datamodule.train_dataloader(),
+                samples=fisher_samples,
+                scale_factor=scale_factor
+            )
 
-        # Merge Fisher estimates with EMA smoothing.
-        if fisher is not None:
-            fisher = {
-                k: (1.0 - fisher_beta) * fisher[k] + fisher_beta * new_fisher[k]
-                for k in new_fisher
-            }
+            # Merge Fisher estimates with EMA smoothing.
+            if fisher is not None:
+                fisher = {
+                    k: (1.0 - fisher_beta) * fisher[k] + fisher_beta * new_fisher[k]
+                    for k in new_fisher
+                }
+            else:
+                fisher = new_fisher
         else:
-            fisher = new_fisher
+            print("[Fisher] Skipped: no later continual-learning phase is configured.")
 
     # ... (in run)
         # Save the training checkpoint.
@@ -308,7 +344,7 @@ def run(
         # domain, while keeping only the canonical final artifact.
         final_path = Path(str(model_pth)).resolve()
         temporary_pattern = f"best-{str(cfg.domain)}*.ckpt"
-        for temporary_path in Path(tmp_dir).glob(temporary_pattern):
+        for temporary_path in Path(checkpoint_dir).glob(temporary_pattern):
             if temporary_path.resolve() != final_path:
                 temporary_path.unlink(missing_ok=True)
                 print(f"[WM] Removed temporary checkpoint: {temporary_path}")
@@ -340,7 +376,8 @@ def train_api(
     fisher=None,
     env_layout=None,
     replay_data=None,
-    direct_data=None
+    direct_data=None,
+    fit_ckpt_path=None,
 ):
     result = run(
         cfg,
@@ -349,10 +386,14 @@ def train_api(
         fisher=fisher,
         layout=env_layout,
         replay_data=replay_data,
-        direct_data=direct_data
+        direct_data=direct_data,
+        fit_ckpt_path=fit_ckpt_path,
     )
 
-    return result, result.get("fisher"), net  # Return 3-tuple for compatibility with older unpacking logic
+    # Return the actual trained module.  Older curriculum code passed a
+    # possibly-None `net` argument back to its caller, which made warm-start
+    # training silently lose the updated weights.
+    return result, result.get("fisher"), result["net"]
 
 
 

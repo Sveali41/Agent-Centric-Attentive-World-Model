@@ -17,6 +17,7 @@ from modelBased.policy_training.experiment_naming import (
     policy_checkpoint_path,
     policy_wandb_identity,
 )
+from modelBased.common.artifact_naming import world_model_checkpoint_path
 import hydra
 from datetime import datetime
 from modelBased.common import utils
@@ -251,7 +252,13 @@ def run_ppo_wm(cfg):
     else:
         print(f"Model type: {hparams_world_model.model_type} not supported")
         exit()
-    utils.load_model_weight(model, hparams_world_model.model_save_path)
+    configured_wm_ckpt = getattr(hparams.PPO, "checkpoint_path_wm", None)
+    wm_ckpt = (
+        Path(str(configured_wm_ckpt)).expanduser().resolve()
+        if configured_wm_ckpt is not None and str(configured_wm_ckpt).strip() and str(configured_wm_ckpt).lower() != "null"
+        else world_model_checkpoint_path(hparams, str(hparams.domain))
+    )
+    utils.load_model_weight(model, str(wm_ckpt))
     model.eval() 
     
 

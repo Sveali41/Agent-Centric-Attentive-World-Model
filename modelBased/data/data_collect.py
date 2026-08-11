@@ -815,7 +815,12 @@ def run_env(
                 elif policy is not None:
                     # P2E / PPO policy injection for Crafter
                     if hasattr(policy, "expects_raw_obs") and policy.expects_raw_obs:
-                        act = policy.select_action(obs_image)
+                        policy_obs = (
+                            obs
+                            if bool(getattr(policy, "expects_observation_dict", False))
+                            else obs_image
+                        )
+                        act = policy.select_action(policy_obs)
                     else:
                         state_norm = _build_policy_state(obs_image)
                         act = policy.select_action(state_norm)
@@ -869,7 +874,10 @@ def run_env(
             # success/solvability checks.
             if intrinsic_reward_fn is not None:
                 obs_next_image = obs_next['image'] if isinstance(obs_next, dict) else obs_next
-                intrinsic_reward = intrinsic_reward_fn(obs_image, act, obs_next_image)
+                if bool(getattr(policy, "expects_observation_dict", False)):
+                    intrinsic_reward = intrinsic_reward_fn(obs, act, obs_next)
+                else:
+                    intrinsic_reward = intrinsic_reward_fn(obs_image, act, obs_next_image)
                 if policy is not None and hasattr(policy, "record_transition"):
                     policy.record_transition(
                         float(intrinsic_reward),

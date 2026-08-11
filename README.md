@@ -35,7 +35,8 @@ The main differences are already defined under `domains:` in the same file:
 Available task groups include:
 
 - MiniGrid: `Grid_11_11_KD_level1.txt`, `Grid_11_11_KD_level2.txt`, `Grid_11_11_KD_level3.txt`, and custom maze/corridor layouts.
-- Crafter: `crafter_minitask_*.txt` and `target_tasks/crafter_target_task_*.txt`.
+- Crafter: `crafter_minitask_*.txt`, `crafter_progression_small.txt`, and
+  `target_tasks/crafter_target_task_*.txt`.
 - BipedalWalker: `minitasks/minitask_*.txt` and `target_tasks/bipedal_target_task_*.txt`.
 
 ### Demonstration: MiniGrid Locked Door (Level 3)
@@ -164,7 +165,9 @@ python run_pipeline.py pipeline.label=minigrid pipeline.force=true  # force reru
 
 The default values are stored in `modelBased/config/config.yaml` under `pipeline:`. Dataset and checkpoint paths can also be changed there or overridden with Hydra arguments.
 
-The current PPO world-model policy implementation is MiniGrid-specific. Therefore, `run_pipeline.py` runs the policy stage for MiniGrid and reports a clear skip for Crafter and BipedalWalker until their corresponding policy adapters are added.
+Crafter has a dedicated WM-PPO adapter. Its imagined rollouts use the native
+Crafter health and first-achievement rewards; the target-tile metric remains a
+separate evaluation signal. BipedalWalker policy training remains skipped.
 
 For a longer policy run after validating the setup, override the PPO budget explicitly:
 
@@ -197,6 +200,34 @@ The output is selected automatically from the active domain configuration and sa
 - BipedalWalker: `bipedalwalker_<task_group>_<task_name>_<data_type>.npz`
 
 Some datasets may already exist in this directory and can be reused.
+
+Domain-specific collection and policy budgets live under the active domain in
+`modelBased/config/config.yaml`. For example, Crafter uses
+`domains.crafter.data_collection.max_steps` for the collection environment
+cap and `domains.crafter.data_collection.episodes` /
+`mini_dataset_size` /
+`maximum_dataset_size` for the dataset budget. Its PPO episode and training
+limits are under `domains.crafter.policy`:
+
+```yaml
+domains:
+  crafter:
+    data_collection:
+      max_steps: 512
+      episodes: 1000
+      mini_dataset_size: 8000
+      maximum_dataset_size: 60000
+    policy:
+      max_ep_len: 512
+      rollout_steps: 4096
+      max_training_timesteps: 1536000
+      total_test_episodes: 100
+```
+
+MiniGrid keeps its own values under `domains.minigrid`. The top-level
+`env.collect.*` and `PPO.*` fields are compatibility aliases for the active
+domain, so existing code continues to work. Pipeline subprocesses also receive
+domain-level command-line overrides.
 
 ### 2. Train the world model
 
@@ -259,6 +290,33 @@ rollouts. Parallel environments keep independent episode lengths, rewards,
 terminal flags, learned colour-aware inventory state, returns, and bootstrap values; PPO flattens
 the resulting `[time, environment]` batch only after computing per-environment
 returns.
+
+Crafter uses the same learned-transition pattern for its symbolic grid and
+16-slot inventory (including health). The WM does not predict achievements:
+planning starts from a fresh episode and maintains achievement history in an
+external tracker. The tracker reproduces Crafter's first-unlock reward and
+health reward, while terminated is based on predicted health and truncated is
+based on the planning step limit. Crafter policy planning can be run with:
+
+```bash
+python -m modelBased.policy_training.PPO_crafter_training domain=crafter
+python -m modelBased.policy_training.PPO_crafter_test domain=crafter
+```
+
+Crafter validation can save the first evaluated episode as a GIF. This works
+headlessly; `PPO.render=true` additionally displays the live render:
+
+```bash
+python -m modelBased.policy_training.PPO_crafter_test \
+  domain=crafter \
+  PPO.total_test_episodes=1 \
+  PPO.render=false \
+  PPO.save_gif=true \
+  PPO.save_csv=false
+```
+
+The GIF is saved under `PPO.save_path_gif` with the task, training source, and
+seed in its filename.
 
 ### 3a. Train model-free PPO directly in the real environment
 
@@ -339,6 +397,17 @@ real run:     minigrid_Grid_11_11_KD_level2_realenv_seed4
 planning: policy_minigrid_Grid_11_11_KD_level2_seed4.ckpt
 real env: policy_minigrid_Grid_11_11_KD_level2_realenv_seed4.ckpt
 ```
+
+When `domains.<domain>.continual_learning.enabled=true`, both artifacts and
+WandB identities receive the same `continue` marker. Standard and continual
+runs therefore never silently reuse each other's checkpoints:
+
+```text
+WM:     attention_world_model_crafter_progression_small_continue_effect.ckpt
+policy: policy_crafter_progression_small_effect_continue_seed0.ckpt
+```
+
+An explicit `PPO.checkpoint_path=/custom/path.ckpt` remains unchanged.
 
 Different seeds remain separate. If an old five-action checkpoint already has
 the simple planning filename, the pipeline detects its incompatible network

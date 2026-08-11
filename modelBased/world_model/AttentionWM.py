@@ -9,9 +9,13 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from typing import List, Dict, Union
 from modelBased.common import utils
+from modelBased.common.categorical_effects import (
+    balanced_categorical_effect_loss,
+    categorical_effect_target,
+)
 from domain.minigrid import minigrid_support as minigrid_utils
 from domain.crafter.crafter_support import (
-    crafter_classification_loss,
+    crafter_effect_loss,
     visualize_crafter_wm,
 )
 from . import AttentionWM_support
@@ -71,14 +75,25 @@ class AttentionWorldModel(pl.LightningModule):
         # Initialize the prediction model.
         module_class = MODEL_MAPPING.get(hparams.model_type.lower())
         if module_class is not None:
+            module_kwargs = {
+                "env_type": "bipedalwalker" if self.is_bipedal else self.env_type,
+                "frame_stack": self.frame_stack,
+            }
+            if module_class is AttentionWM_support.AttentionModule and self.env_type == "crafter":
+                uses_effects = any(
+                    str(spec.get("distribution", "")) == "categorical_effect"
+                    for spec in self.observation_schema
+                )
+                module_kwargs["crafter_output_mode"] = (
+                    "effect" if uses_effects else "absolute"
+                )
             self.model = module_class(
-                hparams.data_type, 
-                hparams.grid_shape, 
-                hparams.attention_mask_size, 
-                hparams.embed_dim, 
+                hparams.data_type,
+                hparams.grid_shape,
+                hparams.attention_mask_size,
+                hparams.embed_dim,
                 hparams.num_heads,
-                env_type="bipedalwalker" if self.is_bipedal else self.env_type,
-                frame_stack=self.frame_stack
+                **module_kwargs,
             )
         else:
             print(f"Model type: {hparams.model_type} not supported")
@@ -284,7 +299,10 @@ class AttentionWorldModel(pl.LightningModule):
                 # Extract single sample (keep dim 0 for model compatibility)
                 s_obs = obs[b:b+1].to(device, dtype=torch.float32)
                 s_act = act[b:b+1].to(device)
-                s_info = {k: v[b:b+1] for k, v in info.items()} if info is not None else None
+                s_info = {
+                    k: (v[b:b+1].to(device) if torch.is_tensor(v) else v[b:b+1])
+                    for k, v in info.items()
+                } if info is not None else None
                 s_obs_next = obs_next[b:b+1].to(device, dtype=torch.float32)
                 s_obs_masked = obs_masked[b:b+1].to(device) if obs_masked is not None else None
                 s_inv = inv[b:b+1].to(device) if inv is not None else None
@@ -298,6 +316,7 @@ class AttentionWorldModel(pl.LightningModule):
                         s_obs_next,
                         obs_prev=s_obs,
                         aux_pred=s_inv_pred,
+                        inv=s_inv,
                         inv_next=s_inv_next,
                     )
                 
@@ -468,13 +487,14 @@ class AttentionWorldModel(pl.LightningModule):
                     value = loss_map[dy, dx].item()
                     self.loss_accumulator[global_y][global_x].append(value)
 
-    def compute_cell_loss(self, next_pred, next_true):
+    def compute_cell_loss(self, next_pred, next_true, current=None):
         # Compute the per-cell error map.
         if self.env_type == 'crafter':
-            # Classification loss per cell (with target clamping)
-            loss_map = crafter_classification_loss(
-                next_pred, next_true, reduction='none'
-            )  # (B, H, W)
+            if current is None:
+                raise ValueError("Crafter effect cell loss requires the current state")
+            loss_map = crafter_effect_loss(
+                next_pred, current, next_true, reduction='none'
+            )
         else:
             # Standard Regression error
             error = torch.abs(next_pred - next_true)
@@ -583,6 +603,7 @@ class AttentionWorldModel(pl.LightningModule):
         obs_next: torch.Tensor,
         obs_prev: torch.Tensor | None = None,
         aux_pred=None,
+        inv: torch.Tensor | None = None,
         inv_next: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Compute one schema-driven observation prediction objective.
@@ -622,6 +643,14 @@ class AttentionWorldModel(pl.LightningModule):
                 if inv_next is None:
                     raise ValueError(f"Missing inventory target for observation field '{name}'")
                 target = inv_next.float()
+                if target_mode == "delta":
+                    if inv is None:
+                        raise ValueError(f"Inventory delta field '{name}' requires the current inventory")
+                    target = target - inv.float()
+                elif target_mode != "absolute":
+                    raise ValueError(
+                        f"Unknown inventory target_mode '{target_mode}' for field '{name}'"
+                    )
             else:
                 if "target_index" in spec:
                     target_index = int(spec["target_index"])
@@ -650,6 +679,24 @@ class AttentionWorldModel(pl.LightningModule):
                 fields[name] = F.binary_cross_entropy_with_logits(
                     prediction, target.clamp(0.0, 1.0)
                 ) / math.log(2.0)
+            elif distribution == "categorical_effect":
+                if obs_prev is None:
+                    raise ValueError(
+                        f"Categorical effect field '{name}' requires the current observation"
+                    )
+                if "target_index" not in spec:
+                    raise ValueError(
+                        f"Categorical effect field '{name}' requires target_index"
+                    )
+                current_frame = obs_prev[:, -obs_next.size(1):, ...]
+                current = current_frame[:, int(spec["target_index"])]
+                effect_target = categorical_effect_target(current, target)
+                fields[name] = balanced_categorical_effect_loss(
+                    prediction,
+                    effect_target,
+                    reduction="balanced_mean",
+                    label_smoothing=float(spec.get("label_smoothing", 0.0)),
+                )
             elif distribution == "mse":
                 fields[name] = F.mse_loss(prediction, target)
             elif distribution == "symlog_mse":
@@ -773,6 +820,7 @@ class AttentionWorldModel(pl.LightningModule):
             obs_next,
             obs_prev=obs,
             aux_pred=aux_pred,
+            inv=inv,
             inv_next=inv_next,
         )
 
@@ -879,7 +927,7 @@ class AttentionWorldModel(pl.LightningModule):
         
         # Map local loss back to global coordinates and store it.
         if getattr(self.hparams, "keep_cell_loss", False) and not getattr(self, 'is_bipedal', False):
-            loss_map = self.compute_cell_loss(obs_pred, obs_next)
+            loss_map = self.compute_cell_loss(obs_pred, obs_next, current=obs)
             batch_size = loss_map.shape[0]
             
             # [DEBUG] Check if we are actually getting coordinates and values
@@ -890,8 +938,9 @@ class AttentionWorldModel(pl.LightningModule):
                 agent_pos = agent_position[i].tolist()  # (y, x)
                 self.accumulate_loss(loss_map[i], agent_pos)
             if self.env_type == 'crafter' and inv_pred is not None and inv_next is not None:
-                # Slot-wise inventory error signal for generator context (shape [16])
-                inv_slot_mse = F.mse_loss(inv_pred, inv_next.float(), reduction='none').mean(dim=0)
+                # The Crafter auxiliary head predicts inventory deltas.
+                inv_target = inv_next.float() - inv.float()
+                inv_slot_mse = F.mse_loss(inv_pred, inv_target, reduction='none').mean(dim=0)
                 self.inventory_loss_accumulator.append(inv_slot_mse.detach().cpu())
   
         if obs_next.dtype != obs_pred.dtype:
@@ -930,6 +979,7 @@ class AttentionWorldModel(pl.LightningModule):
             obs_next,
             obs_prev=obs,
             aux_pred=inv_pred,
+            inv=inv,
             inv_next=inv_next,
         )
 
@@ -1022,6 +1072,7 @@ class AttentionWorldModel(pl.LightningModule):
             obs_next_masked,
             obs_prev=obs_masked,
             aux_pred=aux_pred,
+            inv=inv,
             inv_next=inv_next,
         )
         return {"loss_obs": loss_obs}

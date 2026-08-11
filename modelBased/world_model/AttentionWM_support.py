@@ -163,11 +163,22 @@ class CustomTransformerEncoderLayer(nn.Module):
 
 
 class AttentionModule(nn.Module):
-    def __init__(self, data_type, grid_shape, mask_size, embed_dim, num_heads, env_type="minigrid", frame_stack=1):
+    def __init__(
+        self,
+        data_type,
+        grid_shape,
+        mask_size,
+        embed_dim,
+        num_heads,
+        env_type="minigrid",
+        frame_stack=1,
+        crafter_output_mode="effect",
+    ):
         super().__init__()
         self.data_type = data_type
         self.env_type = env_type
         self.frame_stack = frame_stack
+        self.crafter_output_mode = str(crafter_output_mode)
         self.is_bipedal = (env_type == "bipedalwalker")
         self.embed_dim = embed_dim
         if data_type == 'discrete':
@@ -286,7 +297,17 @@ class AttentionModule(nn.Module):
         ])
         
         if env_type == 'crafter':
-            self.out_channel = 20 + 5  # 20 obj classes (0-19) + 5 dir classes
+            if self.crafter_output_mode == "effect":
+                # KEEP + SET_TO for 20 object and 5 direction categories.
+                self.out_channel = (20 + 1) + (5 + 1)
+            elif self.crafter_output_mode == "absolute":
+                # Read-only compatibility with checkpoints created before the
+                # Crafter WM returned to its original change-model semantics.
+                self.out_channel = 20 + 5
+            else:
+                raise ValueError(
+                    f"Unsupported Crafter output mode: {self.crafter_output_mode}"
+                )
         elif self.is_bipedal:
             self.out_channel = self.state_dim
         else:
@@ -452,7 +473,7 @@ class AttentionModule(nn.Module):
         x_out = x_out.transpose(1, 2).reshape(B, self.out_channel, H, W)
 
         if self.env_type in ('crafter', 'minigrid'):
-            # Mean pool over spatial patches to predict the next inventory.
+            # Mean pool over spatial patches to predict the inventory delta.
             x_pooled = x.mean(dim=1)  # (B, D)
             inv_pred = self.inv_head(x_pooled)
         else:

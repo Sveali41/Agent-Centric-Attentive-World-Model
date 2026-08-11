@@ -1,0 +1,24 @@
+GTTTGGGWW
+GTTTGMGGG
+GGGGAGGGG
+GRRRGRRRG
+GCCGICGGG
+GGGGMMOGG
+
+# --- Initial Stats ---
+health: 9
+food: 9
+drink: 9
+energy: 9
+sapling: 0
+wood: 0
+stone: 0
+coal: 0
+iron: 0
+diamond: 0
+wood_pickaxe: 0
+stone_pickaxe: 0
+iron_pickaxe: 0
+wood_sword: 0
+stone_sword: 0
+iron_sword: 0

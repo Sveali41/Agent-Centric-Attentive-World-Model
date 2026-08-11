@@ -379,6 +379,7 @@ class WMRLDataset(Dataset):
 
         # ===== (2) Build training targets =====
         transition_changed = None
+        inventory_changed = None
         if self.hparams.data_type == 'discrete':
             change_axes = tuple(range(1, obs.ndim))
             transition_changed = np.any(obs != obs_next, axis=change_axes)
@@ -412,10 +413,14 @@ class WMRLDataset(Dataset):
             obs_f = obs  # Keep discrete values unchanged for visualization/debugging.
 
             if env_type == 'crafter':
-                # For Crafter: predict the ABSOLUTE next frame (not delta).
-                # CrossEntropy loss requires class indices (0-16), not delta values.
+                # Preserve the categorical following frame. The WM loss
+                # derives KEEP/SET_TO effect labels from (obs, obs_next);
+                # subtracting category IDs would destroy their semantics.
                 obs_delta = obs_next.astype(np.float32)
-                print(f"[DataModule] Crafter mode: using absolute next frame as target (shape {obs_delta.shape})")
+                print(
+                    "[DataModule] Crafter mode: deriving categorical effects "
+                    f"from current/following frames (shape {obs_delta.shape})"
+                )
             else:
                 # MiniGrid: predict delta for MSE regression (numerically stable)
                 obs_delta = (obs_next.astype(np.int16) - obs_latest.astype(np.int16)).astype(np.float32)
@@ -505,25 +510,28 @@ class WMRLDataModule(pl.LightningDataModule):
     def train_dataloader(self):
         num_workers = int(getattr(self.cfg, "n_cpu", 0))
         sampler = None
+        sample_weights = None
+        dataset = self.data_train.dataset
+        indices = np.asarray(self.data_train.indices, dtype=np.int64)
         if bool(getattr(self.cfg, "transition_balanced_sampling", False)):
-            dataset = self.data_train.dataset
             buckets = dataset.data.get('_sampling_bucket', None)
             if buckets is not None:
-                indices = np.asarray(self.data_train.indices, dtype=np.int64)
                 train_buckets = np.asarray(buckets)[indices]
                 _, inverse, counts = np.unique(
                     train_buckets, return_inverse=True, return_counts=True
                 )
-                weights = 1.0 / counts[inverse].astype(np.float64)
-                sampler = WeightedRandomSampler(
-                    torch.as_tensor(weights, dtype=torch.double),
-                    num_samples=len(indices),
-                    replacement=True,
-                )
+                sample_weights = 1.0 / counts[inverse].astype(np.float64)
                 print(
                     f"[DataModule] Transition-balanced training over "
                     f"{len(counts)} non-empty (action, changed) buckets."
                 )
+
+        if sample_weights is not None:
+            sampler = WeightedRandomSampler(
+                torch.as_tensor(sample_weights, dtype=torch.double),
+                num_samples=len(indices),
+                replacement=True,
+            )
         return DataLoader(
             self.data_train, 
             batch_size=self.cfg.batch_size, 
