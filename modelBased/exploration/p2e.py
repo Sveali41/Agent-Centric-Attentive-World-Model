@@ -1,18 +1,10 @@
-"""Plan2Explore-style disagreement exploration for the attentive WM.
-
-This module ports the core P2E logic from ``Curriculum_world_model_learning``:
-an independently bootstrapped dynamics ensemble supplies intrinsic reward and
-a PPO actor learns to seek transitions on which the ensemble disagrees.
-
-The Curriculum implementation used only the pooled map latent for Crafter.
-AGEBT's WM also predicts inventory deltas, so the state used by both the
-ensemble and explorer appends the normalized 16-slot inventory.  This keeps
-crafting/resource uncertainty visible to P2E without changing the WM itself.
-"""
+"""Official DreamerV2 Plan2Explore components for the Crafter adapter."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections import deque
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -20,497 +12,238 @@ import torch.nn.functional as F
 from torch import nn
 
 from domain.minigrid import minigrid_support
-from modelBased.common.crafter_imagination import imagined_crafter_step_batch
+from modelBased.world_model.crafter_dynamics import imagined_crafter_step_batch
 
 
-# Small task-aware terms keep curiosity from preferring states that are merely
-# hard to predict. Disagreement remains the dominant P2E signal.
-_PROGRESSION_WEIGHTS = {
-    4: 0.10,  # wood
-    5: 1.00,  # stone
-    6: 1.25,  # coal
-    7: 1.50,  # iron
-    8: 2.00,  # diamond
-    10: 0.50,  # wood_pickaxe
-    11: 1.25,  # stone_pickaxe
-    12: 1.75,  # iron_pickaxe
-    13: 0.25,  # wood_sword
-    14: 0.50,  # stone_sword
-    15: 0.75,  # iron_sword
-}
+def _mlp(in_dim: int, out_dim: int, *, layers: int = 4, units: int = 400) -> nn.Sequential:
+    blocks: list[nn.Module] = []
+    current = int(in_dim)
+    for _ in range(int(layers)):
+        blocks.extend((nn.Linear(current, units), nn.ELU()))
+        current = units
+    blocks.append(nn.Linear(current, int(out_dim)))
+    return nn.Sequential(*blocks)
 
 
 class P2EEnsemble(nn.Module):
-    """Bootstrapped latent-dynamics heads used for epistemic disagreement."""
+    """DreamerV2 disagreement ensemble: absolute next-state targets."""
 
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        *,
-        num_models: int = 10,
-        learning_rate: float = 1e-4,
-        target_type: str = "delta",
-        bootstrap_heads: bool = True,
-        device: torch.device | str | None = None,
-    ) -> None:
+    def __init__(self, state_dim: int, action_dim: int, *, num_models: int = 10,
+                 learning_rate: float = 3e-4, device: torch.device | str | None = None,
+                 **_ignored: Any) -> None:
         super().__init__()
-        self.state_dim = int(state_dim)
-        self.action_dim = int(action_dim)
-        self.target_type = str(target_type).strip().lower()
-        if self.target_type not in {"latent", "delta"}:
-            raise ValueError("P2E target_type must be 'latent' or 'delta'")
         if int(num_models) < 2:
-            raise ValueError("P2E disagreement requires at least two ensemble heads")
-        self.bootstrap_heads = bool(bootstrap_heads)
-        self.device = torch.device(
-            device or ("cuda" if torch.cuda.is_available() else "cpu")
-        )
-        input_dim = self.state_dim + self.action_dim
-        self.heads = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(input_dim, self.state_dim * 2),
-                    nn.ReLU(),
-                    nn.Linear(self.state_dim * 2, self.state_dim),
-                )
-                for _ in range(int(num_models))
-            ]
-        )
+            raise ValueError("P2E requires at least two ensemble heads")
+        self.state_dim, self.action_dim, self.num_models = int(state_dim), int(action_dim), int(num_models)
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.heads = nn.ModuleList([_mlp(self.state_dim + self.action_dim, self.state_dim) for _ in range(self.num_models)])
         self.to(self.device)
-        self.optimizer = torch.optim.Adam(
-            self.parameters(), lr=float(learning_rate)
-        )
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=float(learning_rate), eps=1e-5, weight_decay=1e-6)
 
-    def _state(self, value) -> torch.Tensor:
+    def _state(self, value: Any) -> torch.Tensor:
         value = torch.as_tensor(value, dtype=torch.float32, device=self.device)
         if value.ndim == 1:
-            value = value.unsqueeze(0)
+            value = value[None]
         if value.ndim != 2 or value.shape[-1] != self.state_dim:
-            raise ValueError(
-                f"Expected P2E states shaped (B, {self.state_dim}), got {tuple(value.shape)}"
-            )
+            raise ValueError(f"Expected (B,{self.state_dim}) state, got {tuple(value.shape)}")
         return value
 
-    def _actions(self, action) -> torch.Tensor:
-        action = torch.as_tensor(action, device=self.device)
-        if action.ndim == 0:
-            action = action.unsqueeze(0)
-        action = action.long().reshape(-1)
+    def _actions(self, action: Any, batch: int | None = None) -> torch.Tensor:
+        action = torch.as_tensor(action, dtype=torch.long, device=self.device).reshape(-1)
+        if batch is not None and action.numel() == 1 and batch != 1:
+            action = action.expand(batch)
+        if batch is not None and action.numel() != batch:
+            raise ValueError("P2E state/action batch sizes do not match")
         return F.one_hot(action, num_classes=self.action_dim).float()
 
-    def predictions(self, state, action) -> torch.Tensor:
-        """Return all head predictions with shape ``(K, B, state_dim)``."""
+    def predictions(self, state: Any, action: Any) -> torch.Tensor:
         state = self._state(state)
-        action_one_hot = self._actions(action)
-        if action_one_hot.shape[0] == 1 and state.shape[0] != 1:
-            action_one_hot = action_one_hot.expand(state.shape[0], -1)
-        if action_one_hot.shape[0] != state.shape[0]:
-            raise ValueError("P2E state/action batch sizes do not match")
-        inputs = torch.cat([state, action_one_hot], dim=-1)
-        return torch.stack([head(inputs) for head in self.heads], dim=0)
+        inputs = torch.cat((state, self._actions(action, state.shape[0])), dim=-1)
+        return torch.stack([head(inputs) for head in self.heads])
 
     @torch.no_grad()
-    def intrinsic_reward(self, state, action) -> torch.Tensor:
-        """Standard-deviation disagreement averaged over state dimensions."""
+    def intrinsic_reward(self, state: Any, action: Any) -> torch.Tensor:
         return self.predictions(state, action).std(dim=0, unbiased=False).mean(dim=-1)
 
-    def train_step(
-        self,
-        state,
-        action,
-        next_state,
-        *,
-        epochs: int = 1,
-        batch_size: int = 256,
-    ) -> float:
-        """Fit each head on an independent bootstrap of observed transitions."""
-        state = self._state(state).detach()
-        next_state = self._state(next_state).detach()
-        action_one_hot = self._actions(action)
-        if not (len(state) == len(next_state) == len(action_one_hot)):
-            raise ValueError("P2E transition arrays must have the same length")
-        inputs = torch.cat([state, action_one_hot], dim=-1)
-        targets = next_state - state if self.target_type == "delta" else next_state
-        count = int(inputs.shape[0])
-        if count == 0:
-            return 0.0
+    def train_batch(self, state: Any, action: Any, next_state: Any) -> float:
+        state, next_state = self._state(state).detach(), self._state(next_state).detach()
+        inputs = torch.cat((state, self._actions(action, state.shape[0])), dim=-1)
+        target = next_state.detach()
+        self.train(); self.optimizer.zero_grad(set_to_none=True)
+        loss = torch.stack([F.mse_loss(head(inputs), target) for head in self.heads]).mean()
+        loss.backward(); torch.nn.utils.clip_grad_norm_(self.parameters(), 100.0); self.optimizer.step(); self.eval()
+        return float(loss.detach().cpu())
 
-        total_loss = 0.0
-        updates = 0
-        batch_size = max(1, int(batch_size))
-        self.train()
-        for _ in range(max(1, int(epochs))):
-            # Each head gets an independent bootstrap permutation for the
-            # complete training set. Resampling only within a shared minibatch
-            # makes the heads see nearly identical data and weakens disagreement.
-            orders = [
-                torch.randint(0, count, (count,), device=self.device)
-                if self.bootstrap_heads
-                else torch.randperm(count, device=self.device)
-                for _ in self.heads
-            ]
-            for start in range(0, count, batch_size):
-                loss = torch.zeros((), device=self.device)
-                for head_index, head in enumerate(self.heads):
-                    index = orders[head_index][start : start + batch_size]
-                    head_inputs = inputs[index]
-                    head_targets = targets[index]
-                    loss = loss + F.mse_loss(head(head_inputs), head_targets)
-                loss = loss / len(self.heads)
-                self.optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                self.optimizer.step()
-                total_loss += float(loss.detach().cpu())
-                updates += 1
-        self.eval()
-        return total_loss / max(updates, 1)
+    def train_step(self, state, action, next_state, **_kwargs) -> float:
+        return self.train_batch(state, action, next_state)
+
+
+def td_lambda_targets(rewards: torch.Tensor, values_next: torch.Tensor, continuation: torch.Tensor,
+                      gamma: float, lam: float) -> torch.Tensor:
+    """Backward TD(lambda), with continuation already containing gamma."""
+    rewards, values_next, continuation = [x.float() for x in (rewards, values_next, continuation)]
+    targets = torch.zeros_like(rewards)
+    running = values_next[..., -1]
+    for index in range(rewards.shape[-1] - 1, -1, -1):
+        bootstrap = values_next[..., index]
+        running = rewards[..., index] + continuation[..., index] * ((1.0 - lam) * bootstrap + lam * running)
+        targets[..., index] = running
+    return targets
+
+
+class DreamerP2EActorCritic(nn.Module):
+    """Discrete Dreamer actor-critic for imagined exploration trajectories."""
+
+    def __init__(self, state_dim: int, action_dim: int, *, actor_lr: float = 1e-4,
+                 critic_lr: float = 1e-4, entropy_coef: float = 3e-3, gamma: float = .999,
+                 discount_lambda: float = .95, horizon: int = 15, slow_target_update: int = 100,
+                 device: torch.device | str | None = None) -> None:
+        super().__init__()
+        self.state_dim, self.action_dim = int(state_dim), int(action_dim)
+        self.entropy_coef, self.gamma, self.discount_lambda = float(entropy_coef), float(gamma), float(discount_lambda)
+        self.horizon, self.slow_target_update = int(horizon), int(slow_target_update)
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.actor, self.critic, self.target_critic = _mlp(self.state_dim, self.action_dim), _mlp(self.state_dim, 1), _mlp(self.state_dim, 1)
+        self.to(self.device); self.target_critic.load_state_dict(self.critic.state_dict())
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=float(actor_lr), eps=1e-5)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=float(critic_lr), eps=1e-5)
+        self.update_count = 0
+
+    def distribution(self, state: torch.Tensor) -> torch.distributions.Categorical:
+        return torch.distributions.Categorical(logits=self.actor(state))
+
+    @torch.no_grad()
+    def act(self, state: Any) -> int:
+        state = torch.as_tensor(state, dtype=torch.float32, device=self.device)
+        if state.ndim == 1: state = state[None]
+        return int(self.distribution(state).sample()[0].cpu())
+
+    def imagine_update(self, start_states: torch.Tensor, start_images: torch.Tensor, start_inventories: torch.Tensor,
+                       wm_adapter, ensemble: P2EEnsemble, *, target_mode: str = "categorical_gate",
+                       start_terminal: torch.Tensor | None = None) -> dict[str, float]:
+        del start_terminal
+        device = self.device
+        images = start_images.to(next(wm_adapter.world_model.parameters()).device)
+        inventory = start_inventories.to(images.device).float()
+        latent = start_states.to(device).detach()
+        logps, entropies, rewards, conts, values, next_values = [], [], [], [], [], []
+        for _ in range(self.horizon):
+            # Keep policy log-probabilities attached for REINFORCE.  The WM,
+            # ensemble and imagined states are explicitly detached below.
+            dist = self.distribution(latent); action = dist.sample()
+            logps.append(dist.log_prob(action)); entropies.append(dist.entropy()); values.append(self.critic(latent).squeeze(-1))
+            with torch.no_grad():
+                next_images, next_inventory = wm_adapter.imagine_step(images, action, inventory, target_mode)
+                next_latent = wm_adapter.encode_states(next_images, next_inventory).to(device).detach()
+                rewards.append(ensemble.intrinsic_reward(latent.detach(), action).to(device))
+                next_values.append(self.target_critic(next_latent).squeeze(-1))
+                conts.append((next_inventory[:, 0] > 0).float().to(device) * self.gamma)
+            latent, images, inventory = next_latent, next_images, next_inventory
+        rew, cont = torch.stack(rewards, 1), torch.stack(conts, 1)
+        vals, nxt = torch.stack(values, 1), torch.stack(next_values, 1)
+        targets = td_lambda_targets(rew, nxt, cont, self.gamma, self.discount_lambda)
+        weights = torch.ones_like(cont)
+        if self.horizon > 1: weights[:, 1:] = torch.cumprod(cont[:, :-1], dim=1)
+        advantage = (targets - vals).detach()
+        actor_loss = -(weights * (torch.stack(logps, 1) * advantage + self.entropy_coef * torch.stack(entropies, 1))).mean()
+        critic_loss = (weights * (vals - targets.detach()).pow(2)).mean()
+        self.actor_optimizer.zero_grad(set_to_none=True); actor_loss.backward(); torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 100.0); self.actor_optimizer.step()
+        self.critic_optimizer.zero_grad(set_to_none=True); critic_loss.backward(); torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 100.0); self.critic_optimizer.step()
+        self.update_count += 1
+        if self.update_count % self.slow_target_update == 0: self.target_critic.load_state_dict(self.critic.state_dict())
+        reward_flat = rew.detach().reshape(-1).cpu()
+        return {"actor_loss": float(actor_loss.detach().cpu()), "critic_loss": float(critic_loss.detach().cpu()),
+                "imagined_reward_mean": float(reward_flat.mean()),
+                "imagined_reward_p50": float(torch.quantile(reward_flat, .50)),
+                "imagined_reward_p90": float(torch.quantile(reward_flat, .90)),
+                "imagined_reward_max": float(reward_flat.max()),
+                "imagined_entropy": float(torch.stack(entropies).mean().cpu()), "imagined_transitions": float(rew.numel())}
+
+
+class AttentionWMP2EAdapter:
+    """Attention WM encoding, native supervised update, and one-step rollout."""
+
+    def __init__(self, world_model, *, inventory_dim: int = 16, inventory_scale: float = 9.0, amp: bool = False):
+        self.world_model, self.inventory_dim, self.inventory_scale = world_model, int(inventory_dim), float(inventory_scale)
+        self.amp = bool(amp and next(world_model.parameters()).is_cuda)
+        configured = world_model.configure_optimizers(); self.optimizer = configured["optimizer"] if isinstance(configured, dict) else configured
+
+    def _masked(self, images: Any) -> torch.Tensor:
+        device = next(self.world_model.parameters()).device; x = torch.as_tensor(images, device=device)
+        if x.ndim == 3: x = x[None]
+        if x.shape[-1] == 2 and x.shape[1] != 2: x = x.permute(0, 3, 1, 2)
+        pos = minigrid_support.get_agent_position(x, player_id=13)
+        return minigrid_support.extract_masked_state(x, int(self.world_model.mask_size), pos).long()
+
+    # no_grad (rather than inference_mode) is intentional: the resulting
+    # latent is consumed by the actor/critic autograd graph. Inference-mode
+    # tensors cannot safely be used as autograd inputs.
+    @torch.no_grad()
+    def encode_states(self, images: Any, inventories: Any) -> torch.Tensor:
+        # The collector calls train_batch() explicitly before each update, so
+        # keeping eval active avoids thousands of train/eval
+        # toggles during one imagined rollout.
+        self.world_model.eval()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.amp):
+            latent = self.world_model.encode(self._masked(images)).mean(1).float()
+        inv = torch.as_tensor(inventories, dtype=torch.float32, device=latent.device)
+        if inv.ndim == 1: inv = inv[None]
+        return torch.cat((latent, inv[:, :self.inventory_dim] / self.inventory_scale), dim=-1)
+
+    @torch.inference_mode()
+    def imagine_step(self, images, action, inventory, target_mode: str):
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.amp):
+            return imagined_crafter_step_batch(self.world_model, images, action, inventory, int(self.world_model.mask_size), target_mode)
+
+    def train_batch(self, batch: dict[str, Any]) -> float:
+        device = next(self.world_model.parameters()).device; self.world_model.train()
+        prepared = {key: (torch.as_tensor(value, device=device) if value is not None else None) for key, value in batch.items()}
+        for key in ("obs", "obs_next"):
+            if prepared.get(key) is not None and prepared[key].ndim == 4 and prepared[key].shape[-1] == 2:
+                prepared[key] = prepared[key].permute(0, 3, 1, 2).contiguous()
+        obs, act, obs_next, info, _mask, _pos, inv, inv_next = self.world_model.preprocess_batch(prepared, True)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.amp):
+            pred, _attn, aux = self.world_model(obs, act, info, inv=inv)
+            loss, _fields = self.world_model.observation_loss(pred, obs_next, obs, aux, inv, inv_next)
+        self.optimizer.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), 1.0); self.optimizer.step()
+        return float(loss.detach().cpu())
 
 
 class CrafterP2EExplorer:
-    """Connect a Crafter WM encoder and disagreement ensemble to PPO."""
-
-    expects_raw_obs = True
-    expects_observation_dict = True
-
-    def __init__(self, ppo, world_model, ensemble: P2EEnsemble, cfg) -> None:
-        self.ppo = ppo
-        self.world_model = world_model
-        self.ensemble = ensemble
-        self.cfg = cfg
-        self.inventory_dim = int(getattr(cfg.domains.crafter, "inventory_dim", 16))
-        self.inventory_scale = float(getattr(cfg.p2e, "inventory_scale", 9.0))
-        self.reward_scale = float(getattr(cfg.p2e, "intrinsic_reward_scale", 1.0))
-        self.disagreement_weight = float(
-            getattr(cfg.p2e, "intrinsic_disagreement_weight", 1.0)
-        )
-        self.progression_weight = float(
-            getattr(cfg.p2e, "intrinsic_progression_weight", 0.25)
-        )
-        self.survival_weight = float(
-            getattr(cfg.p2e, "intrinsic_survival_weight", 0.05)
-        )
-        self.death_penalty = float(
-            getattr(cfg.p2e, "intrinsic_death_penalty", 0.5)
-        )
-        self.disagreement_clip = float(
-            getattr(cfg.p2e, "intrinsic_disagreement_clip", 5.0)
-        )
-        self._disagreement_ema: float | None = None
-        expected_dim = int(cfg.attention_model.embed_dim) + self.inventory_dim
-        if self.ensemble.state_dim != expected_dim:
-            raise ValueError(
-                f"Crafter P2E ensemble state_dim={self.ensemble.state_dim}; "
-                f"expected {expected_dim}"
-            )
-        self.current_step_context = None
-        self._representation_version = 0
-        self._intrinsic_rewards: list[float] = []
-        self._actions: list[int] = []
-        self._anchor_images = None
-        self._anchor_inventories = None
-        self._anchor_state = None
-
-    def set_world_model(self, world_model) -> None:
-        """Attach the latest online WM representation without resetting PPO."""
-        self.world_model = world_model
-        self._representation_version += 1
-
-    def set_representation_anchor(self, images, inventories) -> None:
-        """Keep a fixed raw anchor batch for measuring encoder drift."""
-        self._anchor_images = np.asarray(images).copy()
-        self._anchor_inventories = np.asarray(inventories).copy()
-        self._anchor_state = self.encode_batch(
-            self._anchor_images, self._anchor_inventories
-        ).detach()
-
-    def measure_representation_drift(self) -> dict[str, float]:
-        if self._anchor_state is None:
-            return {"representation_cosine": 1.0, "representation_l2": 0.0}
-        current = self.encode_batch(
-            self._anchor_images, self._anchor_inventories
-        ).detach()
-        previous = self._anchor_state.to(current.device)
-        cosine = F.cosine_similarity(current, previous, dim=-1).mean()
-        l2 = (current - previous).pow(2).mean().sqrt()
-        self._anchor_state = current
-        return {
-            "representation_cosine": float(cosine.cpu()),
-            "representation_l2": float(l2.cpu()),
-        }
-
-    @staticmethod
-    def _parts(observation) -> tuple[np.ndarray, np.ndarray]:
-        if not isinstance(observation, Mapping):
-            raise TypeError(
-                "Crafter P2E requires the full observation dict with image and inventory"
-            )
-        return (
-            np.asarray(observation["image"]),
-            np.asarray(observation["inventory"], dtype=np.float32),
-        )
-
-    def _masked_images(self, images) -> torch.Tensor:
-        device = next(self.world_model.parameters()).device
-        images = torch.as_tensor(images, device=device)
-        if images.ndim == 3:
-            images = images.unsqueeze(0)
-        if images.ndim != 4:
-            raise ValueError(f"Expected Crafter image batch, got {tuple(images.shape)}")
-        if images.shape[1] != 2 and images.shape[-1] == 2:
-            images = images.permute(0, 3, 1, 2)
-        if images.shape[1] != 2:
-            raise ValueError(f"Expected two Crafter map channels, got {tuple(images.shape)}")
-        positions = minigrid_support.get_agent_position(images, player_id=13)
-        masked = minigrid_support.extract_masked_state(
-            images, int(self.world_model.mask_size), positions
-        )
-        return masked.long()
-
-    @torch.no_grad()
-    def encode_batch(self, images, inventories) -> torch.Tensor:
-        """Encode maps and inventory into the P2E state representation."""
-        masked = self._masked_images(images)
-        features = self.world_model.encode(masked).mean(dim=1)
-        inventory = torch.as_tensor(
-            inventories, dtype=torch.float32, device=features.device
-        )
-        if inventory.ndim == 1:
-            inventory = inventory.unsqueeze(0)
-        inventory = inventory[:, : self.inventory_dim] / max(self.inventory_scale, 1e-6)
-        return torch.cat([features.float(), inventory], dim=-1)
-
-    @torch.no_grad()
-    def encode_observation(self, observation) -> torch.Tensor:
-        image, inventory = self._parts(observation)
-        return self.encode_batch(image, inventory)
-
-    @staticmethod
-    def _object_channel(images, device: torch.device) -> torch.Tensor:
-        value = torch.as_tensor(images, device=device)
-        if value.ndim == 3:
-            value = value.unsqueeze(0)
-        if value.ndim != 4:
-            raise ValueError(f"Expected Crafter image batch, got {tuple(value.shape)}")
-        if value.shape[-1] == 2:
-            return value[..., 0]
-        if value.shape[1] == 2:
-            return value[:, 0]
-        raise ValueError(f"Expected two Crafter map channels, got {tuple(value.shape)}")
-
-    @torch.no_grad()
-    def _intrinsic_components(
-        self,
-        state: torch.Tensor,
-        action,
-        inventories=None,
-        next_inventories=None,
-        images=None,
-        next_images=None,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Compute the shared real/imagined task-aware P2E reward."""
-        disagreement = self.ensemble.intrinsic_reward(state, action).reshape(-1)
-        batch_mean = float(disagreement.mean().detach().cpu())
-        if self._disagreement_ema is None:
-            self._disagreement_ema = max(batch_mean, 1e-6)
-        else:
-            self._disagreement_ema = (
-                0.99 * self._disagreement_ema + 0.01 * max(batch_mean, 0.0)
-            )
-        normalized = disagreement / max(self._disagreement_ema, 1e-6)
-        normalized = normalized.clamp(0.0, self.disagreement_clip)
-        reward = self.disagreement_weight * normalized
-
-        progression = torch.zeros_like(reward)
-        survival_delta = torch.zeros_like(reward)
-        death = torch.zeros_like(reward)
-        if inventories is not None and next_inventories is not None:
-            current = torch.as_tensor(inventories, device=reward.device, dtype=torch.float32)
-            following = torch.as_tensor(
-                next_inventories, device=reward.device, dtype=torch.float32
-            )
-            if current.ndim == 1:
-                current = current.unsqueeze(0)
-            if following.ndim == 1:
-                following = following.unsqueeze(0)
-            positive_delta = (following[:, : self.inventory_dim] - current[:, : self.inventory_dim]).clamp_min(0.0).clamp_max(1.0)
-            weights = torch.zeros(self.inventory_dim, device=reward.device)
-            for index, weight in _PROGRESSION_WEIGHTS.items():
-                if index < self.inventory_dim:
-                    weights[index] = weight
-            progression = (positive_delta * weights).sum(dim=-1)
-            survival_delta = ((following[:, 0] - current[:, 0]) / 9.0).clamp(-1.0, 1.0)
-            death = (following[:, 0] <= 0.0).float()
-
-            if images is not None and next_images is not None:
-                objects = self._object_channel(images, reward.device)
-                next_objects = self._object_channel(next_images, reward.device)
-                table = ((next_objects == 11) & (objects != 11)).any(dim=(1, 2))
-                furnace = ((next_objects == 12) & (objects != 12)).any(dim=(1, 2))
-                progression = progression + table.float() * 0.20 + furnace.float() * 0.30
-
-        reward = reward + self.progression_weight * progression
-        reward = reward + self.survival_weight * survival_delta
-        reward = reward - self.death_penalty * death
-        # A terminal death must never become attractive just because the WM is
-        # uncertain about that transition.
-        reward = torch.where(
-            death > 0.0,
-            torch.full_like(reward, -self.death_penalty),
-            reward,
-        )
-        return reward, {
-            "disagreement": normalized,
-            "progression": progression,
-            "survival_delta": survival_delta,
-            "death": death,
-        }
-
-    def begin_rollout(self, transition_budget) -> None:
-        self.current_step_context = None
-
-    def select_action(self, observation) -> int:
-        state = self.encode_observation(observation)
-        policy_device = next(self.ppo.policy_old.parameters()).device
-        state = state.to(policy_device)
-        action_idx, _, _, _, _ = self.ppo.select_action(state)
-        return int(action_idx)
-
+    """Policy facade for generic collectors; reward remains pure disagreement."""
+    expects_raw_obs = True; expects_observation_dict = True
+    def __init__(self, actor_critic, adapter: AttentionWMP2EAdapter, ensemble: P2EEnsemble): self.actor_critic, self.adapter, self.ensemble = actor_critic, adapter, ensemble
+    def select_action(self, observation) -> int: return self.actor_critic.act(self.adapter.encode_states(observation["image"], observation["inventory"]))
     def compute_intrinsic_reward(self, observation, action, next_observation) -> float:
-        image, inventory = self._parts(observation)
-        next_image, next_inventory = self._parts(next_observation)
-        state = self.encode_batch(image, inventory)
-        reward, _ = self._intrinsic_components(
-            state,
-            int(action),
-            inventory,
-            next_inventory,
-            image,
-            next_image,
-        )
-        return float(reward[0].detach().cpu()) * self.reward_scale
+        del next_observation
+        return float(self.ensemble.intrinsic_reward(self.adapter.encode_states(observation["image"], observation["inventory"]), action)[0].cpu())
 
-    def record_transition(
-        self,
-        reward,
-        is_terminal,
-        env_reward=0.0,
-        obs=None,
-        obs_next=None,
-        action=None,
-        is_success=False,
-    ) -> None:
-        del env_reward, obs, obs_next, is_success
-        self._intrinsic_rewards.append(float(reward))
-        if action is not None:
-            self._actions.append(int(action))
-        self.current_step_context = None
 
-    def mark_rollout_boundary(self) -> None:
-        self.current_step_context = None
-
-    def update_ppo_if_ready(self, *, force: bool = False) -> bool:
-        del force
-        return False
-
-    def adapt_actor_imagined(self, start_images, start_inventories) -> dict:
-        """Train PPO on short imagined rollouts from real replay states."""
-        images = np.asarray(start_images)
-        inventories = np.asarray(start_inventories, dtype=np.float32)
-        if len(images) == 0:
-            return {"imagined_transitions": 0, "imagined_updates": 0}
-        device = next(self.world_model.parameters()).device
-        policy_device = next(self.ppo.policy_old.parameters()).device
-        target_mode = "absolute"
-        for field in getattr(self.cfg.domains.crafter, "observation_schema", []):
-            if str(field.get("name", "")) == "inventory":
-                target_mode = str(field.get("target_mode", "absolute"))
-        horizon = max(1, int(getattr(self.cfg.p2e, "imagined_horizon", 15)))
-        batch_size = max(1, int(getattr(self.cfg.p2e, "imagined_batch_size", 64)))
-        batches = max(1, int(getattr(self.cfg.p2e, "imagined_batches_per_cycle", 4)))
-        reward_values = []
-        entropy_values = []
-        update_metrics = []
-        self.world_model.eval()
-        self.ensemble.eval()
-        for _ in range(batches):
-            indices = np.random.randint(0, len(images), size=batch_size)
-            states = torch.as_tensor(images[indices], device=device)
-            if states.ndim != 4:
-                raise ValueError(f"Expected imagined maps shaped (B,H,W,2), got {tuple(states.shape)}")
-            if states.shape[-1] == 2:
-                states = states.permute(0, 3, 1, 2)
-            states = states.float()
-            inventory = torch.as_tensor(inventories[indices], device=device, dtype=torch.float32)
-            for step in range(horizon):
-                latent = self.encode_batch(states, inventory)
-                policy_latent = latent.to(policy_device)
-                actions, state_buffer, action_buffer, logprobs, values = self.ppo.select_action_batch(policy_latent)
-                with torch.no_grad():
-                    probs = self.ppo.policy_old.actor(policy_latent)
-                    entropy_values.append(float(torch.distributions.Categorical(probs).entropy().mean().cpu()))
-                    next_states, next_inventory = imagined_crafter_step_batch(
-                        self.world_model,
-                        states,
-                        actions.to(device),
-                        inventory,
-                        int(self.world_model.mask_size),
-                        target_mode,
-                    )
-                    intrinsic, _components = self._intrinsic_components(
-                        latent,
-                        actions.to(self.ensemble.device),
-                        inventory,
-                        next_inventory,
-                        states,
-                        next_states,
-                    )
-                    intrinsic = intrinsic.to(policy_device) * self.reward_scale
-                    terminals = next_inventory[:, 0] <= 0.0
-                self.ppo.save_buffer_batch(
-                    state_buffer, action_buffer, logprobs, values, intrinsic, terminals
-                )
-                reward_values.extend(intrinsic.detach().cpu().tolist())
-                states, inventory = next_states, next_inventory
-            with torch.no_grad():
-                next_latent = self.encode_batch(states, inventory).to(policy_device)
-                bootstrap = self.ppo.estimate_old_values_batch(next_latent)
-                bootstrap[terminals.detach().cpu()] = 0.0
-            update_metrics.append(self.ppo.update(bootstrap_value=bootstrap))
-        return {
-            "imagined_transitions": int(len(reward_values)),
-            "imagined_updates": int(len(update_metrics)),
-            "imagined_reward_mean": float(np.mean(reward_values)) if reward_values else 0.0,
-            "imagined_reward_std": float(np.std(reward_values)) if reward_values else 0.0,
-            "imagined_reward_p10": float(np.percentile(reward_values, 10)) if reward_values else 0.0,
-            "imagined_reward_p50": float(np.percentile(reward_values, 50)) if reward_values else 0.0,
-            "imagined_reward_p90": float(np.percentile(reward_values, 90)) if reward_values else 0.0,
-            "imagined_entropy": float(np.mean(entropy_values)) if entropy_values else 0.0,
-            "imagined_parameter_delta": float(sum(m.get("parameter_delta", 0.0) for m in update_metrics)),
-            "imagined_grad_norm": float(np.mean([m.get("grad_norm", 0.0) for m in update_metrics])) if update_metrics else 0.0,
-        }
-
-    def metrics(self, *, reset: bool = False) -> dict[str, float | int]:
-        rewards = np.asarray(self._intrinsic_rewards, dtype=np.float32)
-        actions = np.asarray(self._actions, dtype=np.int64)
-        if actions.size:
-            probabilities = np.bincount(actions, minlength=17).astype(np.float64)
-            probabilities /= probabilities.sum()
-            probabilities = probabilities[probabilities > 0]
-            action_entropy = float(-(probabilities * np.log(probabilities)).sum())
-        else:
-            action_entropy = 0.0
-        result = {
-            "intrinsic_reward_mean": float(rewards.mean()) if rewards.size else 0.0,
-            "intrinsic_reward_std": float(rewards.std()) if rewards.size else 0.0,
-            "action_coverage_ratio": float(len(np.unique(actions)) / 17.0)
-            if actions.size
-            else 0.0,
-            "real_action_entropy": action_entropy,
-            "transitions": int(rewards.size),
-            "representation_version": int(self._representation_version),
-        }
-        if reset:
-            self._intrinsic_rewards.clear()
-            self._actions.clear()
-        return result
+class EpisodeReplay:
+    """Uniform episodic replay preserving sequence and terminal boundaries."""
+    def __init__(self, capacity: int = 2_000_000): self.capacity, self.episodes, self.current, self.size = int(capacity), deque(), [], 0
+    def add(self, obs, obs_next, action, reward, done, info, inv, inv_next):
+        self.current.append({"obs": np.asarray(obs), "obs_next": np.asarray(obs_next), "act": int(action), "rew": float(reward), "done": bool(done), "is_first": len(self.current) == 0, "info": info, "inv": np.asarray(inv, dtype=np.float32), "inv_next": np.asarray(inv_next, dtype=np.float32)}); self.size += 1
+        if done: self.episodes.append(self.current); self.current = []
+        while self.size > self.capacity and self.episodes: self.size -= len(self.episodes.popleft())
+    def __len__(self): return self.size
+    @property
+    def ready(self): return bool(self.episodes)
+    def sample(self, batch_size: int, sequence_length: int, rng=None) -> dict[str, np.ndarray]:
+        rng = rng or np.random.default_rng(); eps = list(self.episodes)
+        if not eps: raise ValueError("Cannot sample empty replay")
+        rows=[]
+        for _ in range(int(batch_size)):
+            ep=eps[int(rng.integers(len(eps)))]; start=int(rng.integers(max(1, len(ep)-sequence_length+1))) if len(ep)>=sequence_length else 0
+            seq=ep[start:start+sequence_length]
+            if len(seq)<sequence_length: seq=[seq[i % len(seq)] for i in range(sequence_length)]
+            rows.append(seq)
+        result={k: np.asarray([[item[k] for item in row] for row in rows]) for k in ("obs","obs_next","act","rew","done","inv","inv_next","is_first")}; result["is_terminal"] = result["done"]; return result
+    def export_dict(self):
+        rows=[item for ep in self.episodes for item in ep]+list(self.current); return {k: np.asarray([item[k] for item in rows]) for k in ("obs","obs_next","act","rew","done","inv","inv_next","info")}
+    def save(self, path: str | Path): Path(path).parent.mkdir(parents=True,exist_ok=True); np.savez_compressed(path, **self.export_dict())
+    @classmethod
+    def load(cls, path: str | Path, capacity=2_000_000):
+        replay=cls(capacity); data=np.load(path,allow_pickle=True)
+        for i in range(len(data["act"])): replay.add(*(data[k][i] for k in ("obs","obs_next","act","rew","done","info","inv","inv_next")))
+        return replay

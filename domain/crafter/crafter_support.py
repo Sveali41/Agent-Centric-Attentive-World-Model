@@ -8,6 +8,13 @@ import numpy as np
 
 PLAYER_ID = 13  # Updated: player ID in new CustomCrafterEnv mapping (was 10)
 
+CRAFTER_INVENTORY_LABELS = (
+    "Health", "Food", "Drink", "Energy",
+    "Wood", "Stone", "Coal", "Iron", "Diamond", "Sapling",
+    "Wood_Pickaxe", "Stone_Pickaxe", "Iron_Pickaxe",
+    "Wood_Sword", "Stone_Sword", "Iron_Sword",
+)
+
 
 def _to_nchw(obs: np.ndarray) -> np.ndarray:
     """Convert observations to (N, C, H, W)."""
@@ -124,6 +131,135 @@ def extract_player_positions(obs: np.ndarray, player_id: int = PLAYER_ID) -> np.
     return positions
 
 
+class CrafterCoverageTracker:
+    """Memory-bounded position and inventory coverage for online rollouts."""
+
+    def __init__(self, player_id: int = PLAYER_ID):
+        self.player_id = int(player_id)
+        self.heatmap = None
+        self.inventory_positive_counts = np.zeros(
+            len(CRAFTER_INVENTORY_LABELS), dtype=np.int64
+        )
+        self.position_samples = 0
+        self.inventory_samples = 0
+        # Primary coverage tracks progression inventory only; physiology is a
+        # separate survival signal and must not create artificial coverage.
+        self.inventory_states: set[bytes] = set()
+        self.inventory_state_history: list[int] = []
+        self.inventory_gain_counts = np.zeros(
+            len(CRAFTER_INVENTORY_LABELS), dtype=np.int64
+        )
+
+    def update(self, observations, inventories) -> None:
+        observations = np.asarray(observations)
+        if observations.ndim == 3:
+            observations = observations[None, ...]
+        obs_nchw = _to_nchw(observations)
+        height, width = obs_nchw.shape[2:]
+        if self.heatmap is None:
+            self.heatmap = np.zeros((height, width), dtype=np.int64)
+        elif self.heatmap.shape != (height, width):
+            raise ValueError(
+                f"Crafter coverage map changed from {self.heatmap.shape} "
+                f"to {(height, width)}"
+            )
+
+        positions = extract_player_positions(obs_nchw, player_id=self.player_id)
+        valid = (
+            (positions[:, 0] >= 0)
+            & (positions[:, 0] < height)
+            & (positions[:, 1] >= 0)
+            & (positions[:, 1] < width)
+        )
+        np.add.at(
+            self.heatmap,
+            (positions[valid, 0], positions[valid, 1]),
+            1,
+        )
+        self.position_samples += int(len(positions))
+
+        inventories = np.asarray(inventories)
+        if inventories.ndim == 1:
+            inventories = inventories[None, ...]
+        inventories = inventories.reshape(inventories.shape[0], -1)
+        expected_slots = len(CRAFTER_INVENTORY_LABELS)
+        if inventories.shape[1] != expected_slots:
+            raise ValueError(
+                f"Crafter coverage expects {expected_slots} inventory slots, "
+                f"got shape {inventories.shape}"
+            )
+        if inventories.shape[0] != obs_nchw.shape[0]:
+            raise ValueError(
+                "Crafter observation and inventory batch sizes differ: "
+                f"{obs_nchw.shape[0]} != {inventories.shape[0]}"
+            )
+        self.inventory_positive_counts += np.count_nonzero(
+            inventories > 0, axis=0
+        )
+        self.inventory_samples += int(inventories.shape[0])
+        discrete = np.rint(inventories).astype(np.int16)
+        for row in discrete[:, 4:]:
+            self.inventory_states.add(row.tobytes())
+        self.inventory_state_history.append(len(self.inventory_states))
+
+    @property
+    def inventory_presence_rate(self) -> np.ndarray:
+        if self.inventory_samples == 0:
+            return np.zeros(len(CRAFTER_INVENTORY_LABELS), dtype=np.float64)
+        return self.inventory_positive_counts / self.inventory_samples * 100.0
+
+    @property
+    def unique_inventory_states(self) -> int:
+        return len(self.inventory_states)
+
+    def save(self, save_path: str | Path, title: str) -> Path:
+        if self.inventory_samples == 0:
+            raise ValueError("Cannot save Crafter coverage before recording observations")
+
+        out = Path(save_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fig, (ax_states, ax_inventory) = plt.subplots(
+            1, 2, figsize=(14, 6), gridspec_kw={"width_ratios": [1, 1.35]}
+        )
+        history = self.inventory_state_history or [self.unique_inventory_states]
+        ax_states.plot(np.arange(1, len(history) + 1), history,
+                       color="#2c7fb8", linewidth=2)
+        ax_states.set_title(f"Unique inventory states: {self.unique_inventory_states}")
+        ax_states.set_xlabel("Collected observations")
+        ax_states.set_ylabel("Cumulative unique states")
+        ax_states.grid(axis="both", linestyle="--", alpha=0.3)
+        rates = self.inventory_presence_rate[4:]
+        colors = ["#2ecc71"] * 6 + ["#e74c3c"] * 3 + ["#f39c12"] * 3
+        ax_inventory.bar(
+            range(len(CRAFTER_INVENTORY_LABELS) - 4),
+            rates,
+            color=colors,
+            alpha=0.8,
+            edgecolor="black",
+        )
+        ax_inventory.set_title("Progression Inventory Coverage / Presence Rate")
+        ax_inventory.set_ylabel("Presence Rate (%)")
+        ax_inventory.set_ylim(0, 115)
+        ax_inventory.set_xticks(range(len(CRAFTER_INVENTORY_LABELS) - 4))
+        ax_inventory.set_xticklabels(
+            CRAFTER_INVENTORY_LABELS[4:], rotation=45, ha="right", fontsize=9
+        )
+        ax_inventory.grid(axis="y", linestyle="--", alpha=0.3)
+        for index, rate in enumerate(rates):
+            color = "darkred" if rate >= 95 else "black"
+            ax_inventory.text(
+                index, rate + 2, f"{rate:.1f}", ha="center", fontsize=8,
+                fontweight="bold", color=color,
+            )
+
+        fig.suptitle(title, fontsize=13, fontweight="bold")
+        fig.tight_layout(rect=(0, 0, 1, 0.95))
+        fig.savefig(out, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Crafter real-env coverage saved to {out}")
+        return out
+
+
 def plot_crafter_coverage_from_npz(data_path: str, save_path: str | None = None, title: str = "Crafter Exploration Coverage"):
     data = np.load(data_path, allow_pickle=True)
 
@@ -166,7 +302,7 @@ def plot_crafter_coverage_from_npz(data_path: str, save_path: str | None = None,
 import torch
 import torch.nn.functional as F
 
-from modelBased.common.categorical_effects import (
+from modelBased.world_model.crafter_dynamics import (
     apply_categorical_effect,
     balanced_categorical_effect_loss,
     categorical_effect_target,

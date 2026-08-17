@@ -229,6 +229,47 @@ MiniGrid keeps its own values under `domains.minigrid`. The top-level
 domain, so existing code continues to work. Pipeline subprocesses also receive
 domain-level command-line overrides.
 
+#### Crafter Plan2Explore acquisition
+
+The canonical Crafter acquisition is the single-environment DreamerV2
+Plan2Explore path. It uses a 10-head, 4x400 ELU ensemble over the pooled
+Attention WM latent plus normalized inventory, with raw population-standard-
+deviation disagreement as the only explorer reward. A categorical
+Dreamer-style actor-critic performs 15-step imagined updates from uniform
+episodic replay (`16 x 50` sequences); native Crafter reward is saved only for
+diagnostics. The default budget is one million interactions with a 10,000-step
+random prefill. Artifacts use the `p2e_official_dv2_attnwm_v1` marker.
+
+```bash
+python run_pipeline.py pipeline.label=crafter \
+  p2e.enabled=true rmax_like.enabled=false
+```
+
+P2E is intentionally incompatible with `continual_learning.enabled=true`.
+
+#### Crafter count-based (RMax-like) acquisition
+
+Crafter can train a WM-independent exploration policy directly in the real
+environment before WM training. The default count-acquisition budget uses
+80,000 transitions while updating PPO and 20,000 additional transitions with
+the explorer frozen. Both phases are retained in the same 100,000-transition
+WM dataset, whose `acquisition_phase` array marks training (`0`) and frozen
+(`1`) samples.
+
+```bash
+python run_pipeline.py pipeline.label=crafter \
+  p2e.enabled=false rmax_like.enabled=true
+```
+
+The novelty reward uses only a shared real-environment state-action counter
+over the agent-centred 5x5 symbolic patch and the 12 progression inventory
+slots. No world model, ensemble, or disagreement signal is loaded during
+acquisition. The dataset, WM, explorer, and final planning policy use the
+`rmax_count_local5_inv12_v1` artifact marker. Keep
+`domains.crafter.data_collection.maximum_dataset_size` equal to
+`rmax_like.train_steps + rmax_like.frozen_steps`; both stage budgets and
+`rmax_like.rollout_steps` must be divisible by `rmax_like.num_envs`.
+
 ### 2. Train the world model
 
 ```bash
@@ -245,14 +286,14 @@ observation_loss = mean(normalized_field_loss for field in observation_schema)
 
 Categorical fields use cross-entropy normalized by `log(number_of_classes)`,
 binary fields use BCE normalized by `log(2)`, normalized continuous fields use
-MSE, and count-like Crafter inventory fields use symlog MSE. The field terms
-are averaged without domain-specific or rarity-specific multipliers. Training
-logs one public loss curve, `train/observation_loss`; validation uses the same
-objective as `val/observation_loss`. EWC, when enabled for continual learning,
-remains an optimization regularizer and is not reported as a second observation
-loss. Each domain declares only its fields in `domains.<domain>.observation_schema`
-inside `modelBased/config/config.yaml`; adding a domain does not require another
-loss implementation.
+MSE. Crafter inventory uses structured categorical KEEP/CHANGE/value targets.
+The field terms are averaged without domain-specific or rarity-specific
+multipliers. Training logs one public loss curve, `train/observation_loss`;
+validation uses the same objective as `val/observation_loss`. Crafter continual
+training is replay-only: it does not compute Fisher matrices or apply EWC. Each
+domain declares only its fields in `domains.<domain>.observation_schema` inside
+`modelBased/config/config.yaml`; adding a domain does not require another loss
+implementation.
 
 MiniGrid treats carried inventory as part of the learned state: token `0`
 means empty hands and tokens `1..6` represent the six key colours. The WM

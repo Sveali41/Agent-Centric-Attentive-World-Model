@@ -12,7 +12,7 @@ import torch
 
 from modelBased.world_model.AttentionWM import AttentionWorldModel
 from modelBased.data.datamodule import WMRLDataModule, WMRLDataset, WMRLDataset
-from modelBased.common.dataset_identity import dataset_matches
+from modelBased.common.artifacts import dataset_matches
 from modelBased.common.utils import PROJECT_ROOT, get_env
 import hydra
 from omegaconf import DictConfig
@@ -150,7 +150,7 @@ def run(
 
     if not dataset_matches(cfg.attention_model.data_dir, cfg):
         allow_legacy = bool(getattr(cfg.attention_model, "allow_legacy_dataset", False))
-        from modelBased.common.dataset_identity import dataset_metadata
+        from modelBased.common.artifacts import dataset_metadata
         if allow_legacy and dataset_metadata(cfg.attention_model.data_dir) is None:
             print(
                 "[WM] WARNING: using a legacy dataset without identity metadata. "
@@ -164,7 +164,7 @@ def run(
             )
 
     use_wandb = cfg.attention_model.use_wandb
-    fisher_beta = float(getattr(cfg.attention_model, "fisher_beta", 0.5))
+    ewc_enabled = bool(getattr(cfg.attention_model, "ewc_enabled", False))
 
     # datamodule
     should_use_validation_mode = cfg.attention_model.freeze_weight
@@ -252,8 +252,15 @@ def run(
         "avg_val_loss": None,
     }
 
-    # consolidation: Load weights if old_params are provided to continue learning
-    net.set_consolidation(old_params, fisher, load_weights=(old_params is not None))
+    if ewc_enabled:
+        net.set_consolidation(old_params, fisher, load_weights=(old_params is not None))
+    else:
+        # Replay-only training carries the live model between phases. No
+        # parameter anchor or Fisher matrix is created or restored.
+        old_params = None
+        fisher = None
+        net.old_params = None
+        net.fisher = None
 
     if cfg.attention_model.freeze_weight:
         # ===== validation =====
@@ -298,10 +305,10 @@ def run(
             net.load_state_dict(best_checkpoint["state_dict"])
             print(f"[WM] Loaded best checkpoint: {best_model_path}")
 
-        # Save the current parameters as the consolidation anchor.
-        old_params = net.save_old_params()
-
-        if bool(getattr(cfg.attention_model, "compute_fisher", True)):
+        if ewc_enabled and bool(getattr(cfg.attention_model, "compute_fisher", True)):
+            # Save the current parameters as the consolidation anchor before
+            # estimating Fisher for a later EWC-regularized phase.
+            old_params = net.save_old_params()
             # Estimate the Fisher information matrix for a later continual phase.
             # Lightning moves the module back to CPU when fit() tears down. Move
             # it explicitly so the expensive per-sample backward passes do not
@@ -310,7 +317,8 @@ def run(
             net.to(fisher_device)
             print(f"[Fisher] Using device: {fisher_device}")
             fisher_samples = int(getattr(cfg.attention_model, "fisher_samples", 3000))
-            scale_factor = cfg.attention_model.scale_factor
+            fisher_beta = float(getattr(cfg.attention_model, "fisher_beta", 0.5))
+            scale_factor = float(getattr(cfg.attention_model, "scale_factor", 1.0))
             new_fisher = net.compute_fisher(
                 datamodule.train_dataloader(),
                 samples=fisher_samples,
@@ -326,7 +334,10 @@ def run(
             else:
                 fisher = new_fisher
         else:
-            print("[Fisher] Skipped: no later continual-learning phase is configured.")
+            old_params = None
+            fisher = None
+            if bool(getattr(cfg.attention_model, "continue_learning", False)):
+                print("[EWC/Fisher] Disabled; continual retention uses replay only.")
 
     # ... (in run)
         # Save the training checkpoint.

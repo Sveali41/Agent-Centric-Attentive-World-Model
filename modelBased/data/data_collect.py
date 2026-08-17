@@ -11,7 +11,7 @@ try:
 except ImportError:
     # Script import (e.g., `python modelBased/data/data_collect.py`)
     from modelBased.common.utils import normalize_obs, WORLD_MODEL_PATH, PROJECT_ROOT
-from modelBased.common.dataset_identity import metadata_array
+from modelBased.common.artifacts import metadata_array
 from domain.minigrid.action_codec import (
     carrying_token_from_env,
     compact_to_native,
@@ -1385,7 +1385,18 @@ def uniform_collect_data_postprocess(env, cfg, wandb_run, log_name, policy=None,
     return obs_u, obsn_u, act_u, rew_u, done_u, info_u
 
 
-def save_experiments(cfg: DictConfig, obs, obs_next, act, rew, done, info=None, inv=None, inv_next=None):
+def save_experiments(
+    cfg: DictConfig,
+    obs,
+    obs_next,
+    act,
+    rew,
+    done,
+    info=None,
+    inv=None,
+    inv_next=None,
+    extra_arrays=None,
+):
     # Grid observations (MiniGrid/Crafter) are 4-D; vector observations (e.g., Bipedal) are 2-D.
     if obs.ndim == 4:
         # Crafter symbolic grid has C=2 in the last axis before conversion.
@@ -1418,6 +1429,15 @@ def save_experiments(cfg: DictConfig, obs, obs_next, act, rew, done, info=None, 
     if inv is not None:
         save_kwargs['g'] = inv        # inventory at time t
         save_kwargs['h'] = inv_next   # inventory at time t+1
+    for key, value in dict(extra_arrays or {}).items():
+        if key in save_kwargs:
+            raise ValueError(f"Extra dataset array collides with reserved key: {key}")
+        value = np.asarray(value)
+        if len(value) != len(obs):
+            raise ValueError(
+                f"Extra dataset array {key!r} has {len(value)} rows; expected {len(obs)}"
+            )
+        save_kwargs[key] = value
     np.savez_compressed(save_path, **save_kwargs)
 
 def data_augmentation(cfg: DictConfig, obs, obs_next, act, rew, done):
@@ -1687,29 +1707,7 @@ def data_collect(cfg: DictConfig):
     )
     save_experiments(cfg, obs, obs_next, act, rew, done, info, inv=inv, inv_next=inv_next)
 
-    # coverage visualization
-    data_path = cfg.env.collect.data_save_path
-    if getattr(cfg.env.collect, "save_coverage_visualize", False) and os.path.exists(data_path):
-        filename, vis_save_path = _resolve_coverage_vis_target(cfg)
-        os.makedirs(vis_save_path, exist_ok=True)
-        save_path = os.path.join(vis_save_path, filename)
-        data = np.load(data_path, allow_pickle=True)
-        collect_cfg = cfg.env.collect if hasattr(cfg.env, "collect") else cfg.env
-        dataset_type = getattr(collect_cfg, "data_type", "Random")
-        if data["a"].ndim == 2 and cfg.env.env_type == "bipedalwalker":
-            layout_source = getattr(cfg.env.collect, "current_layout_str", None) or getattr(cfg.env, "env_path", None)
-            visualize_bipedal_coverage_1d(
-                data,
-                layout_source=layout_source,
-                save_path=save_path,
-                title=f"Bipedal 1D Coverage ({dataset_type})",
-            )
-        else:
-            visualize_agent_coverage(
-                data,
-                save_path=save_path,
-                title=f"Agent Position Coverage ({dataset_type})"
-            )
+    save_dataset_coverage(cfg)
 
     env.close()
 
@@ -1896,29 +1894,12 @@ def _finalize_and_save(
 
     save_experiments(cfg, obs_all, obsn_all, act_all, rew_all, done_all, info_all, inv=inv_final, inv_next=invn_final)
 
-    # visualization
-    data_path = cfg.env.collect.data_save_path
-    if cfg.env.collect.save_coverage_visualize and os.path.exists(data_path):
-        filename, vis_save_path = _resolve_coverage_vis_target(cfg)
-        os.makedirs(vis_save_path, exist_ok=True)
-        save_path = os.path.join(vis_save_path, filename)
-        data = np.load(data_path, allow_pickle=True)
-        collect_cfg = cfg.env.collect if hasattr(cfg.env, "collect") else cfg.env
-        dataset_type = getattr(collect_cfg, "data_type", "Random")
-        if data["a"].ndim == 2 and cfg.env.env_type == "bipedalwalker":
-            layout_source = layout_source or _resolve_runtime_bipedal_layout_source(cfg, env)
-            visualize_bipedal_coverage_1d(
-                data,
-                layout_source=layout_source,
-                save_path=save_path,
-                title=f"Bipedal 1D Coverage ({dataset_type})",
-            )
-        else:
-            visualize_agent_coverage(
-                data,
-                save_path=save_path,
-                title=f"Agent Position Coverage ({dataset_type})"
-            )
+    layout_source = layout_source or (
+        _resolve_runtime_bipedal_layout_source(cfg, env)
+        if str(getattr(cfg.env, "env_type", "")).lower() == "bipedalwalker"
+        else None
+    )
+    save_dataset_coverage(cfg, layout_source=layout_source)
 
     env.close()
 
@@ -1935,7 +1916,8 @@ def visualize_agent_coverage(data, save_path=None, title="Agent Position Coverag
     # Step 1: extract positions with the existing helper.
     # -------------------------------
     obs_np = data['a']
-    raw_obs = obs_np
+    if obs_np.ndim != 4:
+        raise ValueError(f"Position coverage requires 4-D observations, got {obs_np.shape}")
     # If the array is NHWC, convert it to NCHW; Crafter symbolic observations use C=2.
     if obs_np.shape[1] not in [2, 3, 4, 5]:  # Unusual channel count likely means channels-last.
         obs_np = np.moveaxis(obs_np, -1, 1)
@@ -1983,12 +1965,16 @@ def visualize_agent_coverage(data, save_path=None, title="Agent Position Coverag
         matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
-    if 'g' in data and len(data['g']) > 0:
-        inv_data = data['g']
-        if len(inv_data.shape) == 3: # (N, _, 16)
-            inv_data = inv_data[:, 0, :]
-        max_inv = np.max(inv_data, axis=0)
-        
+    has_crafter_inventory = is_crafter_symbolic and 'g' in data and len(data['g']) > 0
+    if has_crafter_inventory:
+        inv_data = np.asarray(data['g'])
+        inv_data = inv_data.reshape(inv_data.shape[0], -1)
+        if inv_data.shape[1] != 16:
+            raise ValueError(
+                "Crafter coverage expects 16 inventory slots, "
+                f"got shape {inv_data.shape}"
+            )
+
         inv_labels = ['Health', 'Food', 'Drink', 'Energy', 
                      'Wood', 'Stone', 'Coal', 'Iron', 'Diamond', 'Sapling', 
                      'Wood_Pickaxe', 'Stone_Pickaxe', 'Iron_Pickaxe', 
@@ -2010,7 +1996,7 @@ def visualize_agent_coverage(data, save_path=None, title="Agent Position Coverag
         # 2. Inventory Stats
         ax2 = plt.subplot(1, 2, 2)
         colors = ['#3498db']*4 + ['#2ecc71']*6 + ['#e74c3c']*3 + ['#f39c12']*3
-        bars = ax2.bar(range(len(inv_labels)), inv_stats, color=colors, alpha=0.8, edgecolor='black')
+        ax2.bar(range(len(inv_labels)), inv_stats, color=colors, alpha=0.8, edgecolor='black')
         
         ax2.set_title("Agent Inventory Acquisition Rate", fontsize=12, fontweight='bold')
         ax2.set_ylabel("Presence Rate (%)")
@@ -2034,23 +2020,111 @@ def visualize_agent_coverage(data, save_path=None, title="Agent Position Coverag
         ]
         ax2.legend(handles=legend_elements, loc='upper right', fontsize=8, framealpha=0.5)
         
-        plt.tight_layout()
+        fig.suptitle(title, fontsize=13, fontweight='bold')
+        plt.tight_layout(rect=(0, 0, 1, 0.95))
     else:
         fig, ax = plt.subplots(figsize=(6,6))
         im = ax.imshow(heatmap, cmap="viridis", origin="upper")
-        # ax.set_title(title)
+        ax.set_title(title)
         ax.set_xlabel("X axis")
         ax.set_ylabel("Y axis")
         plt.colorbar(im, ax=ax, label="Occurrences", fraction=0.046, pad=0.04)
         plt.tight_layout()
 
     if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches="tight")
-        print(f"Heatmap and Stats saved to {save_path}")
+        print(f"Coverage visualization saved to {save_path}")
     else:
         plt.show()
     plt.close()
+
+
+def visualize_crafter_inventory_coverage(
+    data, save_path=None, title="Crafter Inventory Coverage"
+):
+    """Visualize Crafter coverage by inventory states and acquisitions.
+
+    Crafter is an open-ended survival/crafting task, so spatial visitation is
+    only a proxy.  The primary coverage signal is the number of distinct
+    discretized inventory configurations encountered over the dataset, with
+    per-slot presence and acquisition counts shown for diagnosis.  No recipe
+    or achievement labels are used here.
+    """
+    if "g" not in data or len(data["g"]) == 0:
+        raise ValueError("Crafter inventory coverage requires dataset key 'g'")
+    inventory = np.asarray(data["g"], dtype=np.float32).reshape(len(data["g"]), -1)
+    if inventory.shape[1] != 16:
+        raise ValueError(
+            f"Crafter inventory coverage expects 16 slots, got {inventory.shape}"
+        )
+    inventory_next = np.asarray(
+        data.get("h", np.zeros_like(inventory)), dtype=np.float32
+    ).reshape(len(inventory), -1)
+    # Crafter inventory is integer-valued; rounding avoids treating tiny
+    # serialization noise as a new state.
+    # Coverage measures progression inventory only.  Health/food/drink/energy
+    # are survival variables and must not inflate exploration coverage through
+    # routine decay or regeneration.
+    discrete = np.rint(inventory[:, 4:]).astype(np.int16)
+    _, first_indices = np.unique(discrete, axis=0, return_index=True)
+    unique_count = int(len(first_indices))
+    cumulative_unique = np.zeros(len(discrete), dtype=np.int64)
+    seen = set()
+    for index, row in enumerate(discrete):
+        seen.add(row.tobytes())
+        cumulative_unique[index] = len(seen)
+
+    labels = [
+        "Wood", "Stone", "Coal", "Iron", "Diamond", "Sapling",
+        "Wood_Pickaxe", "Stone_Pickaxe", "Iron_Pickaxe", "Wood_Sword",
+        "Stone_Sword", "Iron_Sword",
+    ]
+    presence = np.mean(discrete > 0, axis=0) * 100.0
+    gains = np.sum(inventory_next[:, 4:] > inventory[:, 4:], axis=0)
+    if save_path:
+        import matplotlib
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, (ax_states, ax_slots) = plt.subplots(
+        1, 2, figsize=(14, 6), gridspec_kw={"width_ratios": [1.05, 1.45]}
+    )
+    ax_states.plot(np.arange(1, len(cumulative_unique) + 1), cumulative_unique,
+                   color="#2c7fb8", linewidth=2)
+    ax_states.set_title(f"Unique inventory states: {unique_count}")
+    ax_states.set_xlabel("Collected transitions")
+    ax_states.set_ylabel("Cumulative unique states")
+    ax_states.grid(axis="both", linestyle="--", alpha=0.3)
+
+    x = np.arange(len(labels))
+    width = 0.42
+    ax_slots.bar(x - width / 2, presence, width, label="Presence (%)", color="#2ecc71")
+    ax_slots2 = ax_slots.twinx()
+    ax_slots2.bar(x + width / 2, gains, width, label="Positive gains", color="#e67e22")
+    ax_slots.set_title("Inventory slot coverage")
+    ax_slots.set_ylabel("Presence in observations (%)")
+    ax_slots2.set_ylabel("Positive transitions")
+    ax_slots.set_ylim(0, 115)
+    ax_slots.set_xticks(x)
+    ax_slots.set_xticklabels(labels, rotation=55, ha="right", fontsize=8)
+    ax_slots.grid(axis="y", linestyle="--", alpha=0.3)
+    handles1, labels1 = ax_slots.get_legend_handles_labels()
+    handles2, labels2 = ax_slots2.get_legend_handles_labels()
+    ax_slots.legend(handles1 + handles2, labels1 + labels2, loc="upper right", fontsize=8)
+    fig.suptitle(title, fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    if save_path:
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches="tight")
+        print(f"Crafter inventory coverage saved to {save_path}")
+    else:
+        plt.show()
+    plt.close(fig)
 
 
 def _extract_bipedal_x_positions_and_episode_max(data):
@@ -2321,6 +2395,59 @@ def visualize_bipedal_coverage_1d(data, layout_source, save_path=None, title="Bi
         plt.show()
     plt.close()
 
+
+def save_dataset_coverage(cfg, data_path=None, layout_source=None):
+    """Save the configured coverage plot for an already-written dataset.
+
+    Crafter datasets use progression-inventory coverage as the primary plot;
+    health/food/drink/energy are excluded from the coverage state. Other
+    discrete domains retain the position heatmap, while BipedalWalker uses its
+    terrain-aligned one-dimensional plot.
+    """
+    collect_cfg = cfg.env.collect if hasattr(cfg.env, "collect") else cfg.env
+    if not bool(getattr(collect_cfg, "save_coverage_visualize", False)):
+        return None
+
+    data_path = os.fspath(data_path or getattr(collect_cfg, "data_save_path"))
+    if not os.path.isfile(data_path):
+        raise FileNotFoundError(f"Cannot visualize missing dataset: {data_path}")
+
+    filename, vis_save_path = _resolve_coverage_vis_target(cfg)
+    os.makedirs(vis_save_path, exist_ok=True)
+    save_path = os.path.join(vis_save_path, filename)
+    env_type = str(getattr(cfg.env, "env_type", "")).lower()
+    dataset_type = str(getattr(collect_cfg, "data_type", "random"))
+
+    with np.load(data_path, allow_pickle=True) as data:
+        if env_type == "bipedalwalker" or data["a"].ndim == 2:
+            layout_source = (
+                layout_source
+                or getattr(collect_cfg, "current_layout_str", None)
+                or getattr(cfg.env, "env_path", None)
+            )
+            visualize_bipedal_coverage_1d(
+                data,
+                layout_source=layout_source,
+                save_path=save_path,
+                title=f"Bipedal 1D Coverage ({dataset_type})",
+            )
+        else:
+            if env_type == "crafter" and "g" in data and len(data["g"]):
+                visualize_crafter_inventory_coverage(
+                    data,
+                    save_path=save_path,
+                    title=f"Crafter Inventory Coverage ({dataset_type})",
+                )
+            else:
+                visualize_agent_coverage(
+                    data,
+                    save_path=save_path,
+                    title=f"Agent Position Coverage ({dataset_type})",
+                )
+
+    return save_path
+
+
 def visualize_saved_dataset(data_path, save_path, fig_name, env_type=None, layout_path=None):
     '''
     Visualize the saved dataset coverage heatmap
@@ -2338,11 +2465,18 @@ def visualize_saved_dataset(data_path, save_path, fig_name, env_type=None, layou
                 title=f"Bipedal 1D Coverage ({fig_name})",
             )
         else:
-            visualize_agent_coverage(
-                data,
-                save_path=save_path,
-                title=f"Agent Position Coverage ({fig_name})"
-            )
+            if str(env_type or "").lower() == "crafter" and "g" in data:
+                visualize_crafter_inventory_coverage(
+                    data,
+                    save_path=save_path,
+                    title=f"Crafter Inventory Coverage ({fig_name})",
+                )
+            else:
+                visualize_agent_coverage(
+                    data,
+                    save_path=save_path,
+                    title=f"Agent Position Coverage ({fig_name})",
+                )
         print(f"Coverage heatmap saved to {save_path}")
 
 if __name__ == "__main__": 

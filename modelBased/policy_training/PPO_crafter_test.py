@@ -22,13 +22,13 @@ from modelBased.policy_training.PPO import PPO
 from modelBased.policy_training.experiment_naming import (
     policy_checkpoint_is_compatible,
     policy_checkpoint_path,
+    policy_experiment_label,
     policy_training_source,
 )
+from modelBased.policy_training.evaluation_csv import append_mean_row, detail_rows
 from modelBased.policy_training.PPO_crafter_training import (
     CRAFTER_ACTION_COUNT,
-    CRAFTER_PLAYER_ID,
     build_policy_state,
-    find_success_tile_position,
     seed_policy_training,
 )
 
@@ -51,6 +51,7 @@ def validate_crafter_policy(cfg: DictConfig) -> float:
     ppo_cfg = cfg.PPO
     domain_cfg = cfg.domains["crafter"]
     hparams_wm = cfg.attention_model
+    training_source = policy_training_source(cfg)
 
     checkpoint_path = policy_checkpoint_path(cfg, domain="crafter")
     if not checkpoint_path.is_file():
@@ -61,7 +62,6 @@ def validate_crafter_policy(cfg: DictConfig) -> float:
             f"Retrain the policy for {domain_cfg.task_name}: {checkpoint_path}"
         )
 
-    success_obj_id  = int(getattr(domain_cfg, "success_obj_id", 10))
     inventory_dim   = int(getattr(domain_cfg, "inventory_dim", 16))
     obs_norm_values = list(hparams_wm.obs_norm_values)
     max_ep_len      = int(ppo_cfg.max_ep_len)
@@ -87,17 +87,6 @@ def validate_crafter_policy(cfg: DictConfig) -> float:
     H, W = sample_grid.shape[0], sample_grid.shape[1]
     state_dim = 2 * H * W + inventory_dim
 
-    # Locate success tile
-    sample_chw = np.transpose(sample_grid, (2, 0, 1))
-    goal_yx = find_success_tile_position(sample_chw, success_obj_id)
-    if goal_yx is None:
-        print(
-            f"[Crafter Test] No target tile (obj={success_obj_id}) found; "
-            "target-tile metric disabled."
-        )
-    else:
-        print(f"[Crafter Test] Target tile (obj={success_obj_id}) at yx={goal_yx}")
-
     # Build and load PPO agent
     ppo_agent = PPO(
         state_dim,
@@ -111,7 +100,7 @@ def validate_crafter_policy(cfg: DictConfig) -> float:
         ppo_cfg.action_std,
     )
     print(f"Loading policy: {checkpoint_path}")
-    print(f"Training source: {policy_training_source(cfg)}")
+    print(f"Training source: {training_source}")
     ppo_agent.load(str(checkpoint_path))
     ppo_agent.policy_old.eval()
 
@@ -148,7 +137,9 @@ def validate_crafter_policy(cfg: DictConfig) -> float:
 
             obs, native_reward, done, trunc, info = env.step(action)
             episode_reward += float(native_reward)
-            episode_achievements += len(info.get("newly_unlocked", []))
+            newly_unlocked = info.get("newly_unlocked", [])
+            episode_achievements += len(newly_unlocked)
+            success |= "collect_diamond" in newly_unlocked
             grid = obs["image"]
             state_chw = torch.as_tensor(
                 np.transpose(grid, (2, 0, 1)), device=device, dtype=torch.float32
@@ -156,18 +147,6 @@ def validate_crafter_policy(cfg: DictConfig) -> float:
             inv = torch.as_tensor(
                 obs["inventory"], device=device, dtype=torch.float32
             ).unsqueeze(0)
-
-            # Check success: player stands on the success tile
-            chw_np = np.transpose(obs["image"], (2, 0, 1))
-            player_yx = None
-            hits = np.argwhere(chw_np[0] == CRAFTER_PLAYER_ID)
-            if len(hits) > 0:
-                player_yx = tuple(hits[0])
-
-            # In Crafter minitask the player *moves onto* the tile, so the obj channel
-            # will show the player at goal_yx when they overlap.
-            if goal_yx is not None and player_yx is not None and tuple(player_yx) == tuple(goal_yx):
-                success = True
 
             if render or (save_gif and episode == 1):
                 frame = env.render()
@@ -186,7 +165,7 @@ def validate_crafter_policy(cfg: DictConfig) -> float:
         results.append((episode, step, episode_reward, success, episode_achievements))
         print(
             f"Episode {episode}: steps={step}, native_reward={episode_reward:.5f}, "
-            f"achievements={episode_achievements}, target_success={success}"
+            f"achievements={episode_achievements}, collect_diamond_success={success}"
         )
 
         if save_gif and episode == 1 and frames:
@@ -199,19 +178,66 @@ def validate_crafter_policy(cfg: DictConfig) -> float:
     env.close()
 
     if save_csv:
-        csv_path = csv_dir / "ppo_crafter_test.csv"
-        pd.DataFrame(
+        experiment_label = policy_experiment_label(cfg)
+        if training_source == "real_env":
+            csv_stem = "ppo_crafter_real_env"
+        else:
+            csv_stem = "ppo_crafter"
+        if experiment_label:
+            csv_stem += f"_{experiment_label}"
+        csv_filename = f"{csv_stem}_test.csv"
+        csv_path = csv_dir / csv_filename
+        current_results = pd.DataFrame(
             results,
-            columns=["episode", "steps", "native_reward", "target_success", "newly_unlocked"],
-        ).to_csv(csv_path, index=False)
-        print(f"Saved CSV: {csv_path}")
+            columns=[
+                "episode",
+                "steps",
+                "native_reward",
+                "collect_diamond_success",
+                "newly_unlocked",
+            ],
+        )
+        current_results.insert(0, "seed", seed)
+
+        # Keep one multi-seed validation artifact. Re-running a seed replaces
+        # that seed's rows while preserving every other completed seed, so a
+        # retry cannot silently duplicate its episodes.
+        if csv_path.is_file():
+            previous_results = detail_rows(pd.read_csv(csv_path))
+            if "seed" in previous_results.columns:
+                previous_results["seed"] = pd.to_numeric(
+                    previous_results["seed"], errors="raise"
+                ).astype(int)
+                previous_results = previous_results.loc[
+                    previous_results["seed"] != seed
+                ]
+                current_results = pd.concat(
+                    [previous_results, current_results], ignore_index=True
+                )
+        current_results = current_results.sort_values(
+            ["seed", "episode"], kind="stable"
+        )
+        current_results = append_mean_row(
+            current_results,
+            mean_columns=[
+                "steps",
+                "native_reward",
+                "collect_diamond_success",
+                "newly_unlocked",
+            ],
+            labels={"seed": "all", "episode": "mean"},
+        )
+        temporary_path = csv_path.with_name(f".{csv_path.name}.tmp")
+        current_results.to_csv(temporary_path, index=False)
+        temporary_path.replace(csv_path)
+        print(f"Saved multi-seed CSV: {csv_path} (seed={seed})")
 
     avg_reward   = total_reward / max(total_episodes, 1)
     success_rate = sum(r[3] for r in results) / max(total_episodes, 1)
     achievement_rate = sum(r[4] for r in results) / max(total_episodes, 1)
     print(f"Average real-environment native reward: {avg_reward:.5f}")
     print(f"Average newly unlocked achievements: {achievement_rate:.2f}")
-    print(f"Target-tile success rate: {success_rate:.1%}")
+    print(f"Collect-diamond success rate: {success_rate:.1%}")
     return avg_reward
 
 

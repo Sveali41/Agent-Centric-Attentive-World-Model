@@ -35,6 +35,7 @@ from modelBased.policy_training.experiment_naming import (
     policy_checkpoint_path,
     policy_training_source,
 )
+from modelBased.policy_training.evaluation_csv import append_mean_row
 
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -186,9 +187,15 @@ def validate_policy(cfg: DictConfig) -> float:
 
     if save_csv:
         csv_path = csv_dir / "ppo_real_env_test.csv"
-        pd.DataFrame(
+        evaluation_results = pd.DataFrame(
             results, columns=["episode", "steps", "reward", "success"]
-        ).to_csv(csv_path, index=False)
+        )
+        evaluation_results = append_mean_row(
+            evaluation_results,
+            mean_columns=["steps", "reward", "success"],
+            labels={"episode": "mean"},
+        )
+        evaluation_results.to_csv(csv_path, index=False)
         print(f"Saved CSV: {csv_path}")
 
     average_reward = total_reward / max(total_episodes, 1)

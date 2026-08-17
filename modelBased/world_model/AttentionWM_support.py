@@ -173,12 +173,16 @@ class AttentionModule(nn.Module):
         env_type="minigrid",
         frame_stack=1,
         crafter_output_mode="effect",
+        crafter_inventory_classes=10,
+        crafter_inventory_output_mode="categorical_gate",
     ):
         super().__init__()
         self.data_type = data_type
         self.env_type = env_type
         self.frame_stack = frame_stack
         self.crafter_output_mode = str(crafter_output_mode)
+        self.crafter_inventory_classes = int(crafter_inventory_classes)
+        self.crafter_inventory_output_mode = str(crafter_inventory_output_mode)
         self.is_bipedal = (env_type == "bipedalwalker")
         self.embed_dim = embed_dim
         if data_type == 'discrete':
@@ -187,10 +191,22 @@ class AttentionModule(nn.Module):
                 self.input_channel = (20 + 5) * frame_stack
                 self.action_embedding = nn.Embedding(17, embed_dim) # 17 actions in crafter
                 self.inv_fc = nn.Linear(16, embed_dim)
+                if self.crafter_inventory_output_mode != "categorical_gate":
+                    raise ValueError(
+                        "Crafter inventory must use categorical_gate output, got "
+                        f"{self.crafter_inventory_output_mode!r}"
+                    )
+                # Survival: 4 x (KEEP + SET_TO_0..9).
+                # Items: 12 x KEEP/CHANGE gate + 12 x next value 0..9.
+                inventory_output_width = (
+                    4 * (self.crafter_inventory_classes + 1)
+                    + 12 * 2
+                    + 12 * self.crafter_inventory_classes
+                )
                 self.inv_head = nn.Sequential(
                     nn.Linear(embed_dim, embed_dim),
                     nn.ReLU(),
-                    nn.Linear(embed_dim, 16)
+                    nn.Linear(embed_dim, inventory_output_width)
                 )
             else:
                 self.input_channel = (11 + 6 + 4) * frame_stack
@@ -473,14 +489,33 @@ class AttentionModule(nn.Module):
         x_out = x_out.transpose(1, 2).reshape(B, self.out_channel, H, W)
 
         if self.env_type in ('crafter', 'minigrid'):
-            # Mean pool over spatial patches to predict the inventory delta.
+            # Mean pool over spatial patches to predict the inventory effect.
             x_pooled = x.mean(dim=1)  # (B, D)
             inv_pred = self.inv_head(x_pooled)
+            if self.env_type == 'crafter':
+                effect_width = 4 * (self.crafter_inventory_classes + 1)
+                gate_width = 12 * 2
+                survival_raw = inv_pred[:, :effect_width]
+                gate_raw = inv_pred[:, effect_width:effect_width + gate_width]
+                value_raw = inv_pred[:, effect_width + gate_width:]
+                inv_pred = {
+                    "survival_effect_logits": survival_raw.reshape(
+                        B, 4, self.crafter_inventory_classes + 1
+                    ).transpose(1, 2).contiguous(),
+                    "item_gate_logits": gate_raw.reshape(B, 12, 2)
+                    .transpose(1, 2).contiguous(),
+                    "item_value_logits": value_raw.reshape(
+                        B, 12, self.crafter_inventory_classes
+                    ).transpose(1, 2).contiguous(),
+                }
         else:
             inv_pred = None
 
         if orginal_dim == 3:
             x_out = x_out.squeeze(0)
             if inv_pred is not None:
-                inv_pred = inv_pred.squeeze(0)
+                if isinstance(inv_pred, dict):
+                    inv_pred = {key: value.squeeze(0) for key, value in inv_pred.items()}
+                else:
+                    inv_pred = inv_pred.squeeze(0)
         return x_out, attn_weights, inv_pred

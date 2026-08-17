@@ -4,7 +4,9 @@ pipeline:
   label: ${domain}  # minigrid | crafter | bipedalwalker | full
   force: false
   force_policy: false  # Retrain only policy; keep the matching dataset and WM.
-  skip_world_model: false  # Reuse the configured WM; fail if it is missing.
+  # Planning-only 5-seed evaluation: reuse one fixed RMax dataset/WM and vary
+  # only PPO initialization and policy sampling through PPO.seed.
+  skip_world_model: true  # Fail clearly if the shared WM is missing.
   skip_policy: false
 
 domains:
@@ -19,14 +21,14 @@ domains:
       data_type: random
       episodes: 1000
       mini_dataset_size: 8000
-      maximum_dataset_size: 100000
+      maximum_dataset_size: 400000
       uniform_reset_steps: 5000
     policy:
       # The current progression layout is compact but its resources are spread
       # out; allow PPO enough horizon for inefficient exploratory trajectories.
       max_ep_len: 4096
       # 8192 / 8 imagined environments = 1024 temporal steps per update.
-      rollout_steps: 8192
+      rollout_steps: 4096
       num_imagined_envs: 64
       max_training_timesteps: 3000000
       total_test_episodes: 100
@@ -39,29 +41,27 @@ domains:
     layout_path: ${oc.env:ENV_PATH}/crafter/${domains.crafter.task_name}.txt
     data_save_path: ${oc.env:TRAIN_DATASET_PATH}/crafter_${domains.crafter.task_name}_${env.collect.data_type}.npz
     # Used only when continual_learning=false and p2e.enabled=true.
-    p2e_data_save_path: ${oc.env:TRAIN_DATASET_PATH}/crafter_${domains.crafter.task_name}_p2e.npz
-    # The map head predicts KEEP/SET_TO categorical effects and inventory is
-    # a numerical delta. Keep this artifact separate from absolute-map WMs.
+    p2e_data_save_path: ${oc.env:TRAIN_DATASET_PATH}/crafter_${domains.crafter.task_name}_p2e_official_dv2_attnwm_v1.npz
+    # Acquisition artifacts use the fixed RMax seed below. PPO.seed must not
+    # trigger another real-environment collection or WM training run.
+    rmax_like_data_save_path: ${oc.env:TRAIN_DATASET_PATH}/crafter_${domains.crafter.task_name}_rmax_count_local5_inv12_v1_no_continual_seed${rmax_like.seed}.npz
+    # Map uses KEEP/SET_TO effects. Inventory keeps survival effects and uses
+    # a parameter-free KEEP/CHANGE gate plus conditional value head for items.
     # Standard single-run WM. Continual training writes its separate final
     # artifact to continual_learning.final_checkpoint below.
-    world_model_checkpoint: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_crafter_${domains.crafter.task_name}_effect.ckpt
+    world_model_checkpoint: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_crafter_${domains.crafter.task_name}_effect_inventory_gate_natural_v2_rmax_count_local5_inv12_v1_no_continual_seed${rmax_like.seed}.ckpt
     # Existing Crafter validation files use different map shapes/layouts.
     # Re-enable this after collecting a validation split for this layout.
     validation_data_dir: null
     continual_learning:
-      # The normal pipeline remains single-environment unless explicitly enabled.
+      # The normal pipeline remains -environment unless explicitly enabled.
       enabled: False
       resume: False
       allow_legacy_dataset: false
-      state_path: ${oc.env:MODEL_FPATH}/AttentionWM/continual_crafter_${domains.crafter.task_name}_continue_effect_state.pt
-      replay_path: ${oc.env:MODEL_FPATH}/AttentionWM/continual_crafter_${domains.crafter.task_name}_continue_effect_replay.pt
-      final_checkpoint: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_crafter_${domains.crafter.task_name}_continue_effect.ckpt
-      metrics_path: ${oc.env:MODEL_FPATH}/AttentionWM/continual_crafter_${domains.crafter.task_name}_continue_effect_metrics.csv
-      # P2E acquisition has separate resumable state and final artifacts.
-      p2e_state_path: ${oc.env:MODEL_FPATH}/AttentionWM/continual_crafter_${domains.crafter.task_name}_p2e_continue_effect_state.pt
-      p2e_replay_path: ${oc.env:MODEL_FPATH}/AttentionWM/continual_crafter_${domains.crafter.task_name}_p2e_continue_effect_replay.pt
-      p2e_final_checkpoint: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_crafter_${domains.crafter.task_name}_p2e_continue_effect.ckpt
-      p2e_metrics_path: ${oc.env:MODEL_FPATH}/AttentionWM/continual_crafter_${domains.crafter.task_name}_p2e_continue_effect_metrics.csv
+      state_path: ${oc.env:MODEL_FPATH}/AttentionWM/continual_crafter_${domains.crafter.task_name}_continue_effect_inventory_gate_natural_v2_replay_only_v1_state.pt
+      replay_path: ${oc.env:MODEL_FPATH}/AttentionWM/continual_crafter_${domains.crafter.task_name}_continue_effect_inventory_gate_natural_v2_replay_only_v1_replay.pt
+      final_checkpoint: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_crafter_${domains.crafter.task_name}_continue_effect_inventory_gate_natural_v2_replay_only_v1.ckpt
+      metrics_path: ${oc.env:MODEL_FPATH}/AttentionWM/continual_crafter_${domains.crafter.task_name}_continue_effect_inventory_gate_natural_v2_replay_only_v1_metrics.csv
       # A completed final artifact is authoritative. Set pipeline.force=true
       # when a fresh continual run is intentionally required.
       skip_if_final_checkpoint_exists: true
@@ -74,10 +74,11 @@ domains:
       force_collection: false
       replay_buffer_size: 100000
       replay_frac: 0.5
+      # These phases share local Crafter dynamics. Historical transitions are
+      # retained by replay alone; EWC and Fisher are fully disabled.
+      ewc_enabled: false
       current_sample_ratio: 0.3
-      salient_sample_ratio: 0.5
-      fisher_samples: 3000
-      fisher_beta: 0.5
+      salient_sample_ratio: 0.0
       validate_after_each_phase: true
       # The default task stays unchanged. Later phases overlap adjacent
       # progression boundaries and use separate layouts only when a crafting
@@ -91,14 +92,12 @@ domains:
           task_name: crafter_progression_small
           layout_path: ${oc.env:ENV_PATH}/crafter/crafter_progression_small.txt
           data_dir: ${oc.env:TRAIN_DATASET_PATH}/crafter_crafter_progression_small_inv_default_random.npz
-          p2e_data_dir: ${oc.env:TRAIN_DATASET_PATH}/crafter_crafter_progression_small_inv_default_p2e.npz
           initial_inventory: {}
           validation_data_dir: null
         - name: wood_ready
           task_name: crafter_progression_small
           layout_path: ${oc.env:ENV_PATH}/crafter/crafter_progression_small.txt
           data_dir: ${oc.env:TRAIN_DATASET_PATH}/crafter_crafter_progression_small_inv_wood_ready_random.npz
-          p2e_data_dir: ${oc.env:TRAIN_DATASET_PATH}/crafter_crafter_progression_small_inv_wood_ready_p2e.npz
           # Enough wood to place a table and craft one wooden tool, but do not
           # grant the tool itself: this phase learns the default->wood bridge.
           initial_inventory: {health: 9, food: 9, drink: 9, energy: 9, wood: 3}
@@ -107,17 +106,15 @@ domains:
           task_name: crafter_progression_small
           layout_path: ${oc.env:ENV_PATH}/crafter/crafter_progression_small_stone_ready.txt
           data_dir: ${oc.env:TRAIN_DATASET_PATH}/crafter_crafter_progression_small_inv_stone_ready_random.npz
-          p2e_data_dir: ${oc.env:TRAIN_DATASET_PATH}/crafter_crafter_progression_small_inv_stone_ready_p2e.npz
           # A nearby table makes stone recipes observable. Stone also covers
           # furnace placement; the wooden pickaxe preserves the prior-stage
           # prerequisite instead of jumping directly to a stone tool.
-          initial_inventory: {health: 9, food: 9, drink: 9, energy: 9, wood: 3, stone: 5, coal: 2, wood_pickaxe: 1}
+          initial_inventory: {health: 9, food: 9, drink: 9, energy: 9, wood: 3, stone: 2, coal: 2, wood_pickaxe: 1}
           validation_data_dir: null
         - name: iron_ready
           task_name: crafter_progression_small
           layout_path: ${oc.env:ENV_PATH}/crafter/crafter_progression_small_iron_ready.txt
           data_dir: ${oc.env:TRAIN_DATASET_PATH}/crafter_crafter_progression_small_inv_iron_ready_random.npz
-          p2e_data_dir: ${oc.env:TRAIN_DATASET_PATH}/crafter_crafter_progression_small_inv_iron_ready_p2e.npz
           # Table and furnace are present in this phase layout. Give the
           # ingredients and a stone pickaxe, not the iron pickaxe, so the data
           # contains make_iron_pickaxe before collect_diamond.
@@ -133,7 +130,9 @@ domains:
     observation_schema:
       - {name: layout_object_effect, distribution: categorical_effect, prediction_slice: [0, 21], target_index: 0, classes: 20, label_smoothing: 0.0}
       - {name: layout_direction_effect, distribution: categorical_effect, prediction_slice: [21, 27], target_index: 1, classes: 5, label_smoothing: 0.0}
-      - {name: inventory, distribution: symlog_mse, prediction_source: auxiliary, target_source: inventory, target_mode: delta}
+      # Survival retains KEEP/SET_TO effects. Each item uses an unweighted
+      # KEEP/CHANGE gate and predicts 0..9 only when the target changed.
+      - {name: inventory, distribution: categorical_inventory_gate, prediction_source: auxiliary, target_source: inventory, target_mode: categorical_gate, classes: 10}
     # Policy-specific settings for Crafter WM planning:
     # Object ID of the "success" tile (diamond=10 for minitask_01).
     success_obj_id: 10
@@ -155,7 +154,7 @@ domains:
       uniform_reset_steps: 5000
     policy:
       max_ep_len: 1000
-      rollout_steps: 4096
+      rollout_steps: 16384
       max_training_timesteps: 1536000
       total_test_episodes: 1000
     grid_shape: [3, 0, 0]
@@ -231,54 +230,66 @@ domains:
       - {name: lidar_near, distribution: mse, indices: [14, 15, 16, 17, 18]}
       - {name: lidar_far, distribution: mse, indices: [19, 20, 21, 22, 23]}
 
-# Plan2Explore acquisition for Crafter WM datasets. P2E alternates short real
-# collection rounds with updates to a transient WM, disagreement ensemble and
-# intrinsic-reward PPO explorer. The canonical continual WM is trained on the
-# resulting datasets afterwards.
+# RMax-like acquisition trains PPO only from real-environment count novelty.
+# Its train and frozen phases share the fixed WM acquisition budget.
+rmax_like:
+  enabled: True
+  train_steps: 360000
+  frozen_steps: 40000
+  num_envs: 8
+  mask_size: 5
+  reward_scale: 1.0
+  # Positive magnitude applied as -death_penalty on true death only.
+  # Time-limit truncation is not penalized; set to 0.0 for the old behavior.
+  death_penalty: 5.0
+  # Fixed acquisition seed. The five PPO.seed values share this dataset/WM.
+  seed: 0
+  rollout_steps: 4096
+  start_method: spawn
+  checkpoint_path: ${oc.env:MODEL_FPATH}/Policy/explorer_crafter_${domains.crafter.task_name}_rmax_count_local5_inv12_v1_no_continual_seed${rmax_like.seed}.ckpt
+  coverage_path: ${oc.env:PROJECT_ROOT}/outputs/dataset_visualization/${domains.crafter.task_name}_rmax_count_local5_inv12_v1_no_continual_seed${rmax_like.seed}_coverage.png
+  # The count explorer has a positive, non-stationary reward, so keep its PPO
+  # optimization independent from the final task-policy settings.
+  lr_actor: 3.0e-4
+  lr_critic: 3.0e-4
+  gamma: 0.999
+  K_epochs: 4
+  eps_clip: ${PPO.eps_clip}
+  action_std: ${PPO.action_std}
+  entropy_coef: 0.005
+  normalize_advantages: true
+  normalize_returns: true
+  max_grad_norm: 0.5
+
+# Official DreamerV2 Plan2Explore acquisition for a single Crafter layout.
+# The online Attention WM, disagreement ensemble, and imagined actor-critic
+# are checkpointed together; native Crafter reward is retained only for data
+# diagnostics.
 p2e:
-  enabled: true
-  # One 4k random bootstrap plus 24 P2E chunks keeps the single-layout
-  # collection budget at exactly 100k transitions.
-  cycles_per_phase: 24
-  bootstrap_steps: 4000
-  bootstrap_wm_epochs: 10
-  bootstrap_disag_epochs: 5
+  enabled: False
+  total_steps: 100000
+  prefill_steps: 10000
+  train_every: 5
+  train_steps: 1
+  replay_capacity: 2000000
+  replay_batch_size: 16
+  replay_sequence_length: 50
   num_models: 10
+  ensemble_lr: 3.0e-4
   intrinsic_reward_scale: 1.0
-  # Disagreement remains the main P2E signal. The small task-aware terms only
-  # prevent curiosity from preferring fatal or non-progressing trajectories.
-  intrinsic_disagreement_weight: 1.0
-  intrinsic_progression_weight: 0.25
-  intrinsic_survival_weight: 0.05
-  intrinsic_death_penalty: 0.5
-  intrinsic_disagreement_clip: 5.0
-  disag_lr: 1.0e-4
-  disag_epochs: 1
-  batch_size: 256
-  encode_batch_size: 512
-  target_type: delta
-  bootstrap_heads: true
   inventory_scale: 9.0
-  imagined_batch_size: 64
   imagined_horizon: 15
-  imagined_batches_per_cycle: 4
-  ppo_lr_actor: 3.0e-4
-  ppo_lr_critic: 1.0e-3
-  ppo_gamma: 0.99
-  ppo_k_epochs: 2
-  ppo_eps_clip: 0.2
-  ppo_entropy_coef: 0.03
-  ppo_normalize_advantages: true
-  ppo_normalize_returns: false
-  ppo_max_grad_norm: 0.5
-  wm_epochs_per_cycle: 3
-  # Fine-tune the same online WM on the complete single-environment P2E
-  # dataset before handing it to planning; never restart from random weights.
-  final_wm_epochs: 5
-  show_wm_progress: false
-  replay_buffer_size: 30000
-  replay_add_ratio: 0.5
-  salient_sample_ratio: 0.5
+  gamma: 0.999
+  discount_lambda: 0.95
+  actor_lr: 1.0e-4
+  critic_lr: 1.0e-4
+  actor_entropy: 3.0e-3
+  amp: true
+  slow_target_update: 100
+  checkpoint_every: 100000
+  resume: true
+  checkpoint_path: ${oc.env:MODEL_FPATH}/AttentionWM/p2e_official_dv2_attnwm_v1_inventory_gate_natural_v2_seed${PPO.seed}.pt
+  log_every: 1000
 
 
 attention_model:
@@ -289,13 +300,15 @@ attention_model:
   grid_shape: ${domains.${domain}.grid_shape}
   attention_mask_size: ${domains.${domain}.attention_mask_size}
   batch_size: 1024  # larger batch → better GPU utilization
-  n_cpu: 4  # 4 workers is enough; too many causes overhead
+  # In-memory continual replay is already resident in the parent process;
+  # worker copies can exhaust shared memory when current + replay exceeds 100k.
+  n_cpu: 0
   embed_dim: 128  # 128 64/128/256
   num_heads: 1   # 1 if the embed_dim is 64, num_heads should better be 1
   data_dir: ${env.collect.data_save_path}
   # After training on data_dir, validate on this second dataset (set to null to skip)
   validation_data_dir: ${domains.${domain}.validation_data_dir}
-  n_epochs: 10 # 30
+  n_epochs: 30 # 30
   lr: 5e-4 # 1e-4 
   wd: 1e-5
   obs_norm_values: ${domains.${domain}.obs_norm_values}
@@ -328,19 +341,6 @@ attention_model:
   # Compact WM/PPO actions preserve historical IDs 0-4 and append drop as 5.
   # Native MiniGrid IDs are [0, 1, 2, 3, 5, 4]; only native done (6) is excluded.
   action_map: {0: 'left', 1: 'right', 2: 'forward', 3: 'pickup', 4: 'toggle', 5: 'drop'}
-  lambda_ewc: 100         # EWC regularization strength
-  ewc_ratio: 0.2           # Adaptive ratio target; set to `null` for manual control
-  lambda_ema: 0.1
-  lambda_ewc_min: 10
-  lambda_ewc_max: 1.0e3
-  scale_factor: 1.0
-  drift_threshold: null     # Learned automatically during warmup when left unset
-  warmup_steps: 100
-  drift_cooldown: 200
-  drift_hi: 1.10
-  drift_lo: 0.70
-  drift_up_step: 0.10
-  drift_down_step: 0.05
   replay_frac: 0.5
 
 # 2. data collection
@@ -364,7 +364,7 @@ env:
     mini_dataset_size: ${domains.${domain}.data_collection.mini_dataset_size}
     maximum_dataset_size: ${domains.${domain}.data_collection.maximum_dataset_size}
     data_save_path: ${domains.${domain}.data_save_path}
-    save_coverage_visualize: False
+    save_coverage_visualize: True
     visualize_save_path: ${oc.env:PROJECT_ROOT}/outputs/dataset_visualization
     visualize_filename: ${domains.${domain}.visualize_filename}
     save_env_visualize: False
@@ -381,10 +381,18 @@ PPO:
   num_real_envs: 8
   real_env_backend: subprocess
   real_env_start_method: spawn
+  # Online, memory-bounded coverage for real Crafter PPO rollouts. The same
+  # image is refreshed whenever the policy checkpoint is saved and at exit.
+  save_real_env_coverage: True
+  real_env_coverage_save_path: ${oc.env:PROJECT_ROOT}/outputs/real_env_coverage
+  real_env_coverage_filename: ${domains.crafter.task_name}_realenv_seed${PPO.seed}_coverage.png
   action_set: a6_drop_inventory  # Six actions + colour-aware inventory observation; preserves older checkpoints.
   # Change this value for independent runs. It controls PPO initialization,
   # stochastic actions, and MiniGrid reset randomness in both real and WM modes.
   seed: 0
+  # Separates the single-environment RMax/no-continual policy checkpoint,
+  # WandB group/run, and the shared multi-seed validation CSV.
+  experiment_label: rmax_no_continual_1wm
   env_type: ${domains.${domain}.env_type}
   has_continuous_action_space: False
   # Maximum actions before an unfinished episode resets. Increase this with
@@ -396,7 +404,6 @@ PPO:
   # episodes.
   max_ep_len: ${domains.${domain}.policy.max_ep_len}
   action_std: 0.1  # set same std for action distribution which was used while saving
-  i_episode: 0
   K_epochs: 8  # update policy for K epochs
   eps_clip: 0.2  # clip parameter for PPO
   gamma: 0.99  # discount factor
@@ -411,7 +418,7 @@ PPO:
   num_imagined_envs: ${oc.select:domains.${domain}.policy.num_imagined_envs,64}
   # Zero is the usual choice when deterministic argmax performance matters;
   # positive entropy explicitly rewards keeping the policy stochastic.
-  entropy_coef: 0.001
+  entropy_coef: 0.005
   normalize_advantages: True
   normalize_returns: False
   max_grad_norm: 0.5
@@ -431,13 +438,12 @@ PPO:
   regret_eval_freq: 5000
   regret_eval_episodes: 5
   episodes_eval: 10
-  wandb_project: minigrid_policy_training
+  wandb_project: ${domain}_policy_training
   wandb_entity: null  # null uses the default entity from your `wandb login`
   # Runtime grouping is automatic and layout-specific. Planning preserves
   # <domain>_<task_name>_policy; real training uses
   # <domain>_<task_name>_realenv_policy. Each group contains its seed runs.
   rolling_window_episodes: 50  # WandB rolling metrics use the latest N episodes
-  time_step: 0
   max_training_timesteps: ${domains.${domain}.policy.max_training_timesteps}
   action_std_decay_freq: 2.5e5
   action_std_decay_rate: 0.05
@@ -458,16 +464,3 @@ PPO:
   save_csv: True
   save_path_csv: ${oc.env:PROJECT_ROOT}/modelBased/visulization/PPO/PPO_csv
   use_wandb: True
-
-test_env:
-  visualize: False
-  time_limit: 256 #max number of steps for each rollout 600
-  env_name: MiniGrid-Empty-8x8-v0 #MiniGrid-Dynamic-Obstacles-8x8-v0 #MiniGrid-Empty-5x5-v0 #MiniGrid-Empty-8x8-v0 #MiniGrid-Empty-Random-6x6-v0 
-  n_rollouts: 1000
-
-# 4. Rmax
-R_max:
-  R_max: 1
-  exploration_timesteps: 1e4
-  num_iterations: 1
-  exploration_threshold: 10

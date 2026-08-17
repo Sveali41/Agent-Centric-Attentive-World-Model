@@ -14,12 +14,13 @@ import numpy as np
 from domain.crafter.crafter_custom_env import CustomCrafterEnv
 
 
-def _worker(remote, layout_path: str, max_steps: int, seed: int) -> None:
+def _worker(remote, layout_path: str, max_steps: int, seed: int, initial_inventory=None) -> None:
     """Run one environment and communicate only through the pipe."""
     env = CustomCrafterEnv(
         txt_file_path=layout_path,
         max_steps=max_steps,
         seed=seed,
+        initial_inventory=initial_inventory or {},
     )
     try:
         while True:
@@ -50,6 +51,7 @@ class CrafterSubprocessVectorEnv:
         num_envs: int,
         seed: int,
         start_method: str = "spawn",
+        initial_inventory: dict[str, float] | None = None,
     ) -> None:
         if num_envs < 1:
             raise ValueError("num_envs must be at least 1")
@@ -70,7 +72,7 @@ class CrafterSubprocessVectorEnv:
         ):
             process = context.Process(
                 target=_worker,
-                args=(worker_remote, layout_path, int(max_steps), int(seed) + index),
+                args=(worker_remote, layout_path, int(max_steps), int(seed) + index, initial_inventory or {}),
                 daemon=True,
             )
             process.start()

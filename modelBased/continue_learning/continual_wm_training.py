@@ -1,10 +1,9 @@
 """Continual world-model training over an ordered sequence of environments.
 
 This is the current replacement for the legacy curriculum-learning entry
-point.  A single AttentionWorldModel is carried through every phase.  Each
-phase trains on its current transitions plus a bounded Fisher replay buffer,
-then consolidates the resulting parameters and Fisher estimate for the next
-phase.
+point. A single AttentionWorldModel is carried through every phase. Each phase
+trains on its current transitions plus a bounded replay buffer. EWC and Fisher
+estimation are intentionally disabled for this shared-dynamics curriculum.
 """
 
 from __future__ import annotations
@@ -23,11 +22,11 @@ import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
 
-from modelBased.common.dataset_identity import dataset_matches, dataset_metadata
+from modelBased.common.artifacts import dataset_matches, dataset_metadata
 from modelBased.continue_learning.fisher_buffer import FisherReplayBuffer
 from modelBased.world_model import AttentionWM_training
 from modelBased.world_model.AttentionWM import AttentionWorldModel
-from modelBased.common.artifact_naming import (
+from modelBased.common.artifacts import (
     continual_artifact_path,
     continual_phase_data_path,
     world_model_checkpoint_path,
@@ -112,8 +111,7 @@ def _phase_cfg(base_cfg: DictConfig, phase: ContinualPhase, max_shape: tuple[int
 
     continual_cfg = domain_cfg.get("continual_learning", {})
     attention_cfg["replay_frac"] = float(continual_cfg.get("replay_frac", 0.5))
-    attention_cfg["fisher_samples"] = int(continual_cfg.get("fisher_samples", 3000))
-    attention_cfg["fisher_beta"] = float(continual_cfg.get("fisher_beta", 0.5))
+    attention_cfg["ewc_enabled"] = bool(continual_cfg.get("ewc_enabled", False))
 
     return OmegaConf.create(raw)
 
@@ -188,6 +186,7 @@ def _architecture_signature(cfg: DictConfig, channels: int) -> dict[str, Any]:
         "action_norm_values": int(cfg.attention_model.action_norm_values),
         "inventory_dim": int(getattr(domain_cfg, "inventory_dim", 0)),
         "observation_schema": schema,
+        "continual_regularizer": "replay_only_v1",
     }
 
 
@@ -517,8 +516,10 @@ def run_continual(cfg: DictConfig) -> dict[str, Any]:
         state = _load_state(state_path)
         _validate_resume_state(state, cfg, phases, architecture)
         next_phase_index = int(state["next_phase_index"])
-        old_params = state.get("old_params")
-        fisher = state.get("fisher")
+        if state.get("old_params") is not None or state.get("fisher") is not None:
+            raise ValueError("Replay-only continual state must not contain EWC/Fisher tensors")
+        old_params = None
+        fisher = None
         history = list(state.get("phase_history", []))
         if state.get("model_state_dict"):
             net.load_state_dict(state["model_state_dict"], strict=True)
@@ -543,10 +544,10 @@ def run_continual(cfg: DictConfig) -> dict[str, Any]:
     for index in range(next_phase_index, len(phases)):
         phase = phases[index]
         phase_cfg = _phase_cfg(cfg, phase, max_shape)
-        # Fisher is only needed to regularize a later phase.  Computing it for
-        # the final configured phase adds an expensive per-sample backward pass
-        # without affecting this run's final model or validation metrics.
-        phase_cfg.attention_model.compute_fisher = index < len(phases) - 1
+        # Replay-only continual learning never performs the expensive
+        # per-sample Fisher backward passes.
+        phase_cfg.attention_model.ewc_enabled = False
+        phase_cfg.attention_model.compute_fisher = False
         phase_dir = state_path.parent / f"{state_path.stem}_phase_{index}"
         phase_cfg.attention_model.checkpoint_dir = str(phase_dir)
         # Do not expose an intermediate phase as the canonical final model.
@@ -584,8 +585,8 @@ def run_continual(cfg: DictConfig) -> dict[str, Any]:
             fit_ckpt_path=fit_ckpt,
         )
         old_params = result.get("old_params")
-        if old_params is None:
-            old_params = net.save_old_params()
+        if old_params is not None or fisher is not None:
+            raise RuntimeError("Replay-only continual training produced unexpected EWC state")
         _set_map_shape(net, channels, max_shape)
 
         buffer.update_combined(
@@ -632,7 +633,6 @@ def run_continual(cfg: DictConfig) -> dict[str, Any]:
             "phase_name": phase.name,
             "transitions": phase.transitions,
             "replay_size": len(buffer),
-            "fisher_samples": int(getattr(continual_cfg, "fisher_samples", 3000)),
             "validations": validations,
             "best_validation_loss": next(
                 (item["loss"] for item in validations if item["phase_index"] == index),

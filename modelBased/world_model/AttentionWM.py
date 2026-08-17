@@ -9,9 +9,12 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from typing import List, Dict, Union
 from modelBased.common import utils
-from modelBased.common.categorical_effects import (
+from modelBased.world_model.crafter_dynamics import (
     balanced_categorical_effect_loss,
     categorical_effect_target,
+    crafter_inventory_gate_loss,
+    decode_crafter_inventory,
+    validate_discrete_inventory,
 )
 from domain.minigrid import minigrid_support as minigrid_utils
 from domain.crafter.crafter_support import (
@@ -25,6 +28,45 @@ import pandas as pd
 import numpy as np
 
 
+def _remove_legacy_sharded_tensor_state_hooks(module: nn.Module) -> int:
+    """Remove obsolete Lightning hooks from models without ShardedTensors.
+
+    The PyTorch Lightning version used by this project registers the legacy
+    ShardedTensor save/load hooks on every ``LightningModule``.  The save hook
+    scans every value in ``module.__dict__``.  Once a Trainer-owned weak proxy
+    expires, merely calling ``state_dict()`` can therefore raise
+    ``ReferenceError: weakly-referenced object no longer exists`` even though
+    this model contains only ordinary tensors.
+
+    Only the two known ShardedTensor compatibility hooks are removed; all
+    other PyTorch and project checkpoint hooks are preserved.
+    """
+    removed = 0
+    hook_groups = (
+        ("_state_dict_hooks", {"state_dict_hook"}),
+        ("_load_state_dict_pre_hooks", {"pre_load_state_dict_hook"}),
+    )
+    sharded_modules = {
+        "torch.distributed._shard.sharded_tensor",
+        "torch.distributed._sharded_tensor",
+    }
+    for attr_name, expected_names in hook_groups:
+        hooks = getattr(module, attr_name, None)
+        if hooks is None:
+            continue
+        for key, hook in list(hooks.items()):
+            # PyTorch wraps load pre-hooks in _WrappedHook; its original
+            # function is available as ``hook`` (and as ``__wrapped__``).
+            function = getattr(hook, "hook", getattr(hook, "__wrapped__", hook))
+            if (
+                getattr(function, "__module__", "") in sharded_modules
+                and getattr(function, "__name__", "") in expected_names
+            ):
+                del hooks[key]
+                removed += 1
+    return removed
+
+
 class AttentionWorldModel(pl.LightningModule):
     def __init__(self, hparams):
         super().__init__()
@@ -36,10 +78,7 @@ class AttentionWorldModel(pl.LightningModule):
         self.visualize_every = hparams.visualize_every
         self.step_counter = 0  
         self.data_type = hparams.data_type
-        self.ewc_ratio = getattr(hparams, "ewc_ratio", 0.2)           # Target ratio: EWC ~= 20% of obs_loss; set null in yaml to disable manual control.
-        self.lambda_ema = getattr(hparams, "lambda_ema", 0.1)         # EMA smoothing factor for lambda.
-        self.lambda_ewc_min = getattr(hparams, "lambda_ewc_min", 1e-4)
-        self.lambda_ewc_max = getattr(hparams, "lambda_ewc_max", 1e3)
+        self.ewc_enabled = bool(getattr(hparams, "ewc_enabled", False))
         self.lambda_ewc = float(getattr(hparams, "lambda_ewc", 1.0))
         self.loss_accumulator = [[[] for _ in range(self.col)] for _ in range(self.row)]
         self.loss_map_result = None
@@ -47,13 +86,6 @@ class AttentionWorldModel(pl.LightningModule):
         self.inventory_loss_accumulator = []
         self._val_step_outputs = []
 
-
-
-        # Slow outer-loop drift controller.
-        self.warmup_steps = getattr(hparams, "warmup_steps", 100)
-        self.drift_cooldown = getattr(hparams, "drift_cooldown", 200)  # Minimum steps between adjustments.
-        self._last_drift_update_step = -10**9
-        self.drift_threshold = getattr(hparams, "drift_threshold", 1e-3)
         self.fisher = 0
         self.old_params = None
         self.env_type = hparams.env_type
@@ -87,6 +119,33 @@ class AttentionWorldModel(pl.LightningModule):
                 module_kwargs["crafter_output_mode"] = (
                     "effect" if uses_effects else "absolute"
                 )
+                inventory_spec = next(
+                    (
+                        spec for spec in self.observation_schema
+                        if str(spec.get("name", "")) == "inventory"
+                    ),
+                    None,
+                )
+                if inventory_spec is None:
+                    raise ValueError("Crafter observation schema must define inventory")
+                inventory_distribution = str(
+                    inventory_spec.get("distribution", "")
+                )
+                inventory_target_mode = str(
+                    inventory_spec.get("target_mode", "")
+                )
+                if (
+                    inventory_distribution != "categorical_inventory_gate"
+                    or inventory_target_mode != "categorical_gate"
+                ):
+                    raise ValueError(
+                        "Crafter inventory must use categorical_inventory_gate "
+                        "distribution and categorical_gate target_mode"
+                    )
+                module_kwargs["crafter_inventory_classes"] = int(
+                    inventory_spec.get("classes", 10)
+                )
+                module_kwargs["crafter_inventory_output_mode"] = inventory_target_mode
             self.model = module_class(
                 hparams.data_type,
                 hparams.grid_shape,
@@ -112,6 +171,10 @@ class AttentionWorldModel(pl.LightningModule):
                 "bipedal_train_token_losses.csv",
             )
         self.save_hyperparameters(hparams)
+        # This model never owns torch.distributed ShardedTensor attributes.
+        # Removing Lightning's legacy compatibility hooks prevents checkpoint
+        # saves from inspecting expired Trainer weak references.
+        _remove_legacy_sharded_tensor_state_hooks(self)
 
 
     def save_old_params(self):
@@ -126,99 +189,6 @@ class AttentionWorldModel(pl.LightningModule):
     #     for n, p in self.named_parameters():
     #         if n in old_params:
     #             p.data.copy_(old_params[n])  # Overwrite the current parameter with the saved value.
-
-    def compute_avg_param_drift(self) -> float:
-        drift_sum = 0.0
-        num = 0
-        for name, param in self.named_parameters():
-            if self.old_params is not None and name in self.old_params:
-                drift = (param - self.old_params[name].to(param.device)).pow(2).mean()
-                drift_sum += drift.item()
-                num += 1
-        avg_drift = drift_sum / max(num, 1)
-        return avg_drift
-
-    def update_lambda_ewc_by_ratio(self, obs_loss: torch.Tensor, ewc_raw: torch.Tensor, r: float | None):
-        """
-        [DEPRECATED / FIXED]
-        Originally attempted to dynamically scale lambda based on loss ratio.
-        Removed to ensure stability. Now uses fixed self.lambda_ewc.
-        """
-        pass 
-        # Keep lambda updates independent from inverse-drift heuristics.
-        # This caused exploding updates or vanishing constraints.
-        # We rely on fixed lambda_ewc set in config.
-
-    def update_lambda_ewc(self, avg_drift: float):
-        """
-        Slow outer-loop controller for `lambda` based on average parameter drift.
-        It complements the fast ratio controller by:
-        - learning `drift_threshold` during warmup when it is unset
-        - using a cooldown window to reduce interference with fast updates
-        - applying hysteresis so adjustments happen only outside a safe band
-        - updating in log space, then smoothing with EMA and clamping to bounds
-        """
-        import math
-        import torch
-
-        # Protective defaults.
-        if not hasattr(self, "lambda_ewc"):
-            self.lambda_ewc = float(getattr(self.hparams, "lambda_ewc", 1.0))
-        if not hasattr(self, "_drift_values"):
-            self._drift_values = []
-        if not hasattr(self, "_last_drift_update_step"):
-            self._last_drift_update_step = -10**9
-
-        # Read hyperparameters, allowing overrides from `hparams` or instance attributes.
-        warmup_steps = getattr(self.hparams, "warmup_steps", getattr(self, "warmup_steps", 100))
-        cooldown = getattr(self.hparams, "drift_cooldown", getattr(self, "drift_cooldown", 200))
-        hi_ratio = getattr(self.hparams, "drift_hi", 1.10)  # Increase only above 110% of the threshold.
-        lo_ratio = getattr(self.hparams, "drift_lo", 0.70)  # Decrease only below 70% of the threshold.
-        up_step = getattr(self.hparams, "drift_up_step", 0.10)  # Log-space step size for increasing lambda.
-        down_step = getattr(self.hparams, "drift_down_step", 0.05)  # Log-space step size for decreasing lambda.
-        lam_min = getattr(self.hparams, "lambda_ewc_min", getattr(self, "lambda_ewc_min", 1e-4))
-        lam_max = getattr(self.hparams, "lambda_ewc_max", getattr(self, "lambda_ewc_max", 1e3))
-        lam_ema = getattr(self.hparams, "lambda_ema", getattr(self, "lambda_ema", 0.1))
-
-        # Log drift statistics.
-        self.log("train/avg_param_drift", avg_drift)
-
-        # During warmup, infer the threshold from the running drift mean if needed.
-        if getattr(self, "drift_threshold", None) is None:
-            self._drift_values.append(float(avg_drift))
-            if len(self._drift_values) >= warmup_steps:
-                self.drift_threshold = float(sum(self._drift_values) / len(self._drift_values))
-                print(f"[Auto-tuned] drift_threshold set to {self.drift_threshold:.6f}")
-            # Do not adjust lambda during warmup.
-            return
-
-        # Cooldown prevents frequent interference with the fast controller.
-        if self.global_step - self._last_drift_update_step < cooldown:
-            return
-
-        # Only adjust outside the hysteresis band.
-        hi = self.drift_threshold * hi_ratio
-        lo = self.drift_threshold * lo_ratio
-
-        lam = float(max(self.lambda_ewc, lam_min))
-        lam_log = math.log(lam)
-        changed = False
-
-        if avg_drift > hi:
-            lam_log += up_step
-            changed = True
-        elif avg_drift < lo:
-            lam_log -= down_step
-            changed = True
-
-        if changed:
-            lam_new = math.exp(lam_log)
-            # Clamp to configured bounds.
-            lam_new = float(torch.clamp(torch.tensor(lam_new), lam_min, lam_max))
-            # Apply EMA smoothing.
-            self.lambda_ewc = (1.0 - lam_ema) * self.lambda_ewc + lam_ema * lam_new
-            # Update the last-adjustment step.
-            self._last_drift_update_step = self.global_step
 
     def load_old_params(self, old_params):
         device = next(self.parameters()).device
@@ -401,13 +371,9 @@ class AttentionWorldModel(pl.LightningModule):
             self.old_params = {k: v.detach().cpu().float() for k, v in old_params.items()}
 
             if load_weights:
-                # [FIX] Clear all hooks that might cause ReferenceError in state_dict() or weight loading
-                if hasattr(self, "_state_dict_hooks"):
-                    self._state_dict_hooks.clear()
-                if hasattr(self, "_parameters"):
-                    for p_name, p in self._parameters.items():
-                        if p is not None and hasattr(p, "_hooks"):
-                            p._hooks.clear()
+                # Preserve unrelated hooks and remove only the obsolete
+                # ShardedTensor compatibility hooks described above.
+                _remove_legacy_sharded_tensor_state_hooks(self)
 
                 # Directly load without the complex state_dict() dance to avoid hooks
                 # strict=False allows missing or mismatched keys without crashing
@@ -647,10 +613,15 @@ class AttentionWorldModel(pl.LightningModule):
                     if inv is None:
                         raise ValueError(f"Inventory delta field '{name}' requires the current inventory")
                     target = target - inv.float()
-                elif target_mode != "absolute":
+                elif target_mode not in {"absolute", "categorical_effect", "categorical_gate"}:
                     raise ValueError(
                         f"Unknown inventory target_mode '{target_mode}' for field '{name}'"
                     )
+                if target_mode in {"categorical_effect", "categorical_gate"}:
+                    if inv is None:
+                        raise ValueError("Missing current discrete inventory")
+                    validate_discrete_inventory(inv, "current")
+                    validate_discrete_inventory(inv_next, "next")
             else:
                 if "target_index" in spec:
                     target_index = int(spec["target_index"])
@@ -680,22 +651,37 @@ class AttentionWorldModel(pl.LightningModule):
                     prediction, target.clamp(0.0, 1.0)
                 ) / math.log(2.0)
             elif distribution == "categorical_effect":
-                if obs_prev is None:
-                    raise ValueError(
-                        f"Categorical effect field '{name}' requires the current observation"
-                    )
-                if "target_index" not in spec:
-                    raise ValueError(
-                        f"Categorical effect field '{name}' requires target_index"
-                    )
-                current_frame = obs_prev[:, -obs_next.size(1):, ...]
-                current = current_frame[:, int(spec["target_index"])]
+                if target_source == "inventory":
+                    if inv is None:
+                        raise ValueError(
+                            f"Categorical inventory effect field '{name}' requires current inventory"
+                        )
+                    current = inv
+                else:
+                    if obs_prev is None:
+                        raise ValueError(
+                            f"Categorical effect field '{name}' requires the current observation"
+                        )
+                    if "target_index" not in spec:
+                        raise ValueError(
+                            f"Categorical effect field '{name}' requires target_index"
+                        )
+                    current_frame = obs_prev[:, -obs_next.size(1):, ...]
+                    current = current_frame[:, int(spec["target_index"])]
                 effect_target = categorical_effect_target(current, target)
                 fields[name] = balanced_categorical_effect_loss(
                     prediction,
                     effect_target,
-                    reduction="balanced_mean",
+                    reduction=str(spec.get("effect_reduction", "balanced_mean")),
                     label_smoothing=float(spec.get("label_smoothing", 0.0)),
+                )
+            elif distribution == "categorical_inventory_gate":
+                if target_source != "inventory" or inv is None or inv_next is None:
+                    raise ValueError(
+                        "categorical_inventory_gate requires current and next inventory"
+                    )
+                fields[name], _ = crafter_inventory_gate_loss(
+                    prediction, inv, inv_next
                 )
             elif distribution == "mse":
                 fields[name] = F.mse_loss(prediction, target)
@@ -836,10 +822,11 @@ class AttentionWorldModel(pl.LightningModule):
                     accuracy = ((torch.sigmoid(logits) >= 0.5).float() == target).float().mean()
                     self.train_token_acc_accumulator[token_name].append(float(accuracy.detach().cpu()))
 
-        # EWC remains an optimization regularizer, not a second observation objective.
-        ewc_raw = self.ewc_loss()
-        self.update_lambda_ewc_by_ratio(observation_loss, ewc_raw, self.ewc_ratio)
-        optimization_objective = observation_loss + self.lambda_ewc * ewc_raw
+        if self.ewc_enabled:
+            ewc_raw = self.ewc_loss()
+            optimization_objective = observation_loss + self.lambda_ewc * ewc_raw
+        else:
+            optimization_objective = observation_loss
 
         # One public training-loss curve for every domain.
         self.log(
@@ -938,10 +925,10 @@ class AttentionWorldModel(pl.LightningModule):
                 agent_pos = agent_position[i].tolist()  # (y, x)
                 self.accumulate_loss(loss_map[i], agent_pos)
             if self.env_type == 'crafter' and inv_pred is not None and inv_next is not None:
-                # The Crafter auxiliary head predicts inventory deltas.
-                inv_target = inv_next.float() - inv.float()
-                inv_slot_mse = F.mse_loss(inv_pred, inv_target, reduction='none').mean(dim=0)
-                self.inventory_loss_accumulator.append(inv_slot_mse.detach().cpu())
+                # Store per-slot categorical error rates for diagnostics.
+                inv_reconstructed = decode_crafter_inventory(inv, inv_pred)
+                inv_slot_error = inv_reconstructed.ne(inv_next.long()).float().mean(dim=0)
+                self.inventory_loss_accumulator.append(inv_slot_error.detach().cpu())
   
         if obs_next.dtype != obs_pred.dtype:
             obs_next = obs_next.float()
@@ -1018,12 +1005,13 @@ class AttentionWorldModel(pl.LightningModule):
                 self.loss_map_result = avg_sem.reshape(1, 5)
             else:
                 self.loss_map_result = np.zeros((1, 5), dtype=np.float32)
-            if self.env_type == 'crafter':
-                if len(self.inventory_loss_accumulator) > 0:
-                    stacked = torch.stack(self.inventory_loss_accumulator, dim=0)  # [num_batches, 16]
-                    self.inventory_loss_vector_result = stacked.mean(dim=0).numpy().astype(np.float32)
-                else:
-                    self.inventory_loss_vector_result = np.zeros(16, dtype=np.float32)
+        if getattr(self.hparams, "keep_cell_loss", False) and self.env_type == 'crafter':
+            if len(self.inventory_loss_accumulator) > 0:
+                stacked = torch.stack(self.inventory_loss_accumulator, dim=0)  # [num_batches, 16]
+                self.inventory_loss_vector_result = stacked.mean(dim=0).numpy().astype(np.float32)
+            else:
+                self.inventory_loss_vector_result = np.zeros(16, dtype=np.float32)
+        if getattr(self.hparams, "keep_cell_loss", False):
             self.inventory_loss_accumulator = []
             # Clear cell-level history to avoid memory growth across repeated validations.
             self.loss_accumulator = [[[] for _ in range(self.col)] for _ in range(self.row)]

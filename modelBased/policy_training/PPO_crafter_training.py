@@ -3,11 +3,11 @@
 Mirrors PPO_world_training.py but adapted for Crafter:
   - Observation: (2, H, W) — obj channel + dir channel
   - Actions: 17 (noop … make_iron_sword)
-  - Inventory: 16-dim continuous vector (health/food/drink/energy + 12 items)
+  - Inventory: 16 discrete counts (health/food/drink/energy + 12 items)
   - Reward/done: native Crafter health + first-achievement reward and
-    terminated/truncated semantics; target tile is evaluation-only
-  - WM map output: categorical effects (KEEP/SET_TO), reconstructed on the
-    current patch; inventory remains a numerical delta
+    terminated/truncated semantics; collect_diamond is evaluation-only success
+  - WM map and inventory output: categorical effects (KEEP/SET_TO), decoded
+    against the current state into integer next-state values
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ from omegaconf import DictConfig
 
 from modelBased.common import utils
 from modelBased.common.utils import PROJECT_ROOT  # re-import for clarity
-from modelBased.common.crafter_imagination import (
+from modelBased.world_model.crafter_dynamics import (
     imagined_crafter_step_batch as _shared_imagined_crafter_step_batch,
 )
 from modelBased.policy_training.PPO import PPO
@@ -37,11 +37,12 @@ from modelBased.policy_training.experiment_naming import (
     policy_checkpoint_path,
     policy_wandb_identity,
 )
-from modelBased.common.artifact_naming import world_model_checkpoint_path
+from modelBased.common.artifacts import world_model_checkpoint_path
 from modelBased.world_model import AttentionWM_support, Embedding_support, MLP_support
 from domain.crafter.crafter_custom_env import CustomCrafterEnv
 from domain.crafter.crafter_reward import ACHIEVEMENT_NAMES, native_reward_batch
 from domain.crafter.crafter_support import (
+    CrafterCoverageTracker,
     crafter_output_mode_from_state_dict,
     crafter_reconstruct_from_logits,
 )
@@ -152,8 +153,8 @@ def crafter_inventory_target_mode(observation_schema) -> str:
             str(field.get("name", "")) == "inventory"
             and str(field.get("target_source", "")) == "inventory"
         ):
-            return str(field.get("target_mode", "absolute"))
-    return "absolute"
+            return str(field.get("target_mode", "categorical_gate"))
+    return "categorical_gate"
 
 
 def crafter_checkpoint_output_mode(checkpoint_path: str | Path) -> str:
@@ -164,6 +165,22 @@ def crafter_checkpoint_output_mode(checkpoint_path: str | Path) -> str:
         weights_only=False,
     )
     state = raw.get("state_dict", raw)
+    inventory_width = next(
+        (
+            int(value.shape[0])
+            for key, value in state.items()
+            if key.endswith("inv_head.2.weight") and value.ndim == 2
+        ),
+        None,
+    )
+    expected_width = 4 * 11 + 12 * 2 + 12 * 10
+    if inventory_width != expected_width:
+        raise ValueError(
+            "Crafter checkpoint uses an incompatible inventory head: "
+            f"output width {inventory_width}, expected {expected_width} for "
+            "survival effects plus item gate/value heads. Retrain the WM with "
+            "the categorical inventory-gate schema."
+        )
     return crafter_output_mode_from_state_dict(state)
 
 
@@ -247,6 +264,21 @@ def run_ppo_crafter_wm(cfg: DictConfig):
     }
     if module_class is AttentionWM_support.AttentionModule:
         module_kwargs["crafter_output_mode"] = wm_output_mode
+        inventory_spec = next(
+            (
+                field for field in hparams_wm.observation_schema
+                if str(field.get("name", "")) == "inventory"
+            ),
+            None,
+        )
+        if inventory_spec is None:
+            raise ValueError("Crafter observation schema must define inventory")
+        module_kwargs["crafter_inventory_classes"] = int(
+            inventory_spec.get("classes", 10)
+        )
+        module_kwargs["crafter_inventory_output_mode"] = str(
+            inventory_spec.get("target_mode", "categorical_gate")
+        )
     elif wm_output_mode == "effect":
         raise ValueError("Crafter categorical effects currently require the Attention WM")
     model = module_class(
@@ -294,12 +326,14 @@ def run_ppo_crafter_wm(cfg: DictConfig):
         raise ValueError("PPO.max_training_timesteps must be divisible by PPO.num_imagined_envs")
 
     # ---- 3. Crafter-specific dimensions ----
-    success_obj_id  = int(getattr(domain_cfg, "success_obj_id", 10))
     inventory_dim   = int(getattr(domain_cfg, "inventory_dim", 16))
     obs_norm_values = list(hparams_wm.obs_norm_values)
     inventory_target_mode = crafter_inventory_target_mode(hparams_wm.observation_schema)
-    if inventory_target_mode not in {"absolute", "delta"}:
-        raise ValueError(f"Unsupported Crafter inventory target mode: {inventory_target_mode}")
+    if inventory_target_mode != "categorical_gate":
+        raise ValueError(
+            "Crafter WM planning requires categorical_gate inventory, "
+            f"got {inventory_target_mode!r}"
+        )
 
     # ---- 4. Build real env (for resets only) ----
     seed_policy_training(seed)
@@ -315,22 +349,10 @@ def run_ppo_crafter_wm(cfg: DictConfig):
     H, W = sample_grid.shape[0], sample_grid.shape[1]
     state_dim = 2 * H * W + inventory_dim   # flat obs + inventory
 
-    # Keep the historical target-tile metric when a target exists, but do not
-    # use it as the training reward or episode termination condition.
-    # Transpose to (2, H, W) for consistency
-    sample_chw = np.transpose(sample_grid, (2, 0, 1))  # (2, H, W)
-    goal_yx = find_success_tile_position(sample_chw, success_obj_id)
-    if goal_yx is None:
-        print(
-            f"[Crafter PPO] No target tile (obj={success_obj_id}) found; "
-            "target-tile metric disabled."
-        )
-        goal_positions = None
-    else:
-        print(f"[Crafter PPO] Target tile (obj={success_obj_id}) at yx={goal_yx}")
-        goal_positions = torch.as_tensor(goal_yx, device=device, dtype=torch.long).expand(
-            num_imagined_envs, -1
-        )
+    # Success is an evaluation metric only. It is latched when the imagined
+    # native-reward tracker first unlocks collect_diamond; it neither changes
+    # reward nor terminates the episode.
+    diamond_achievement_index = ACHIEVEMENT_NAMES.index("collect_diamond")
 
     # ---- 5. PPO agent ----
     seed_policy_training(seed)
@@ -399,6 +421,9 @@ def run_ppo_crafter_wm(cfg: DictConfig):
 
     episode_rewards = torch.zeros(num_imagined_envs, device=device)
     episode_steps   = torch.zeros(num_imagined_envs, device=device, dtype=torch.long)
+    episode_success = torch.zeros(
+        num_imagined_envs, device=device, dtype=torch.bool
+    )
     last_terminated = torch.zeros(num_imagined_envs, device=device, dtype=torch.bool)
 
     recent_rewards   = deque(maxlen=rolling_window)
@@ -467,13 +492,7 @@ def run_ppo_crafter_wm(cfg: DictConfig):
                 cow_hp,
                 life_state,
             )
-        agent_positions = get_crafter_agent_position_torch(states)   # (B, 2)
-        if goal_positions is None:
-            reached_goal = torch.zeros(
-                num_imagined_envs, device=device, dtype=torch.bool
-            )
-        else:
-            reached_goal = torch.all(agent_positions == goal_positions, dim=1)
+        episode_success |= newly_unlocked[:, diamond_achievement_index]
         truncated = episode_steps >= max_ep_len
         terminated = inventory[:, 0] <= 0
         dones = terminated | truncated
@@ -506,7 +525,7 @@ def run_ppo_crafter_wm(cfg: DictConfig):
         if completed.numel() > 0:
             comp_rewards  = episode_rewards[completed].detach().cpu().tolist()
             comp_steps    = episode_steps[completed].detach().cpu().tolist()
-            comp_successes= reached_goal[completed].detach().cpu().int().tolist()
+            comp_successes = episode_success[completed].detach().cpu().int().tolist()
             comp_achievements = unlocked[completed].sum(dim=1).detach().cpu().tolist()
             for ep_r, ep_s, ep_ok, ep_ach in zip(
                 comp_rewards, comp_steps, comp_successes, comp_achievements
@@ -550,6 +569,7 @@ def run_ppo_crafter_wm(cfg: DictConfig):
                 value[completed] = 0
             episode_rewards[completed] = 0.0
             episode_steps[completed]   = 0
+            episode_success[completed] = False
 
         # Print interval
         if time_step >= next_print_timestep and print_running_episodes > 0:
@@ -616,6 +636,43 @@ def _build_real_policy_state_batch(obs, obs_norm_values):
     return build_policy_state(states, inventory, obs_norm_values)
 
 
+def _new_real_env_coverage_tracker(cfg):
+    if not bool(getattr(cfg.PPO, "save_real_env_coverage", True)):
+        return None
+    return CrafterCoverageTracker()
+
+
+def _save_real_env_coverage(cfg, tracker):
+    if tracker is None or tracker.position_samples == 0:
+        return None
+    ppo_cfg = cfg.PPO
+    task_name = str(cfg.domains["crafter"].task_name)
+    seed = int(getattr(ppo_cfg, "seed", 0))
+    save_dir = Path(
+        str(
+            getattr(
+                ppo_cfg,
+                "real_env_coverage_save_path",
+                PROJECT_ROOT / "outputs" / "real_env_coverage",
+            )
+        )
+    ).expanduser().resolve()
+    filename = str(
+        getattr(
+            ppo_cfg,
+            "real_env_coverage_filename",
+            f"{task_name}_realenv_seed{seed}_coverage.png",
+        )
+    )
+    return tracker.save(
+        save_dir / filename,
+        title=(
+            f"Crafter Real-Env Inventory Coverage "
+            f"({task_name}, seed={seed}, transitions={tracker.position_samples})"
+        ),
+    )
+
+
 def _run_ppo_crafter_real_parallel(cfg: DictConfig, num_real_envs: int):
     """Train real-env PPO with synchronous subprocess environment sampling."""
     ppo_cfg = cfg.PPO
@@ -641,6 +698,7 @@ def _run_ppo_crafter_real_parallel(cfg: DictConfig, num_real_envs: int):
         start_method=str(getattr(ppo_cfg, "real_env_start_method", "spawn")),
     )
 
+    coverage_tracker = _new_real_env_coverage_tracker(cfg)
     try:
         obs, _ = envs.reset()
         grid_shape = np.transpose(obs["image"][0], (2, 0, 1)).shape
@@ -677,6 +735,8 @@ def _run_ppo_crafter_real_parallel(cfg: DictConfig, num_real_envs: int):
             f"rollout={rollout_steps} transitions/update"
         )
         while time_step < max_training_timesteps:
+            if coverage_tracker is not None:
+                coverage_tracker.update(obs["image"], obs["inventory"])
             state = _build_real_policy_state_batch(obs, obs_norm_values)
             actions, state_buf, action_buf, logprob_buf, value_buf = \
                 ppo_agent.select_action_batch(state)
@@ -772,6 +832,7 @@ def _run_ppo_crafter_real_parallel(cfg: DictConfig, num_real_envs: int):
 
             if time_step >= next_save_timestep:
                 ppo_agent.save(checkpoint_path)
+                _save_real_env_coverage(cfg, coverage_tracker)
                 print(f"[Crafter Real PPO] checkpoint saved at timestep={time_step}: {checkpoint_path}")
                 while next_save_timestep <= time_step:
                     next_save_timestep += save_model_freq
@@ -788,6 +849,7 @@ def _run_ppo_crafter_real_parallel(cfg: DictConfig, num_real_envs: int):
             bootstrap_values = ppo_agent.estimate_old_values_batch(final_state)
             ppo_agent.update(bootstrap_value=bootstrap_values)
         ppo_agent.save(checkpoint_path)
+        _save_real_env_coverage(cfg, coverage_tracker)
         print(f"[Crafter Real PPO] Final policy saved: {checkpoint_path}")
         if sub_run is not None:
             sub_run.finish()
@@ -860,6 +922,7 @@ def run_ppo_crafter_real(cfg: DictConfig):
         return build_policy_state(state, inventory, obs_norm_values).squeeze(0)
 
     obs, _ = env.reset()
+    coverage_tracker = _new_real_env_coverage_tracker(cfg)
     last_terminated = False
     while time_step < max_training_timesteps:
         episode_reward = 0.0
@@ -872,6 +935,8 @@ def run_ppo_crafter_real(cfg: DictConfig):
         episode_action_counts = np.zeros(CRAFTER_ACTION_COUNT, dtype=np.int64)
 
         while episode_steps < max_ep_len and time_step < max_training_timesteps:
+            if coverage_tracker is not None:
+                coverage_tracker.update(obs["image"], obs["inventory"])
             state = policy_state(obs)
             action, state_buf, action_buf, logprob_buf, value_buf = ppo_agent.select_action(state)
             next_obs, reward, terminated, truncated, info = env.step(int(action))
@@ -900,6 +965,7 @@ def run_ppo_crafter_real(cfg: DictConfig):
                 ppo_agent.update(bootstrap_value=bootstrap)
             if time_step >= next_save_timestep:
                 ppo_agent.save(checkpoint_path)
+                _save_real_env_coverage(cfg, coverage_tracker)
                 print(f"[Crafter Real PPO] checkpoint saved at timestep={time_step}: {checkpoint_path}")
                 while next_save_timestep <= time_step:
                     next_save_timestep += save_model_freq
@@ -960,6 +1026,7 @@ def run_ppo_crafter_real(cfg: DictConfig):
     else:
         ppo_agent.buffer.clear()
     ppo_agent.save(checkpoint_path)
+    _save_real_env_coverage(cfg, coverage_tracker)
     print(f"[Crafter Real PPO] Final policy saved: {checkpoint_path}")
     env.close()
     if sub_run is not None:

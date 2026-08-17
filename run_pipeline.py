@@ -10,14 +10,16 @@ from pathlib import Path
 import hydra
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
-from modelBased.common.dataset_identity import dataset_matches
+from modelBased.common.artifacts import dataset_matches
 from modelBased.policy_training.experiment_naming import (
     policy_checkpoint_is_compatible,
     policy_checkpoint_path,
 )
-from modelBased.common.artifact_naming import (
+from modelBased.common.artifacts import (
     p2e_enabled,
+    rmax_like_enabled,
     single_environment_dataset_path,
+    validate_acquisition_flags,
     world_model_checkpoint_path,
 )
 
@@ -79,6 +81,12 @@ def policy_runtime_overrides(cfg: DictConfig) -> list[str]:
             overrides.append(
                 f"PPO.{name}={str(bool(getattr(ppo_cfg, name))).lower()}"
             )
+    experiment_label = getattr(ppo_cfg, "experiment_label", None)
+    if (
+        experiment_label is not None
+        and str(experiment_label).strip().lower() not in {"", "null", "none"}
+    ):
+        overrides.append(f"PPO.experiment_label={experiment_label}")
     return overrides
 
 
@@ -101,6 +109,9 @@ def domain_runtime_overrides(cfg: DictConfig, domain: str) -> list[str]:
                     f"domains.{domain}.data_collection.{name}="
                     f"{getattr(collection_cfg, name)}"
                 )
+    attention_cfg = getattr(cfg, "attention_model", None)
+    if attention_cfg is not None and hasattr(attention_cfg, "n_cpu"):
+        overrides.append(f"attention_model.n_cpu={int(attention_cfg.n_cpu)}")
     if hasattr(domain_cfg, "collection_replace_start_with_empty"):
         value = bool(domain_cfg.collection_replace_start_with_empty)
         overrides.append(
@@ -111,6 +122,42 @@ def domain_runtime_overrides(cfg: DictConfig, domain: str) -> list[str]:
     return overrides
 
 
+def rmax_like_runtime_overrides(cfg: DictConfig, domain: str) -> list[str]:
+    """Forward count-acquisition settings to pipeline subprocesses."""
+    if not hasattr(cfg, "rmax_like"):
+        return []
+    rmax_cfg = cfg.rmax_like
+    overrides = [
+        f"rmax_like.enabled={str(bool(getattr(rmax_cfg, 'enabled', False))).lower()}"
+    ]
+    if domain != "crafter" or not bool(getattr(rmax_cfg, "enabled", False)):
+        return overrides
+    for name in (
+        "train_steps", "frozen_steps", "num_envs", "mask_size", "reward_scale",
+        "death_penalty", "seed", "rollout_steps", "start_method", "checkpoint_path", "coverage_path",
+        "lr_actor", "lr_critic", "gamma", "K_epochs", "eps_clip", "action_std",
+        "entropy_coef", "normalize_advantages", "normalize_returns", "max_grad_norm",
+    ):
+        if hasattr(rmax_cfg, name):
+            value = getattr(rmax_cfg, name)
+            if isinstance(value, bool):
+                value = str(value).lower()
+            overrides.append(f"rmax_like.{name}={value}")
+    return overrides
+
+
+def p2e_runtime_overrides(cfg: DictConfig) -> list[str]:
+    """Forward the online Dreamer P2E budget/schedule to its subprocess."""
+    if not hasattr(cfg, "p2e"):
+        return []
+    names = (
+        "enabled", "total_steps", "prefill_steps", "train_every", "train_steps",
+        "replay_capacity", "replay_batch_size", "replay_sequence_length",
+        "checkpoint_every", "checkpoint_path", "resume",
+    )
+    return [f"p2e.{name}={getattr(cfg.p2e, name)}" for name in names if hasattr(cfg.p2e, name)]
+
+
 def run_domain(domain: str, cfg: DictConfig) -> None:
     domain_cfg = cfg.domains[domain]
     force = bool(cfg.pipeline.force)
@@ -118,6 +165,7 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
     skip_world_model = bool(getattr(cfg.pipeline, "skip_world_model", False))
     python = sys.executable
     layout_path = Path(str(domain_cfg.layout_path)).expanduser().resolve()
+    validate_acquisition_flags(cfg, domain)
     if not layout_path.exists():
         raise FileNotFoundError(
             f"[{domain}] Canonical layout does not exist: {layout_path}"
@@ -138,6 +186,10 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
         policy_identity_overrides.append(
             f"p2e.enabled={str(bool(cfg.p2e.enabled)).lower()}"
         )
+    if hasattr(cfg, "rmax_like"):
+        policy_identity_overrides.append(
+            f"rmax_like.enabled={str(bool(cfg.rmax_like.enabled)).lower()}"
+        )
     configured_continual = getattr(domain_cfg, "continual_learning", None)
     if configured_continual is not None:
         policy_identity_overrides.append(
@@ -155,6 +207,11 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
         raise ValueError(
             f"[{domain}] continual WM training cannot be combined with "
             "PPO.train_in_real_env=true. Disable continual_learning or use WM planning."
+        )
+    if train_in_real_env and rmax_like_enabled(cfg, domain):
+        raise ValueError(
+            "RMax-like WM acquisition requires PPO.train_in_real_env=false; "
+            "the acquisition explorer is trained separately in the real environment"
         )
 
     if skip_world_model:
@@ -198,6 +255,10 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
                 continual_overrides.append(
                     f"p2e.enabled={str(bool(cfg.p2e.enabled)).lower()}"
                 )
+            if hasattr(cfg, "rmax_like"):
+                continual_overrides.append(
+                    f"rmax_like.enabled={str(bool(cfg.rmax_like.enabled)).lower()}"
+                )
             if force:
                 # pipeline.force means start a fresh continual run. The state and
                 # replay files are still replaced atomically by the trainer.
@@ -212,7 +273,11 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
                     [
                         python,
                         "-m",
-                        "modelBased.continue_learning.crafter_curriculum_collect",
+                        (
+                            "modelBased.exploration.crafter_rmax_continual_collect"
+                            if rmax_like_enabled(cfg, domain)
+                            else "modelBased.continue_learning.crafter_curriculum_collect"
+                        ),
                         f"domain={domain}",
                         *continual_overrides,
                     ],
@@ -245,6 +310,7 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
     else:
         # --- 1. Dataset Collection ---
         use_single_p2e = p2e_enabled(cfg, domain)
+        use_rmax_like = rmax_like_enabled(cfg, domain)
         data_path = single_environment_dataset_path(cfg, domain)
         data_overrides = [
             *domain_overrides,
@@ -252,28 +318,52 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
             f"env.collect.data_save_path={data_path}",
             f"attention_model.data_dir={data_path}",
         ]
+        # The mode-specific path is authoritative inside the acquisition
+        # subprocess too. Without forwarding it, a child composed with its
+        # default PPO.seed can silently write every RMax/P2E run to seed 0
+        # while the parent trains the WM from a different seed path.
+        if use_single_p2e:
+            data_overrides.append(
+                f"domains.{domain}.p2e_data_save_path={data_path}"
+            )
+        elif use_rmax_like:
+            data_overrides.append(
+                f"domains.{domain}.rmax_like_data_save_path={data_path}"
+            )
         if hasattr(cfg, "p2e"):
             data_overrides.append(
                 f"p2e.enabled={str(bool(cfg.p2e.enabled)).lower()}"
             )
+        if use_single_p2e:
+            data_overrides.append("env.collect.data_type=p2e")
+        data_overrides.extend(rmax_like_runtime_overrides(cfg, domain))
+        data_overrides.extend(p2e_runtime_overrides(cfg) if use_single_p2e else [])
         if configured_continual is not None:
             data_overrides.append(
                 f"domains.{domain}.continual_learning.enabled="
                 f"{str(continual_enabled).lower()}"
             )
-        collector_module = (
-            "modelBased.continue_learning.crafter_curriculum_collect"
-            if use_single_p2e
-            else "modelBased.data.data_collect"
-        )
-        collection_mode = "single-environment P2E" if use_single_p2e else "standard"
+        if use_single_p2e:
+            collector_module = "modelBased.continue_learning.crafter_curriculum_collect"
+            collection_mode = "single-environment P2E"
+        elif use_rmax_like:
+            collector_module = "modelBased.exploration.crafter_rmax_collect"
+            collection_mode = "RMax-like count exploration"
+        else:
+            collector_module = "modelBased.data.data_collect"
+            collection_mode = "standard"
         force_collection_override = []
         if use_single_p2e and force:
             force_collection_override.append(
                 f"domains.{domain}.continual_learning.force_collection=true"
             )
         data_recollected = False
-        expected_data_size = int(domain_cfg.data_collection.maximum_dataset_size)
+        # P2E owns its one-million-interaction budget; random/RMax retain the
+        # domain collection budget so acquisition modes cannot overwrite one
+        # another's identity.
+        expected_data_size = int(
+            cfg.p2e.total_steps if use_single_p2e else domain_cfg.data_collection.maximum_dataset_size
+        )
         p2e_artifacts_ready = (
             not use_single_p2e
             or (
@@ -281,17 +371,27 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
                 and world_model_path.is_file()
             )
         )
+        rmax_artifacts_ready = (
+            not use_rmax_like
+            or (
+                dataset_transition_count(data_path) == expected_data_size
+                and Path(str(cfg.rmax_like.checkpoint_path)).expanduser().resolve().is_file()
+            )
+        )
         if (
             data_path.exists()
             and not force
             and dataset_matches(data_path, cfg, domain)
             and p2e_artifacts_ready
+            and rmax_artifacts_ready
         ):
             print(f"[SKIP] Dataset already exists: {data_path}")
         elif data_path.exists() and not force:
             reason = (
                 "P2E dataset size/final WM is incomplete"
                 if use_single_p2e and dataset_matches(data_path, cfg, domain)
+                else "RMax-like dataset/explorer artifact is incomplete"
+                if use_rmax_like and dataset_matches(data_path, cfg, domain)
                 else "dataset identity does not match"
             )
             print(f"[RECOLLECT] {reason} for {domain}: {data_path}")

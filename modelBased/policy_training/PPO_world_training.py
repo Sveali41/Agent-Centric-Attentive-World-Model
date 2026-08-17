@@ -17,7 +17,7 @@ from modelBased.policy_training.experiment_naming import (
     policy_checkpoint_path,
     policy_wandb_identity,
 )
-from modelBased.common.artifact_naming import world_model_checkpoint_path
+from modelBased.common.artifacts import world_model_checkpoint_path
 import hydra
 from datetime import datetime
 from modelBased.common import utils
