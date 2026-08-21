@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pandas as pd
 
 
 CONTINUAL_SUFFIX = "continue"
@@ -17,6 +18,35 @@ INVENTORY_GATE_SUFFIX = "inventory_gate_natural_v2"
 # are intentionally not addressable by the new acquisition path.
 P2E_SUFFIX = "p2e_official_dv2_attnwm_v1"
 RMAX_LIKE_SUFFIX = "rmax_count_local5_inv12_v1"
+
+
+def detail_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    """Remove aggregate rows before merging a CSV with a new evaluation run."""
+    detailed = frame.copy()
+    for column in ("seed", "episode"):
+        if column in detailed.columns:
+            detailed = detailed.loc[
+                detailed[column].astype(str).str.lower() != "mean"
+            ]
+    if "seed" in detailed.columns:
+        detailed = detailed.loc[
+            detailed["seed"].astype(str).str.lower() != "all"
+        ]
+    return detailed
+
+
+def append_mean_row(
+    frame: pd.DataFrame,
+    *,
+    mean_columns: list[str],
+    labels: dict[str, object],
+) -> pd.DataFrame:
+    """Append one explicitly labelled aggregate row to an evaluation table."""
+    mean_row: dict[str, object] = {column: np.nan for column in frame.columns}
+    mean_row.update(labels)
+    for column in mean_columns:
+        mean_row[column] = pd.to_numeric(frame[column], errors="coerce").mean()
+    return pd.concat([frame, pd.DataFrame([mean_row])], ignore_index=True)
 
 
 def continual_learning_enabled(cfg, domain: str | None = None) -> bool:

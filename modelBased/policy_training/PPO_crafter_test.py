@@ -18,6 +18,7 @@ from omegaconf import DictConfig
 
 from domain.crafter.crafter_custom_env import CustomCrafterEnv
 from modelBased.common import utils
+from modelBased.common.artifacts import append_mean_row, detail_rows
 from modelBased.policy_training.PPO import PPO
 from modelBased.policy_training.experiment_naming import (
     policy_checkpoint_is_compatible,
@@ -25,7 +26,6 @@ from modelBased.policy_training.experiment_naming import (
     policy_experiment_label,
     policy_training_source,
 )
-from modelBased.policy_training.evaluation_csv import append_mean_row, detail_rows
 from modelBased.policy_training.PPO_crafter_training import (
     CRAFTER_ACTION_COUNT,
     build_policy_state,

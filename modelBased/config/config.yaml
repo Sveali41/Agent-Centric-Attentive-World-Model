@@ -6,7 +6,7 @@ pipeline:
   force_policy: false  # Retrain only policy; keep the matching dataset and WM.
   # Planning-only 5-seed evaluation: reuse one fixed RMax dataset/WM and vary
   # only PPO initialization and policy sampling through PPO.seed.
-  skip_world_model: true  # Fail clearly if the shared WM is missing.
+  skip_world_model: False  # Fail clearly if the shared WM is missing.
   skip_policy: false
 
 domains:

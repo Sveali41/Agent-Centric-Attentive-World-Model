@@ -28,6 +28,7 @@ from domain.minigrid.action_codec import (
 )
 from domain.minigrid.minigrid_custom_env import CustomMiniGridEnv
 from domain.minigrid.minigrid_support import ColRowCanl_to_CanlRowCol
+from modelBased.common.artifacts import append_mean_row
 from modelBased.common.utils import normalize_obs
 from modelBased.policy_training.PPO import PPO
 from modelBased.policy_training.experiment_naming import (
@@ -35,7 +36,6 @@ from modelBased.policy_training.experiment_naming import (
     policy_checkpoint_path,
     policy_training_source,
 )
-from modelBased.policy_training.evaluation_csv import append_mean_row
 
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
