@@ -19,7 +19,7 @@ if __name__ == "__main__":
                 max_len=1e7,
                 random_gen_max=3e4,
                 save_flag= False,
-                save_path=str(PROJECT_ROOT / 'legacy' / 'generator' / 'result'), start_point_flag=False)
+                save_path=str(PROJECT_ROOT / 'outputs' / 'visualizations' / 'legacy' / 'generator'), start_point_flag=False)
 
     print("Generated {} maps.".format(len(task_dict)))
     # save the dataset

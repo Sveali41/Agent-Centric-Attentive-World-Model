@@ -43,7 +43,7 @@ Available task groups include:
 
 The following GIF demonstrates a policy evaluated in the challenging `Grid_11_11_KD_level3` environment (locked door). The agent successfully learns the causal chain required to solve the task: `navigate to key → pickup key → navigate to door → toggle (unlock) door → navigate to goal`.
 
-![MiniGrid Level 3 Locked Door Policy Evaluation](modelBased/visulization/PPO/PPO_gif/ppo_real_env_test.gif)
+![MiniGrid Level 3 Locked Door Policy Evaluation](outputs/evaluation/ppo/gif/ppo_real_env_test.gif)
 
 *By utilizing the Attentive World Model for planning and adjusting PPO exploration parameters (e.g., `entropy_coef=0.01`) to handle extreme reward sparsity, the agent can achieve a stable ~100% success rate on this long-horizon task.*
 
@@ -164,6 +164,21 @@ python run_pipeline.py pipeline.label=minigrid pipeline.force=true  # force reru
 ```
 
 The default values are stored in `modelBased/config/config.yaml` under `pipeline:`. Dataset and checkpoint paths can also be changed there or overridden with Hydra arguments.
+
+All Hydra run metadata and generated evaluation/planning artifacts are written
+under this repository's single `outputs/` directory. Paths are based on
+`WM_ROOT`, not the shell's current working directory or the outer curriculum
+workspace.
+
+- `outputs/hydra/`: current and legacy Hydra runs
+- `outputs/results/`: world-model, continual-learning, and exploration metrics
+- `outputs/visualizations/`: dataset, environment, coverage, and WM figures
+- `outputs/planning/`: A*, MCTS, and MPC artifacts
+- `outputs/evaluation/`: policy CSV/GIF evaluations
+- `outputs/wandb/`: local Weights & Biases files
+
+Datasets and reusable checkpoints intentionally remain under
+`modelBased/data/` and `modelBased/models/`.
 
 Crafter has a dedicated WM-PPO adapter. Its imagined rollouts use the native
 Crafter health and first-achievement rewards; the target-tile metric remains a

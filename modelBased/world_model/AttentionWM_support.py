@@ -2,6 +2,7 @@ import torch
 from torch import nn
 from torch import nn
 import torch.nn.functional as F
+from domain.minigrid.transition_codec import minigrid_contract
 
 class ResidualMLP(nn.Module):
     def __init__(self, dim, hidden_dim, dropout=0.1):
@@ -175,6 +176,7 @@ class AttentionModule(nn.Module):
         crafter_output_mode="effect",
         crafter_inventory_classes=10,
         crafter_inventory_output_mode="categorical_gate",
+        minigrid_transition_mode="effect",
     ):
         super().__init__()
         self.data_type = data_type
@@ -183,6 +185,7 @@ class AttentionModule(nn.Module):
         self.crafter_output_mode = str(crafter_output_mode)
         self.crafter_inventory_classes = int(crafter_inventory_classes)
         self.crafter_inventory_output_mode = str(crafter_inventory_output_mode)
+        self.minigrid_transition_mode = str(minigrid_transition_mode)
         self.is_bipedal = (env_type == "bipedalwalker")
         self.embed_dim = embed_dim
         if data_type == 'discrete':
@@ -209,14 +212,20 @@ class AttentionModule(nn.Module):
                     nn.Linear(embed_dim, inventory_output_width)
                 )
             else:
+                contract = minigrid_contract(self.minigrid_transition_mode)
                 self.input_channel = (11 + 6 + 4) * frame_stack
-                self.action_embedding = nn.Embedding(7, embed_dim)
+                # The old absolute checkpoint used seven rows, including the
+                # native ``done`` row. Keep that shape only for compatibility;
+                # the semantic dataset/policy action space is always six.
+                action_embedding_size = 7 if contract.mode == "absolute" else contract.action_count
+                self.action_embedding = nn.Embedding(action_embedding_size, embed_dim)
                 # 0 = empty hands; 1..6 = key colour id + 1.
                 self.key_embedding = nn.Embedding(7, embed_dim)
+                inventory_output_classes = contract.inventory_output_classes
                 self.inv_head = nn.Sequential(
                     nn.Linear(embed_dim, embed_dim),
                     nn.ReLU(),
-                    nn.Linear(embed_dim, 7),
+                    nn.Linear(embed_dim, inventory_output_classes),
                 )
         else:
             if self.is_bipedal:
@@ -327,9 +336,20 @@ class AttentionModule(nn.Module):
         elif self.is_bipedal:
             self.out_channel = self.state_dim
         else:
-            self.out_channel = 11 + 6 + 4  # obj(11) + color(6) + state(4) for MiniGrid CE
+            self.out_channel = minigrid_contract(self.minigrid_transition_mode).output_channels
         if not self.is_bipedal:
             self.fc = nn.Linear(embed_dim, self.out_channel)
+
+        if self.env_type == "minigrid":
+            contract = minigrid_contract(self.minigrid_transition_mode)
+            self.checkpoint_contract = {
+                "domain": "minigrid",
+                "transition_mode": contract.mode,
+                "input_channels": 21,
+                "output_channels": contract.output_channels,
+                "inventory_output_classes": contract.inventory_output_classes,
+                "semantic_action_count": contract.action_count,
+            }
         
         self.dropout_conv = nn.Dropout(p=0.1)
 
@@ -347,6 +367,49 @@ class AttentionModule(nn.Module):
         x = torch.stack(token_feats, dim=1) # (Batch, NumTokens, EmbedDim)
         x = x + self.pos_embedding + self.token_type_embedding
         return x
+
+    @torch.no_grad()
+    def encode_map_features(self, state):
+        """Encode a full discrete MiniGrid map for generator novelty scoring.
+
+        This intentionally stops before action/context fusion.  The transition
+        model's convolutional representation is therefore reusable for maps
+        of different spatial sizes and does not depend on the local attention
+        mask or a positional-embedding length.
+        """
+        if self.env_type != "minigrid" or self.data_type != "discrete":
+            raise ValueError("encode_map_features is only available for discrete MiniGrid")
+        if state.ndim == 3:
+            state = state.unsqueeze(0)
+        if state.ndim != 4 or state.size(1) != 3:
+            raise ValueError(
+                "MiniGrid map features expect state [B,3,H,W], got "
+                f"{tuple(state.shape)}"
+            )
+
+        state = state.to(next(self.parameters()).device)
+        obj = state[:, 0].long().clamp(0, 10)
+        color = state[:, 1].long().clamp(0, 5)
+        direction = state[:, 2].long().clamp(0, 3)
+        state_emb = torch.cat(
+            [
+                F.one_hot(obj, num_classes=11),
+                F.one_hot(color, num_classes=6),
+                F.one_hot(direction, num_classes=4),
+            ],
+            dim=-1,
+        ).float().permute(0, 3, 1, 2)
+
+        x = self.relu(self.bn1(self.conv1(state_emb)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        pooled = torch.cat(
+            [
+                F.adaptive_avg_pool2d(x, (1, 1)).flatten(1),
+                F.adaptive_max_pool2d(x, (1, 1)).flatten(1),
+            ],
+            dim=1,
+        )
+        return F.normalize(pooled, p=2, dim=1)
 
     def decode_bipedal_tokens(self, token_features, state):
         batch_size = token_features.size(0)

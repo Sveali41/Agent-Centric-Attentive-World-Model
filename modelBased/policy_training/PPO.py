@@ -183,6 +183,7 @@ class PPO:
         normalize_advantages=False,
         normalize_returns=True,
         max_grad_norm=0.0,
+        freeze_actor_until_first_reward=False,
     ):
 
         self.has_continuous_action_space = has_continuous_action_space
@@ -197,6 +198,13 @@ class PPO:
         self.normalize_advantages = bool(normalize_advantages)
         self.normalize_returns = bool(normalize_returns)
         self.max_grad_norm = float(max_grad_norm)
+        self.freeze_actor_until_first_reward = bool(
+            freeze_actor_until_first_reward
+        )
+        # A random, untrained critic is not evidence that one action is better
+        # than another.  Sparse-reward runs keep the actor fixed until the
+        # collector has observed at least one genuine reward signal.
+        self.has_seen_reward_signal = False
 
         self.buffer = RolloutBuffer()
 
@@ -233,6 +241,7 @@ class PPO:
         self.optimizer.state.clear()
         self.optimizer.zero_grad(set_to_none=True)
         self.update_count = 0
+        self.has_seen_reward_signal = False
 
     def set_action_std(self, new_action_std):
 
@@ -372,6 +381,119 @@ class PPO:
             values = self.policy_old.critic(states.to(device))
         return values.detach().reshape(-1).cpu()
 
+    def behavior_clone(
+        self,
+        states,
+        actions,
+        epochs=500,
+        batch_size=256,
+        learning_rate=3e-4,
+        target_accuracy=0.995,
+        target_probability=0.995,
+    ):
+        """Warm-start the discrete actor from verified planner transitions.
+
+        This updates only the actor. The critic remains untrained until PPO
+        sees environment returns, and ``has_seen_reward_signal`` deliberately
+        remains false so the sparse-reward actor guard still applies.
+        """
+        if self.has_continuous_action_space:
+            raise ValueError("Behavior cloning currently supports discrete PPO only")
+        states = torch.as_tensor(states, dtype=torch.float32, device=device)
+        actions = torch.as_tensor(actions, dtype=torch.long, device=device).reshape(-1)
+        if states.ndim != 2:
+            raise ValueError(
+                f"BC states must have shape [N,state_dim], got {tuple(states.shape)}"
+            )
+        if len(states) != len(actions) or not len(states):
+            raise ValueError(
+                f"BC requires equally sized non-empty states/actions, got "
+                f"{len(states)} and {len(actions)}"
+            )
+        if int(actions.min()) < 0 or int(actions.max()) >= self.policy.action_dim:
+            raise ValueError("BC actions contain an ID outside the PPO action space")
+
+        actor_before = {
+            name: parameter.detach().clone()
+            for name, parameter in self.policy.actor.named_parameters()
+        }
+        optimizer = torch.optim.Adam(
+            self.policy.actor.parameters(), lr=float(learning_rate)
+        )
+        batch_size = max(1, min(int(batch_size), len(states)))
+        epochs_completed = 0
+
+        def evaluate_actor():
+            with torch.no_grad():
+                probabilities = self.policy.actor(states)
+                chosen = probabilities.gather(1, actions[:, None]).squeeze(1)
+                accuracy = (probabilities.argmax(dim=1) == actions).float().mean()
+                loss = -chosen.clamp_min(1e-8).log().mean()
+            return (
+                float(loss.item()),
+                float(accuracy.item()),
+                float(chosen.mean().item()),
+                float(chosen.min().item()),
+            )
+
+        for epoch in range(max(1, int(epochs))):
+            permutation = torch.randperm(len(states), device=device)
+            for start in range(0, len(states), batch_size):
+                indices = permutation[start : start + batch_size]
+                probabilities = self.policy.actor(states[indices])
+                selected = probabilities.gather(
+                    1, actions[indices, None]
+                ).squeeze(1)
+                loss = -selected.clamp_min(1e-8).log().mean()
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+            epochs_completed = epoch + 1
+            if epochs_completed % 10 == 0 or epochs_completed == int(epochs):
+                _, accuracy, mean_probability, _ = evaluate_actor()
+                if (
+                    accuracy >= float(target_accuracy)
+                    and mean_probability >= float(target_probability)
+                ):
+                    break
+
+        loss, accuracy, mean_probability, min_probability = evaluate_actor()
+        actor_delta = 0.0
+        for name, parameter in self.policy.actor.named_parameters():
+            actor_delta += float(
+                (parameter.detach() - actor_before[name]).norm(2).item() ** 2
+            )
+        actor_delta **= 0.5
+
+        # Rollout sampling always uses policy_old. Synchronize only the actor;
+        # the original random critic is intentionally untouched.
+        self.policy_old.actor.load_state_dict(self.policy.actor.state_dict())
+        # If this method is used after previous training, stale Adam moments
+        # must not immediately undo the supervised initialization.
+        actor_parameters = set(self.policy.actor.parameters())
+        for parameter in list(self.optimizer.state):
+            if parameter in actor_parameters:
+                del self.optimizer.state[parameter]
+
+        metrics = {
+            "examples": len(states),
+            "epochs": epochs_completed,
+            "loss": loss,
+            "accuracy": accuracy,
+            "mean_target_probability": mean_probability,
+            "min_target_probability": min_probability,
+            "actor_parameter_delta": actor_delta,
+        }
+        print(
+            "[PPO BC] "
+            f"examples={len(states)} epochs={epochs_completed} "
+            f"loss={loss:.6f} accuracy={accuracy:.2%} "
+            f"mean_target_prob={mean_probability:.4f} "
+            f"min_target_prob={min_probability:.4f} "
+            f"actor_delta={actor_delta:.6e}"
+        )
+        return metrics
+
     def update(self, bootstrap_value=0.0):
         """
         Update PPO from the current rollout buffer.
@@ -392,11 +514,36 @@ class PPO:
 
         parallel_rollout = torch.is_tensor(self.buffer.rewards[0])
 
+        if parallel_rollout:
+            rewards_tb = torch.stack(self.buffer.rewards, dim=0).float()
+            reward_signal_in_rollout = bool(
+                rewards_tb.detach().abs().gt(1e-12).any().item()
+            )
+        else:
+            reward_signal_in_rollout = any(
+                abs(float(torch.as_tensor(reward).detach().reshape(-1)[0].item()))
+                > 1e-12
+                for reward in self.buffer.rewards
+            )
+        if reward_signal_in_rollout:
+            self.has_seen_reward_signal = True
+        actor_update_enabled = (
+            not self.freeze_actor_until_first_reward
+            or self.has_seen_reward_signal
+        )
+        # Before any real reward has been observed, a bootstrap value comes
+        # only from the random critic itself.  Do not train the critic to
+        # reproduce that arbitrary initial value; use the known zero-return
+        # target until an external reward grounds the value function.
+        zero_unrewarded_bootstrap = (
+            self.freeze_actor_until_first_reward
+            and not self.has_seen_reward_signal
+        )
+
         # Monte Carlo returns, optionally bootstrapped at a non-terminal
         # rollout boundary. For vectorized environments, every column is an
         # independent trajectory and terminal markers reset only that column.
         if parallel_rollout:
-            rewards_tb = torch.stack(self.buffer.rewards, dim=0).float()
             terminals_tb = torch.stack(self.buffer.is_terminals, dim=0).bool()
             batch_size = rewards_tb.shape[1]
             discounted_reward = torch.as_tensor(
@@ -411,6 +558,8 @@ class PPO:
                     f"Expected {batch_size} bootstrap values, got "
                     f"{discounted_reward.numel()}"
                 )
+            if zero_unrewarded_bootstrap:
+                discounted_reward.zero_()
             returns = []
             for reward_t, terminal_t in zip(
                 reversed(rewards_tb), reversed(terminals_tb)
@@ -425,7 +574,9 @@ class PPO:
             rewards = torch.stack(list(reversed(returns)), dim=0).reshape(-1).to(device)
         else:
             rewards = []
-            discounted_reward = float(bootstrap_value)
+            discounted_reward = (
+                0.0 if zero_unrewarded_bootstrap else float(bootstrap_value)
+            )
             for reward, is_terminal in zip(
                 reversed(self.buffer.rewards), reversed(self.buffer.is_terminals)
             ):
@@ -474,6 +625,9 @@ class PPO:
         }
         last_loss = None
         last_grad_norm = 0.0
+        last_actor_loss = 0.0
+        last_critic_loss = 0.0
+        last_entropy = 0.0
 
         # Optimize policy for K epochs
         for _ in range(self.K_epochs):
@@ -486,22 +640,35 @@ class PPO:
             # Finding the ratio (pi_theta / pi_theta__old)
             ratios = torch.exp(logprobs - old_logprobs.detach())
 
-            # Finding Surrogate Loss
-            surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
-
-            # final loss of clipped objective PPO
-            loss = (
-                -torch.min(surr1, surr2)
-                + 0.5 * self.MseLoss(state_values, rewards)
-                - self.entropy_coef * dist_entropy
-            )
+            critic_loss = 0.5 * self.MseLoss(state_values, rewards)
+            if actor_update_enabled:
+                # Finding Surrogate Loss
+                surr1 = ratios * advantages
+                surr2 = torch.clamp(
+                    ratios, 1 - self.eps_clip, 1 + self.eps_clip
+                ) * advantages
+                actor_loss = -torch.min(surr1, surr2).mean()
+                entropy = dist_entropy.mean()
+                loss_mean = (
+                    actor_loss
+                    + critic_loss
+                    - self.entropy_coef * entropy
+                )
+            else:
+                # Actor and critic are disjoint modules.  Omitting both the
+                # surrogate and entropy terms leaves actor gradients as None,
+                # so Adam cannot move the policy while reward is ungrounded.
+                actor_loss = torch.zeros((), device=state_values.device)
+                entropy = torch.zeros((), device=state_values.device)
+                loss_mean = critic_loss
 
             # take gradient step
             self.optimizer.zero_grad()
-            loss_mean = loss.mean()
             loss_mean.backward()
             last_loss = float(loss_mean.detach().cpu().item())
+            last_actor_loss = float(actor_loss.detach().cpu().item())
+            last_critic_loss = float(critic_loss.detach().cpu().item())
+            last_entropy = float(entropy.detach().cpu().item())
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 self.policy.parameters(), self.max_grad_norm
             ) if self.max_grad_norm > 0.0 else None
@@ -519,11 +686,21 @@ class PPO:
         self.policy_old.load_state_dict(self.policy.state_dict())
 
         parameter_delta = 0.0
+        actor_parameter_delta = 0.0
+        critic_parameter_delta = 0.0
         for name, parameter in self.policy.named_parameters():
-            parameter_delta += float(
-                (parameter.detach() - parameters_before[name]).norm(2).item() ** 2
+            squared_delta = float(
+                (parameter.detach() - parameters_before[name]).norm(2).item()
+                ** 2
             )
+            parameter_delta += squared_delta
+            if name.startswith("actor."):
+                actor_parameter_delta += squared_delta
+            elif name.startswith("critic."):
+                critic_parameter_delta += squared_delta
         parameter_delta = parameter_delta ** 0.5
+        actor_parameter_delta = actor_parameter_delta ** 0.5
+        critic_parameter_delta = critic_parameter_delta ** 0.5
         self.update_count += 1
         metrics = {
             "updated": True,
@@ -532,11 +709,22 @@ class PPO:
             "loss": last_loss,
             "grad_norm": last_grad_norm,
             "parameter_delta": parameter_delta,
+            "actor_parameter_delta": actor_parameter_delta,
+            "critic_parameter_delta": critic_parameter_delta,
+            "actor_loss": last_actor_loss,
+            "critic_loss": last_critic_loss,
+            "entropy": last_entropy,
+            "actor_update_enabled": actor_update_enabled,
+            "reward_signal_in_rollout": reward_signal_in_rollout,
+            "has_seen_reward_signal": self.has_seen_reward_signal,
         }
         print(
             f"[PPO UPDATE #{self.update_count}] rollout={rollout_size} "
             f"loss={last_loss:.6f} grad_norm={last_grad_norm:.6f} "
-            f"parameter_delta={parameter_delta:.6e}"
+            f"actor_delta={actor_parameter_delta:.6e} "
+            f"critic_delta={critic_parameter_delta:.6e} "
+            f"actor_update={actor_update_enabled} "
+            f"reward_signal={reward_signal_in_rollout}"
         )
 
         # clear buffer
@@ -552,6 +740,10 @@ class PPO:
     def load(self, checkpoint_path):
         self.policy_old.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
         self.policy.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage))
+        # A loaded policy is assumed to have already been trained on grounded
+        # returns. Evaluation is unaffected, and resumed training must not
+        # unexpectedly re-freeze a previously learned actor.
+        self.has_seen_reward_signal = True
 
 
 def preprocess_observation(

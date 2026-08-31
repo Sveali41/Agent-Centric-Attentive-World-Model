@@ -6,6 +6,7 @@ from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from typing import Dict, Optional
 from modelBased.common.utils import get_env, normalize_obs
 from modelBased.common.utils import merge_data_dicts
+from domain.minigrid.transition_codec import MINIGRID_ACTION_COUNT
 
 try:
     from func_timeout import func_set_timeout
@@ -117,14 +118,20 @@ class WMRLDataset(Dataset):
         total_bad = obj_bad + color_bad + state_bad
 
         if total_bad > 0:
-            print(
-                f"[DataModule][MiniGrid] Sanitizing {tag}: "
-                f"obj_bad={obj_bad}, color_bad={color_bad}, state_bad={state_bad}"
+            raise ValueError(
+                f"[DataModule][MiniGrid] Invalid {tag}: "
+                f"obj_bad={obj_bad}, color_bad={color_bad}, state_bad={state_bad}. "
+                "Raw categorical observations must be absolute IDs in the declared ranges; "
+                "the loader will not clip deltas into labels."
             )
-            arr = arr.copy()
-            np.clip(arr[:, 0], 0, 10, out=arr[:, 0])
-            np.clip(arr[:, 1], 0, 5, out=arr[:, 1])
-            np.clip(arr[:, 2], 0, 3, out=arr[:, 2])
+        agent_counts = (obj == 10).reshape(obj.shape[0], -1).sum(axis=1)
+        invalid_agents = np.flatnonzero(agent_counts != 1)
+        if len(invalid_agents):
+            raise ValueError(
+                f"[DataModule][MiniGrid] {tag} must contain exactly one agent "
+                f"per sample; invalid samples={invalid_agents[:10].tolist()}, "
+                f"counts={agent_counts[invalid_agents[:10]].tolist()}"
+            )
         return arr
 
     @staticmethod
@@ -132,8 +139,9 @@ class WMRLDataset(Dataset):
         """Decode colour-aware inventory tokens from transition metadata.
 
         Token 0 means empty hands; tokens 1..6 represent MiniGrid key colours
-        0..5. New datasets store both sides of every transition explicitly.
-        The shift fallback keeps older sequential datasets readable.
+        0..5. Both sides must belong to the same transition.  Legacy metadata
+        cannot be repaired by shifting adjacent rows because uniform/replay
+        datasets are not guaranteed to preserve temporal adjacency.
         """
         if info is None:
             return None, None
@@ -149,31 +157,89 @@ class WMRLDataset(Dataset):
             return {}
 
         records = [_as_dict(value) for value in flat_info]
+        missing_current = [
+            index for index, record in enumerate(records)
+            if "current_carrying_token" not in record
+        ]
+        missing_next = [
+            index for index, record in enumerate(records)
+            if "next_carrying_token" not in record
+        ]
+        if missing_current or missing_next:
+            raise ValueError(
+                "[DataModule][MiniGrid] Colour-aware inventory supervision "
+                "requires current_carrying_token and next_carrying_token on "
+                "every transition. Legacy carrying_key/carrying_token fields "
+                "cannot recover the two raw inventory states; recollect this "
+                "dataset. "
+                f"missing_current={missing_current[:10]}, "
+                f"missing_next={missing_next[:10]}"
+            )
+
         current = np.asarray([
-            int(record.get("carrying_token", bool(record.get("carrying_key", False))))
+            int(record["current_carrying_token"])
             for record in records
         ], dtype=np.int64)
-
-        has_explicit_next = all("next_carrying_token" in record for record in records)
-        if has_explicit_next:
-            next_inventory = np.asarray([
-                int(record["next_carrying_token"]) for record in records
-            ], dtype=np.int64)
-        else:
-            next_inventory = np.zeros_like(current)
-            if len(current) > 1:
-                next_inventory[:-1] = current[1:]
-            if done is not None:
-                terminal = np.asarray(done).reshape(-1).astype(bool)
-                next_inventory[terminal] = 0
-            print(
-                "[DataModule][MiniGrid] Legacy inventory metadata detected; "
-                "deriving next inventory by temporal shift. Recollect data for "
-                "explicit colour-aware inventory targets."
+        next_inventory = np.asarray([
+            int(record["next_carrying_token"]) for record in records
+        ], dtype=np.int64)
+        invalid_current = (current < 0) | (current >= 7)
+        invalid_next = (next_inventory < 0) | (next_inventory >= 7)
+        if invalid_current.any() or invalid_next.any():
+            raise ValueError(
+                "[DataModule][MiniGrid] Inventory tokens must be in [0, 6]; "
+                f"invalid_current={int(invalid_current.sum())}, "
+                f"invalid_next={int(invalid_next.sum())}"
             )
-        np.clip(current, 0, 6, out=current)
-        np.clip(next_inventory, 0, 6, out=next_inventory)
         return current, next_inventory
+
+    @staticmethod
+    def _normalize_minigrid_info_for_batch(info):
+        """Return a fixed-schema copy of MiniGrid transition metadata.
+
+        Gym environment ``info`` dictionaries may contain event-only keys.  In
+        particular, ``uniform_reset`` is present only on forced-reset rows in
+        already collected target datasets.  PyTorch's default collator treats
+        dictionaries as structured batch data and therefore requires every row
+        to expose exactly the same keys.
+
+        The world model consumes the explicit ``inv`` tensor, not arbitrary
+        environment diagnostics.  Keep only the stable inventory fields plus a
+        boolean reset marker so batching remains deterministic without changing
+        the raw NPZ data.
+        """
+        if info is None:
+            return None
+
+        def _as_dict(value):
+            if isinstance(value, dict):
+                return value
+            if isinstance(value, np.ndarray) and value.size == 1:
+                value = value.item()
+                if isinstance(value, dict):
+                    return value
+            return {}
+
+        normalized = []
+        for value in np.asarray(info, dtype=object).reshape(-1):
+            record = _as_dict(value)
+            current_token = int(record.get("current_carrying_token", 0))
+            next_token = int(
+                record.get(
+                    "next_carrying_token",
+                    record.get("carrying_token", 0),
+                )
+            )
+            normalized.append({
+                "current_carrying_key": bool(current_token > 0),
+                "current_carrying_token": current_token,
+                "carrying_key": bool(next_token > 0),
+                "carrying_token": next_token,
+                "next_carrying_key": bool(next_token > 0),
+                "next_carrying_token": next_token,
+                "uniform_reset": bool(record.get("uniform_reset", False)),
+            })
+        return np.asarray(normalized, dtype=object)
 
     def state_batch_preprocess(self, state):
         obs = np.zeros((state.shape[0], 3, 3, state.shape[-1])) # The mask will extract a 3x3 square around the agent
@@ -190,8 +256,9 @@ class WMRLDataset(Dataset):
         1. Replay control: cap replay volume so historical data does not drown out
            the current iteration's samples.
         2. Sampling: subsample replay data when it exceeds the allowed ratio.
-        3. Target construction: use `obs_delta` (next frame minus current frame)
-           as the world-model target when appropriate for better numerical stability.
+    3. Target construction: categorical MiniGrid/Crafter samples retain the
+       absolute next frame; their semantic KEEP/SET_TO labels are derived in
+       the loss. Continuous domains retain their normalized delta target.
 
         Args:
             loaded (dict): Current-iteration samples (obs, next, act, info).
@@ -374,7 +441,7 @@ class WMRLDataset(Dataset):
         else:
             C_base = 3 # MiniGrid default
 
-        # Use the latest frame in stacked obs to calculate delta against obs_next
+        # Keep the latest frame available for continuous delta domains.
         obs_latest = obs[:, -C_base:] if (obs.ndim > 1 and obs.shape[1] > C_base) else obs
 
         # ===== (2) Build training targets =====
@@ -403,26 +470,20 @@ class WMRLDataset(Dataset):
         elif self.hparams.data_type == 'discrete':
             act_f = act.astype(np.int64)
             if env_type == 'minigrid':
-                act_bad = int(np.count_nonzero((act_f < 0) | (act_f >= int(self.act_norm_values))))
+                act_bad = int(np.count_nonzero((act_f < 0) | (act_f >= MINIGRID_ACTION_COUNT)))
                 if act_bad > 0:
-                    print(
-                        f"[DataModule][MiniGrid] Sanitizing actions: bad={act_bad}, "
-                        f"valid=[0, {int(self.act_norm_values) - 1}]"
+                    raise ValueError(
+                        f"[DataModule][MiniGrid] Invalid compact actions: bad={act_bad}; "
+                        f"valid=[0, {MINIGRID_ACTION_COUNT - 1}]"
                     )
-                    np.clip(act_f, 0, int(self.act_norm_values) - 1, out=act_f)
             obs_f = obs  # Keep discrete values unchanged for visualization/debugging.
 
-            if env_type == 'crafter':
-                # Preserve the categorical following frame. The WM loss
-                # derives KEEP/SET_TO effect labels from (obs, obs_next);
-                # subtracting category IDs would destroy their semantics.
+            if env_type in ('crafter', 'minigrid'):
+                # Categorical domains always retain the absolute following
+                # frame. Their loss derives semantic effect labels from the
+                # current/following pair; subtracting category IDs is invalid.
                 obs_delta = obs_next.astype(np.float32)
-                print(
-                    "[DataModule] Crafter mode: deriving categorical effects "
-                    f"from current/following frames (shape {obs_delta.shape})"
-                )
             else:
-                # MiniGrid: predict delta for MSE regression (numerically stable)
                 obs_delta = (obs_next.astype(np.int16) - obs_latest.astype(np.int16)).astype(np.float32)
                 if getattr(self.hparams, "clip_discrete_delta", False):
                     np.clip(obs_delta, -1, 1, out=obs_delta)
@@ -434,10 +495,27 @@ class WMRLDataset(Dataset):
         data = {'obs': obs_f, 'obs_next': obs_delta, 'act': act_f}
         if transition_changed is not None:
             action_ids = act_f.reshape(len(act_f), -1)[:, 0].astype(np.int64)
-            # Generic action/event buckets: no domain objects or action meanings
-            # are encoded here. Rare state-changing outcomes receive equal
-            # sampling opportunity alongside no-op outcomes for the same action.
-            data['_sampling_bucket'] = action_ids * 2 + transition_changed.astype(np.int64)
+            if env_type == 'minigrid':
+                current_frame = obs[:, -3:]
+                object_changed = np.any(current_frame[:, 0] != obs_next[:, 0], axis=(1, 2))
+                color_changed = np.any(current_frame[:, 1] != obs_next[:, 1], axis=(1, 2))
+                state_changed = np.any(current_frame[:, 2] != obs_next[:, 2], axis=(1, 2))
+                inv_changed = (
+                    np.any(inv != inv_next, axis=tuple(range(1, inv.ndim)))
+                    if inv is not None and inv_next is not None
+                    else np.zeros(len(obs), dtype=bool)
+                )
+                signature = (
+                    object_changed.astype(np.int64)
+                    | (color_changed.astype(np.int64) << 1)
+                    | (state_changed.astype(np.int64) << 2)
+                    | (inv_changed.astype(np.int64) << 3)
+                )
+                data['_sampling_bucket'] = action_ids * 16 + signature
+            else:
+                data['_sampling_bucket'] = action_ids * 2 + transition_changed.astype(np.int64)
+        if env_type == 'minigrid' and info is not None:
+            info = self._normalize_minigrid_info_for_batch(info)
         if env_type in ('with_obj', 'minigrid') and info is not None:
             data['info'] = info
         if inv is not None:
@@ -506,6 +584,43 @@ class WMRLDataModule(pl.LightningDataModule):
         else:
             self.data_train = torch.utils.data.Subset(data, range(0, split_size))
             self.data_test = torch.utils.data.Subset(data, range(split_size, len(data)))
+
+        # Target archives are validation-only and can be much larger than is
+        # useful for repeated MAC evaluation.  When requested by the caller,
+        # select one deterministic random subset from the full archive.  A
+        # fixed seed keeps exactly the same transitions across MAC iterations,
+        # so changes in target loss reflect the model rather than resampling.
+        max_validation_samples = int(
+            getattr(self.cfg, "max_validation_samples", 0)
+        )
+        sample_from_full = bool(
+            getattr(self.cfg, "validation_sample_from_full_dataset", False)
+        )
+        if max_validation_samples > 0:
+            if sample_from_full:
+                candidates = np.arange(len(data), dtype=np.int64)
+            else:
+                candidates = np.asarray(self.data_test.indices, dtype=np.int64)
+            if len(candidates) > max_validation_samples:
+                subset_seed = int(
+                    getattr(self.cfg, "validation_subset_seed", 0)
+                )
+                subset_rng = np.random.default_rng(subset_seed)
+                selected = subset_rng.choice(
+                    candidates,
+                    size=max_validation_samples,
+                    replace=False,
+                )
+                # Sorting does not change membership and makes traversal and
+                # debugging reproducible as well as sampling reproducible.
+                selected.sort()
+                self.data_test = torch.utils.data.Subset(data, selected.tolist())
+                source = "full archive" if sample_from_full else "validation holdout"
+                print(
+                    f"[DataModule] Fixed validation subset: "
+                    f"{max_validation_samples}/{len(candidates)} samples from "
+                    f"{source} (seed={subset_seed})."
+                )
 
     def train_dataloader(self):
         num_workers = int(getattr(self.cfg, "n_cpu", 0))

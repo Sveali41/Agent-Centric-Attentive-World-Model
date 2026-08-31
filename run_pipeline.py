@@ -29,8 +29,22 @@ MODEL_DIR = ROOT / "modelBased" / "models"
 try:
     from dotenv import load_dotenv
     load_dotenv(ROOT / ".env", override=False)
+    load_dotenv(ROOT.parent / ".env", override=False)
 except ImportError:
     pass
+
+# Allow the pipeline to start even when it is launched without sourcing the
+# repository-level .env file first.
+os.environ.setdefault("PROJECT_ROOT", str(ROOT.parent))
+os.environ.setdefault("WM_ROOT", str(ROOT))
+os.environ.setdefault("ENV_PATH", str(ROOT.parent / "level"))
+os.environ.setdefault("WORLD_MODEL_PATH", str(ROOT / "modelBased"))
+os.environ.setdefault(
+    "TRAIN_DATASET_PATH", str(ROOT / "modelBased" / "data" / "train_world_model")
+)
+os.environ.setdefault("MODEL_FPATH", str(ROOT / "modelBased" / "models"))
+os.environ.setdefault("GENERATOR_PATH", str(ROOT.parent / "generator"))
+os.environ.setdefault("TRAINER_PATH", str(ROOT.parent / "trainer"))
 
 
 
@@ -60,6 +74,7 @@ def policy_runtime_overrides(cfg: DictConfig) -> list[str]:
     ppo_cfg = cfg.PPO
     overrides = []
     for name in (
+        "wm_control_mode",
         "max_ep_len",
         "rollout_steps",
         "max_training_timesteps",
@@ -93,7 +108,18 @@ def policy_runtime_overrides(cfg: DictConfig) -> list[str]:
 def domain_runtime_overrides(cfg: DictConfig, domain: str) -> list[str]:
     """Forward domain task and collection budgets to stage subprocesses."""
     domain_cfg = cfg.domains[domain]
-    overrides = [f"domains.{domain}.task_name={domain_cfg.task_name}"]
+    overrides = [
+        f"domains.{domain}.task_name={domain_cfg.task_name}",
+        # task_name alone does not rewrite a literal layout_path. Forward the
+        # fully resolved layout so collection, WM training and PPO all use the
+        # same environment file in their fresh Hydra subprocesses.
+        f"domains.{domain}.layout_path={domain_cfg.layout_path}",
+    ]
+    if domain == "minigrid" and hasattr(domain_cfg, "minigrid_transition_mode"):
+        overrides.append(
+            f"domains.{domain}.minigrid_transition_mode="
+            f"{domain_cfg.minigrid_transition_mode}"
+        )
     collection_cfg = getattr(domain_cfg, "data_collection", None)
     if collection_cfg is not None:
         for name in (
@@ -181,7 +207,13 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
         f"PPO.seed={int(cfg.PPO.seed)}",
         f"PPO.action_set={cfg.PPO.action_set}",
         f"domains.{domain}.task_name={domain_cfg.task_name}",
+        f"domains.{domain}.layout_path={domain_cfg.layout_path}",
     ]
+    if domain == "minigrid" and hasattr(domain_cfg, "minigrid_transition_mode"):
+        policy_identity_overrides.append(
+            f"domains.{domain}.minigrid_transition_mode="
+            f"{domain_cfg.minigrid_transition_mode}"
+        )
     if hasattr(cfg, "p2e"):
         policy_identity_overrides.append(
             f"p2e.enabled={str(bool(cfg.p2e.enabled)).lower()}"
@@ -457,6 +489,56 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
 
     if bool(cfg.pipeline.skip_policy):
         print(f"[SKIP] Policy stage disabled for {domain}")
+    elif domain == "minigrid" and str(getattr(cfg.PPO, "wm_control_mode", "ppo")).lower() in {"mpc", "mcts", "astar"}:
+        control_mode = str(cfg.PPO.wm_control_mode).lower()
+        print(f"[{domain}] Running online WM {control_mode.upper()} evaluation; PPO training is disabled by flag.")
+        control_cfg = getattr(cfg.PPO, control_mode)
+        if control_mode == "mpc":
+            control_names = (
+                "horizon", "population", "elite_count", "iterations", "gamma",
+                "goal_reward", "progress_reward", "step_penalty", "invalid_action_penalty",
+                "uncertainty_penalty", "fallback_action", "episodes",
+                "print_every_steps", "output_dir",
+            )
+        elif control_mode == "mcts":
+            control_names = (
+                "simulations", "max_depth", "rollout_depth", "exploration_constant", "gamma",
+                "goal_reward", "progress_reward", "inventory_change_bonus", "door_open_bonus",
+                "step_penalty", "invalid_action_penalty", "uncertainty_penalty", "heuristic_weight",
+                "fallback_action", "episodes", "print_every_steps", "output_dir",
+            )
+        else:
+            control_names = (
+                "execution_mode", "max_depth", "max_expansions",
+                "progress_every_expansions", "max_real_steps",
+                "initial_directions", "seeds", "validate_real", "save_gif",
+                "rollout_plans_in_real_env", "evaluate_all_targets", "target_dir",
+                "gif_fps", "print_every_steps", "output_dir",
+            )
+        control_overrides = [
+            f"PPO.{control_mode}.{name}={getattr(control_cfg, name)}"
+            for name in (
+                *control_names,
+            )
+            if hasattr(control_cfg, name)
+        ]
+        run_command(
+            [
+                python,
+                "-m",
+                (
+                    "modelBased.policy_training.dijkstra_planner"
+                    if control_mode == "astar"
+                    else f"modelBased.policy_training.{control_mode}_planner"
+                ),
+                "domain=minigrid",
+                f"PPO.checkpoint_path_wm={world_model_path}",
+                *policy_overrides,
+                *control_overrides,
+            ],
+            f"{domain} / online WM {control_mode.upper()}",
+            cfg,
+        )
     elif domain == "minigrid":
         policy_path = policy_checkpoint_path(cfg, domain=domain)
         policy_compatible = policy_checkpoint_is_compatible(

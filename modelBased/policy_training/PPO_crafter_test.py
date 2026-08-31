@@ -18,6 +18,7 @@ from omegaconf import DictConfig
 
 from domain.crafter.crafter_custom_env import CustomCrafterEnv
 from modelBased.common import utils
+from modelBased.common.utils import WM_OUTPUTS_PATH
 from modelBased.common.artifacts import append_mean_row, detail_rows
 from modelBased.policy_training.PPO import PPO
 from modelBased.policy_training.experiment_naming import (
@@ -105,7 +106,9 @@ def validate_crafter_policy(cfg: DictConfig) -> float:
     ppo_agent.policy_old.eval()
 
     csv_dir = Path(str(ppo_cfg.save_path_csv)).expanduser().resolve()
-    gif_dir = Path(str(getattr(ppo_cfg, "save_path_gif", "outputs/PPO_gif"))).expanduser().resolve()
+    gif_dir = Path(
+        str(getattr(ppo_cfg, "save_path_gif", WM_OUTPUTS_PATH / "evaluation" / "ppo" / "gif"))
+    ).expanduser().resolve()
     if save_gif:
         gif_dir.mkdir(parents=True, exist_ok=True)
     if save_csv:

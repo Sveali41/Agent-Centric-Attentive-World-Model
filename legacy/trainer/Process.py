@@ -2,6 +2,7 @@ from omegaconf import DictConfig
 import Support
 from legacy.generator.common.utils import load_gen
 from modelBased.common.utils import TRAINER_PATH
+from pathlib import Path
 import hydra
 from learning_buffer import EnvLearningBuffer
 import numpy as np
@@ -41,8 +42,16 @@ def run(cfg: DictConfig):
     use_wandb = cfg.training_generator.use_wandb
     if use_wandb:
         run_name = "CL_WM_without_RB_2" 
-        wandb.login(key="eeecc8f761c161927a5713203b0362dfcb3181c4")
-        main_run = wandb.init(project='World_Model_Curriculum_Learning', entity='18920011663-king-s-college-london', name=run_name, reinit=True)
+        wandb_dir = Path(str(cfg.paths.wandb)).expanduser().resolve()
+        wandb_dir.mkdir(parents=True, exist_ok=True)
+        wandb.login()
+        main_run = wandb.init(
+            project='World_Model_Curriculum_Learning',
+            entity='18920011663-king-s-college-london',
+            name=run_name,
+            reinit=True,
+            dir=str(wandb_dir),
+        )
         wandb.define_metric("curriculum_step")  
         wandb.define_metric("final_task_performance", step_metric="curriculum_step")
     old_params, fisher = None, None
@@ -212,4 +221,3 @@ def check_data(cfg: DictConfig):
 if __name__ == "__main__":
     run()
     # check_data()  # Uncomment to check data
-

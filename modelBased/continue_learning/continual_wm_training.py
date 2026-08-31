@@ -27,10 +27,13 @@ from modelBased.continue_learning.fisher_buffer import FisherReplayBuffer
 from modelBased.world_model import AttentionWM_training
 from modelBased.world_model.AttentionWM import AttentionWorldModel
 from modelBased.common.artifacts import (
+    add_effect_suffix,
     continual_artifact_path,
     continual_phase_data_path,
     world_model_checkpoint_path,
 )
+from modelBased.common.utils import WM_RESULTS_PATH
+from domain.minigrid.transition_codec import canonical_minigrid_schema
 
 
 STATE_VERSION = 1
@@ -177,6 +180,11 @@ def _samples_for_replay(data: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
 def _architecture_signature(cfg: DictConfig, channels: int) -> dict[str, Any]:
     domain_cfg = cfg.domains[str(cfg.domain)]
     schema = OmegaConf.to_container(domain_cfg.observation_schema, resolve=True)
+    if str(cfg.domain) == "minigrid" and not schema:
+        schema = canonical_minigrid_schema(
+            str(getattr(cfg.attention_model, "minigrid_transition_mode", "effect")),
+            str(getattr(cfg.attention_model, "effect_reduction", "balanced_mean")),
+        )
     return {
         "env_type": str(cfg.attention_model.env_type),
         "model_type": str(cfg.attention_model.model_type),
@@ -496,7 +504,7 @@ def run_continual(cfg: DictConfig) -> dict[str, Any]:
     if state_path is None or replay_path is None:
         raise ValueError("Continual learning requires state_path and replay_path")
     if metrics_path is None:
-        metrics_path = state_path.with_suffix(".csv")
+        metrics_path = WM_RESULTS_PATH / "continual_learning" / f"{state_path.stem}.csv"
 
     # Configure the model once for the largest map used by the curriculum.
     cfg.attention_model.grid_shape = [channels, max_shape[0], max_shape[1]]
@@ -511,6 +519,7 @@ def run_continual(cfg: DictConfig) -> dict[str, Any]:
     history: list[dict[str, Any]] = []
     next_phase_index = 0
     active_fit_ckpt = None
+    base_phase_epochs = int(getattr(cfg.attention_model, "n_epochs", 1))
 
     if bool(getattr(continual_cfg, "resume", True)) and state_path.is_file():
         state = _load_state(state_path)
@@ -548,14 +557,29 @@ def run_continual(cfg: DictConfig) -> dict[str, Any]:
         # per-sample Fisher backward passes.
         phase_cfg.attention_model.ewc_enabled = False
         phase_cfg.attention_model.compute_fisher = False
+        # Lightning stores the optimizer and scheduler in ``last.ckpt``. By
+        # increasing the absolute epoch limit and resuming from the previous
+        # phase's last checkpoint, each phase receives one additional epoch
+        # block without resetting Adam moments or the scheduler state.
+        phase_cfg.attention_model.n_epochs = base_phase_epochs * (index + 1)
         phase_dir = state_path.parent / f"{state_path.stem}_phase_{index}"
         phase_cfg.attention_model.checkpoint_dir = str(phase_dir)
         # Do not expose an intermediate phase as the canonical final model.
         # The final artifact is copied only after every phase completes.
-        phase_cfg.attention_model.model_save_path = str(phase_dir / "phase_model.ckpt")
+        phase_model_path = phase_dir / "phase_model.ckpt"
+        if str(getattr(phase_cfg.attention_model, "minigrid_transition_mode", "")) == "effect":
+            phase_model_path = add_effect_suffix(phase_model_path)
+        phase_cfg.attention_model.model_save_path = str(phase_model_path)
         data = _load_phase_data(phase.data_dir, max_shape, channels)
         replay_data = buffer.export_dict() if len(buffer) else None
-        fit_ckpt = active_fit_ckpt if index == next_phase_index else None
+        if index == next_phase_index and active_fit_ckpt:
+            fit_ckpt = active_fit_ckpt
+        elif index > 0:
+            previous_phase_dir = state_path.parent / f"{state_path.stem}_phase_{index - 1}"
+            previous_fit = previous_phase_dir / "last.ckpt"
+            fit_ckpt = str(previous_fit) if previous_fit.is_file() else None
+        else:
+            fit_ckpt = None
 
         # Persist the previous phase before training.  If this phase is
         # interrupted, its last.ckpt can be resumed without advancing the
@@ -653,6 +677,8 @@ def run_continual(cfg: DictConfig) -> dict[str, Any]:
     final_checkpoint.parent.mkdir(parents=True, exist_ok=True)
     final_phase_dir = state_path.parent / f"{state_path.stem}_phase_{len(phases) - 1}"
     final_source = final_phase_dir / "phase_model.ckpt"
+    if str(getattr(cfg.attention_model, "minigrid_transition_mode", "")) == "effect":
+        final_source = add_effect_suffix(final_source)
     if not final_source.is_file():
         fallback_source = final_phase_dir / f"best-{str(cfg.domain)}.ckpt"
         if fallback_source.is_file():

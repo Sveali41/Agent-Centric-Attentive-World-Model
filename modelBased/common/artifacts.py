@@ -63,6 +63,11 @@ def continual_learning_enabled(cfg, domain: str | None = None) -> bool:
 def categorical_effect_enabled(cfg, domain: str | None = None) -> bool:
     """Return whether the domain map schema uses categorical effects."""
     selected_domain = str(domain or cfg.domain)
+    if selected_domain == "minigrid":
+        return str(
+            getattr(getattr(cfg, "attention_model", None), "minigrid_transition_mode", "")
+            or getattr(cfg.domains[selected_domain], "minigrid_transition_mode", "effect")
+        ).lower() == "effect"
     schema = getattr(cfg.domains[selected_domain], "observation_schema", [])
     for field in schema:
         distribution = (
@@ -217,17 +222,33 @@ def world_model_checkpoint_path(cfg, domain: str | None = None) -> Path:
             cfg, "final_checkpoint", selected_domain
         )
         if configured is not None:
+            if categorical_effect_enabled(cfg, selected_domain):
+                configured = add_effect_suffix(configured)
             return configured
-        base = Path(str(domain_cfg.world_model_checkpoint)).expanduser().resolve()
-        if p2e_enabled(cfg, selected_domain):
-            base = add_p2e_suffix(base)
-        return add_continual_suffix(base)
     base = Path(str(domain_cfg.world_model_checkpoint)).expanduser().resolve()
+    if categorical_effect_enabled(cfg, selected_domain):
+        base = add_effect_suffix(base)
     if p2e_enabled(cfg, selected_domain):
-        return add_p2e_suffix(base)
+        base = add_p2e_suffix(base)
     if rmax_like_enabled(cfg, selected_domain):
-        return add_rmax_like_suffix(base)
+        base = add_rmax_like_suffix(base)
+    if continual_learning_enabled(cfg, selected_domain):
+        base = add_continual_suffix(base)
     return base
+
+
+def align_world_model_artifact_path(cfg) -> Path | None:
+    """Align the configured WM path with the active MiniGrid representation."""
+    if str(getattr(cfg, "domain", "")) != "minigrid":
+        return None
+    configured = getattr(getattr(cfg, "attention_model", None), "model_save_path", None)
+    if configured is None:
+        return None
+    path = Path(str(configured)).expanduser().resolve()
+    if categorical_effect_enabled(cfg, "minigrid"):
+        path = add_effect_suffix(path, before_seed=True)
+    cfg.attention_model.model_save_path = str(path)
+    return path
 
 
 def single_environment_dataset_path(cfg, domain: str | None = None) -> Path:
@@ -318,6 +339,8 @@ def identity_from_config(cfg: Any, domain: str | None = None) -> dict[str, Any]:
         "layout_hash": layout_hash(layout_path),
     }
     if domain == "minigrid":
+        identity["observation_pair_encoding"] = "absolute_state_pair_v1"
+        identity["action_encoding"] = "compact6_v1"
         collect_cfg = getattr(getattr(cfg, "env", None), "collect", None)
         identity["collection_replace_start_with_empty"] = bool(
             getattr(collect_cfg, "replace_start_with_empty", False)

@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 from typing import List, Dict, Tuple
 from domain.minigrid import minigrid_support as minigrid_utils
+from domain.minigrid.transition_codec import minigrid_effect_cell_nll
 import random
 import os
 import tempfile
@@ -137,18 +138,25 @@ class FisherReplayBuffer:
                         weighted=False,
                     )
                 loss = per_cell.mean(dim=(1, 2)).detach().cpu().tolist()
+            elif getattr(model, "env_type", "") == "minigrid":
+                per_cell, _ = minigrid_effect_cell_nll(
+                    pred_for_loss,
+                    obs_masked,
+                    obs_next_masked,
+                    mode=getattr(model, "minigrid_transition_mode", "absolute"),
+                )
+                loss = per_cell.mean(dim=(1, 2)).detach().cpu().tolist()
             else:
                 loss = [F.mse_loss(pred_for_loss[i], obs_next_masked[i]).item() for i in range(len(pred_for_loss))]
 
-            # Optional weighting term, e.g. based on state change magnitude.
-            obs_full = batch["obs"].float()
-            obs_next_full = batch["obs_next"].float()
-            delta = [(obs_next_full[i] - obs_full[i]).abs().mean().item() for i in range(len(obs_next_full))]
-            score = [l + 0.1 * d for l, d in zip(loss, delta)]  # Combined score.
+            # Categorical MiniGrid IDs are labels, not continuous magnitudes;
+            # never rank replay samples by numeric ID differences.
+            score = loss
         
-            scored_samples = list(zip(score, [dict(obs=samples['obs'][i],
-                                                   act=samples['act'][i],
-                                                   obs_next=samples['obs_next'][i]) for i in range(len(score))]))
+        scored_samples = list(zip(
+            score,
+            [self._sample_at(samples, i) for i in range(len(score))],
+        ))
         scored_samples.sort(key=lambda x: -x[0])
         top_k_samples = [s for _, s in scored_samples[:top_k]]
         return top_k_samples
@@ -216,14 +224,7 @@ class FisherReplayBuffer:
 
         selected = []
         for i in selected_indices:
-            sample = {
-                'obs': samples['obs'][i],
-                'act': samples['act'][i],
-                'obs_next': samples['obs_next'][i]
-            }
-            if 'info' in samples:
-                sample['info'] = samples['info'][i]
-            selected.append(sample)
+            selected.append(self._sample_at(samples, i))
 
         self.buffer.extend(selected)
         if len(self.buffer) > self.max_size:

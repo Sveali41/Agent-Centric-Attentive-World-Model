@@ -49,12 +49,17 @@ def balanced_categorical_effect_loss(
     reduction: str = "balanced_mean",
     label_smoothing: float = 0.0,
     normalize: bool = True,
+    focal_gamma: float = 0.0,
 ) -> torch.Tensor:
-    """Cross entropy with automatic equal averaging of KEEP and SET_TO cells.
+    """Categorical effect loss with optional per-cell focal modulation.
 
     ``balanced_mean`` first averages each non-empty group (KEEP and SET_TO),
     then averages the group losses.  It therefore avoids a hand-tuned class
     weight while preventing unchanged cells from dominating sparse effects.
+
+    When ``focal_gamma`` is positive, the focal factor is applied to each
+    categorical cell before any reduction.  ``focal_gamma=0`` is exactly the
+    normalized cross-entropy path used by the legacy implementation.
     """
     if logits.ndim != target.ndim + 1:
         raise ValueError(
@@ -77,6 +82,15 @@ def balanced_categorical_effect_loss(
         reduction="none",
         label_smoothing=float(label_smoothing),
     )
+    focal_gamma = float(focal_gamma)
+    if focal_gamma < 0.0 or not math.isfinite(focal_gamma):
+        raise ValueError(f"focal_gamma must be finite and non-negative, got {focal_gamma!r}")
+    if focal_gamma > 0.0:
+        probabilities = torch.softmax(logits, dim=1)
+        p_true = probabilities.gather(1, target.unsqueeze(1)).squeeze(1)
+        p_true = p_true.clamp(min=torch.finfo(probabilities.dtype).eps, max=1.0)
+        focal_factor = (1.0 - p_true).pow(focal_gamma)
+        per_cell = per_cell * focal_factor
     scale = math.log(logits.shape[1]) if normalize else 1.0
     per_cell = per_cell / scale
 

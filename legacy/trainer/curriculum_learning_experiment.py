@@ -2,7 +2,14 @@ from omegaconf import DictConfig
 import Support
 from legacy.generator.common.utils import load_gen
 from domain.minigrid.minigrid_custom_env import CustomMiniGridEnv
-from modelBased.common.utils import LEVEL_PATH, TRAINER_PATH, extract_unique_patches, generate_minitasks_until_covered
+from modelBased.common.utils import (
+    LEVEL_PATH,
+    TRAINER_PATH,
+    WM_RESULTS_PATH,
+    WM_VISUALIZATIONS_PATH,
+    extract_unique_patches,
+    generate_minitasks_until_covered,
+)
 from modelBased.world_model import AttentionWM_training
 from modelBased.policy_training import PPO_world_training
 from modelBased.data.data_collect import visualize_agent_coverage, visualize_saved_dataset
@@ -180,7 +187,7 @@ def collect_data_general(
     save_path = data_save_dir / f"{save_name}_test_{explore_type}.npz"
 
     cfg.env.collect.data_save_path = str(save_path)
-    cfg.env.collect.visualize_save_path = TRAINER_PATH / "logs" / "dataset_visualization"
+    cfg.env.collect.visualize_save_path = WM_VISUALIZATIONS_PATH / "legacy" / "datasets"
     cfg.env.collect.visualize_filename = f"{save_name}_{explore_type}.png"
 
     # -----------------------------
@@ -362,7 +369,7 @@ def collect_data_for_txt(cfg: DictConfig):
     file_name = os.path.splitext(env_text_file_name)[0]
     explore_type = cfg.env.collect.data_type  # 'random' or 'uniform'
     cfg.env.collect.data_save_path = TRAINER_PATH / 'data' / f'{file_name}_test_{explore_type}.npz'
-    cfg.env.collect.visualize_save_path = TRAINER_PATH / 'logs' / 'dataset_visualization'
+    cfg.env.collect.visualize_save_path = WM_VISUALIZATIONS_PATH / 'legacy' / 'datasets'
     cfg.env.collect.visualize_filename = f"{file_name}_{explore_type}.png"
 
     collect_data_general(
@@ -389,7 +396,7 @@ def visualize_CL_dataset(cfg: DictConfig):
     file_name = os.path.splitext(env_text_file_name)[0]
     explore_type = cfg.env.collect.data_type  # 'random' or 'uniform'
     cfg.env.collect.data_save_path = os.path.join(data_save_dir, f'{file_name}_test_{explore_type}.npz')
-    cfg.env.collect.visualize_save_path = TRAINER_PATH / 'logs' / 'dataset_visualization'
+    cfg.env.collect.visualize_save_path = WM_VISUALIZATIONS_PATH / 'legacy' / 'datasets'
     cfg.env.collect.visualize_filename = f"{file_name}_{explore_type}.png"
 
     data_path = cfg.env.collect.data_save_path
@@ -427,7 +434,7 @@ def test_1(cfg: DictConfig):
     validation_rounds = 10          # number of validation rounds if interval mode enabled
     VALID_TIMES = 50                # number of target validations per phase (original setting)
 
-    csv_path = os.path.join(TRAINER_PATH, 'logs', 'target_eval_log.csv')
+    csv_path = str(WM_RESULTS_PATH / 'legacy' / 'target_eval_log.csv')
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
 
     fisher_buffer = FisherReplayBuffer(max_size=cfg.attention_model.fisher_buffer_size)
@@ -557,7 +564,7 @@ def test_1(cfg: DictConfig):
         plt.xlabel("X Position (columns)")
         plt.ylabel("Y Position (rows)")
 
-        output_path = TRAINER_PATH / 'logs' / f"loss_map_avg_{phase_name}.png"
+        output_path = WM_VISUALIZATIONS_PATH / 'legacy' / f"loss_map_avg_{phase_name}.png"
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close()
@@ -596,7 +603,7 @@ def curriculum_learning_transitions(cfg: DictConfig):
     explore_type = cfg.env.collect.data_type # uniform / random
     data_save_dir = TRAINER_PATH / "data"
 
-    log_dir = TRAINER_PATH / "logs"
+    log_dir = WM_RESULTS_PATH / "legacy"
     csv_path = log_dir / "target_eval_log_compare_patches_minitask.csv"
     os.makedirs(log_dir, exist_ok=True)
 

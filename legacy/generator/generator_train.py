@@ -10,7 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from legacy.generator.data.datamodule import GenDataModule
 from legacy.generator.data.datamodule_vae import VaeDataModule
 import hydra
-from modelBased.common.utils import PROJECT_ROOT, get_env
+from modelBased.common.utils import PROJECT_ROOT, WM_VISUALIZATIONS_PATH, get_env
 from omegaconf import DictConfig
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
@@ -46,7 +46,11 @@ def train(cfg: DictConfig):
         model = VAE(hparams.vae)
     wandb_logger = None 
     if hparams.training_generator.use_wandb:
-        wandb_logger = WandbLogger(project="Gen Training", log_model=True)
+        wandb_logger = WandbLogger(
+            project="Gen Training",
+            log_model=True,
+            save_dir=str(hparams.paths.wandb),
+        )
         wandb_logger.experiment.watch(model, log='all', log_freq=1000)
 
     # Define the trainer
@@ -138,7 +142,7 @@ def validate(cfg: DictConfig):
                     generated_maps,
                     count=32,
                     save_flag=True,
-                    save_path=str(PROJECT_ROOT / 'legacy' / 'generator' / 'result'),
+                    save_path=str(WM_VISUALIZATIONS_PATH / 'legacy' / 'generator'),
                 )
 
 if __name__ == "__main__":

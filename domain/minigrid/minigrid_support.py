@@ -295,7 +295,7 @@ class Visualization:
     def __init__(self, config=""):
         self.cfg = config
         if not os.path.exists(self.cfg.save_path):
-            os.mkdir(self.cfg.save_path)
+            os.makedirs(self.cfg.save_path, exist_ok=True)
 
     def _direction_name(self, value):
         """Map invalid/unseen direction values to a safe visualization label."""

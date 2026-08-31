@@ -12,8 +12,8 @@ import torch
 
 from modelBased.world_model.AttentionWM import AttentionWorldModel
 from modelBased.data.datamodule import WMRLDataModule, WMRLDataset, WMRLDataset
-from modelBased.common.artifacts import dataset_matches
-from modelBased.common.utils import PROJECT_ROOT, get_env
+from modelBased.common.artifacts import dataset_matches, align_world_model_artifact_path
+from modelBased.common.utils import PROJECT_ROOT, WORLD_MODEL_PATH, WM_RESULTS_PATH, get_env
 import hydra
 from omegaconf import DictConfig
 from pytorch_lightning.loggers import CSVLogger
@@ -47,6 +47,40 @@ class ValidationDataModule(WMRLDataModule):
             loaded = self.direct_data
         else:
             loaded = np.load(self.data_dir, allow_pickle=True)
+
+        # Validation archives can be large and are evaluated repeatedly during
+        # MAC.  Subsample the raw aligned arrays before WMRLDataset performs
+        # channel validation, inventory decoding, and sampling-bucket setup.
+        # The fixed seed gives every MAC iteration exactly the same holdout.
+        max_samples = int(getattr(self.cfg, "max_validation_samples", 0))
+        total_samples = len(loaded["a"])
+        if 0 < max_samples < total_samples:
+            subset_seed = int(getattr(self.cfg, "validation_subset_seed", 0))
+            rng = np.random.default_rng(subset_seed)
+            selected = rng.choice(
+                total_samples,
+                size=max_samples,
+                replace=False,
+            )
+            selected.sort()
+
+            keys = loaded.files if hasattr(loaded, "files") else loaded.keys()
+            sampled = {}
+            for key in keys:
+                value = loaded[key]
+                # Transition arrays all have N as their leading dimension.
+                # Scalar identity metadata must be copied without indexing.
+                if getattr(value, "ndim", 0) > 0 and len(value) == total_samples:
+                    sampled[key] = value[selected]
+                else:
+                    sampled[key] = value
+            if hasattr(loaded, "close"):
+                loaded.close()
+            loaded = sampled
+            print(
+                f"[ValidationDataModule] Fixed raw subset: "
+                f"{max_samples}/{total_samples} samples (seed={subset_seed})."
+            )
         
         # Create dataset
         data = WMRLDataset(loaded, self.cfg, self.replay_data)
@@ -57,7 +91,10 @@ class ValidationDataModule(WMRLDataModule):
         # Training split is intentionally empty in validation-only mode.
         self.data_train = torch.utils.data.Subset(data, range(0, 0))
         
-        print(f"[ValidationDataModule] Used 100% data ({len(self.data_test)} samples) for validation.")
+        print(
+            f"[ValidationDataModule] Validating on "
+            f"{len(self.data_test)} prepared samples."
+        )
 
     def val_dataloader(self):
         return torch.utils.data.DataLoader(
@@ -138,6 +175,7 @@ def run(
     direct_data=None,
     fit_ckpt_path=None,
 ):
+    align_world_model_artifact_path(cfg)
     if net is None:
         from modelBased.world_model.AttentionWM import AttentionWorldModel
         net = AttentionWorldModel(cfg.attention_model)
@@ -180,18 +218,46 @@ def run(
     # logger
     logger = None
     if use_wandb:
-        logger = WandbLogger(project="Local_Attention_Training", log_model=True, reinit=True)
+        wandb_dir = Path(
+            str(
+                getattr(
+                    getattr(cfg, "paths", None),
+                    "wandb",
+                    WM_RESULTS_PATH.parent / "wandb",
+                )
+            )
+        ).expanduser().resolve()
+        wandb_dir.mkdir(parents=True, exist_ok=True)
+        logger = WandbLogger(
+            project="Local_Attention_Training",
+            log_model=True,
+            reinit=True,
+            save_dir=str(wandb_dir),
+        )
         # Avoid attaching W&B watch hooks during validation-only execution.
         # Those hooks would outlive the temporary logger instance.
         if not cfg.attention_model.freeze_weight:
             # logger.experiment.watch(net, log='all', log_freq=1000)
             pass
     else:
-        # Keep local metrics even when W&B is disabled.
-        logger = CSVLogger(
-            save_dir=str(PROJECT_ROOT / "modelBased" / "log"),
-            name="world_model",
+        # MAC already owns the experiment-level CSV in
+        # the curriculum results directory. Disable Lightning's per-call CSVLogger by
+        # default in the MAC config so every WM train/validation invocation
+        # does not create a new ``world_model/version_*/metrics.csv``
+        # directory. It remains available as an explicit opt-in for
+        # standalone WM debugging.
+        save_local_metrics = bool(
+            getattr(cfg.attention_model, "save_local_metrics", True)
         )
+        if save_local_metrics:
+            logger = CSVLogger(
+                save_dir=str(
+                    getattr(cfg.attention_model, "metrics_dir", WM_RESULTS_PATH / "world_model")
+                ),
+                name="world_model",
+            )
+        else:
+            logger = False
 
     # callbacks
     metric_to_monitor = 'val/observation_loss'
@@ -230,10 +296,32 @@ def run(
     debug_mode = bool(getattr(cfg.attention_model, "debug_mode", False))
     show_progress_bar = bool(getattr(cfg.attention_model, "enable_progress_bar", True))
 
+    # When resuming a full Lightning checkpoint between MAC iterations,
+    # Lightning also restores the previous epoch counter.  Extend the epoch
+    # budget so this invocation still gets the configured number of fresh
+    # epochs instead of stopping at the old max_epochs boundary.
+    resume_epoch_offset = 0
+    if fit_ckpt_path and os.path.isfile(str(fit_ckpt_path)):
+        try:
+            resume_meta = torch.load(
+                str(fit_ckpt_path),
+                map_location="cpu",
+                weights_only=False,
+            )
+            resume_epoch_offset = max(0, int(resume_meta.get("epoch", -1)) + 1)
+            print(
+                f"[WM] Restoring optimizer state after epoch "
+                f"{resume_epoch_offset - 1}; adding {int(cfg.attention_model.n_epochs)} new epochs."
+            )
+        except Exception as exc:
+            print(f"[WM] Could not read resume epoch metadata: {exc}. Using a fresh epoch budget.")
+            resume_epoch_offset = 0
+    max_epochs = int(cfg.attention_model.n_epochs) + resume_epoch_offset
+
     trainer = pl.Trainer(
         precision=32,
         logger=logger,
-        max_epochs=cfg.attention_model.n_epochs,
+        max_epochs=max_epochs,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         gradient_clip_val=1.0,

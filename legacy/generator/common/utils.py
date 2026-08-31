@@ -2,7 +2,8 @@ import torch
 from legacy.generator.gen import GAN
 import random
 import re
-from minigrid.core.constants import IDX_TO_COLOR
+import numpy as np
+from minigrid.core.constants import IDX_TO_COLOR, IDX_TO_OBJECT
 
 def load_gen(cfg):
     hparams = cfg
@@ -40,14 +41,40 @@ def generate_obj_map(layout, map_dict):
     Returns:
         str: A string representation of the layout.
     """
-    # Convert the layout tensor to a numpy array
-    reverse_map_dict = {v: k for k, v in map_dict.items()}
+    # Accept both the historical batched shape (1, H, W) and the generator's
+    # current single-map shape (H, W).  The old implementation always indexed
+    # layout[0][i], which turns a scalar into ``row`` for a 2-D map.
+    if hasattr(layout, "detach"):
+        layout = layout.detach().cpu().numpy()
+    else:
+        layout = np.asarray(layout)
+
+    while layout.ndim > 2 and layout.shape[0] == 1:
+        layout = layout[0]
+    if layout.ndim != 2:
+        raise ValueError(f"Expected MiniGrid layout with shape (H, W) or (1, H, W), got {layout.shape}")
+
+    # Current configs use object-name -> ASCII mappings, while older configs
+    # used ASCII -> integer mappings. Support both representations.
+    reverse_map_dict = {}
+    for key, value in dict(map_dict).items():
+        try:
+            reverse_map_dict[int(value)] = str(key)
+        except (TypeError, ValueError):
+            pass
+
     layout_strings = []
-    for i in range(layout.shape[1]): 
-        row = layout[0][i]  
-        layout_line = ''.join([reverse_map_dict.get(num.item()) for num in row])
-        layout_strings.append(layout_line)
-    return '\n'.join(layout_strings)
+    for row in layout:
+        chars = []
+        for num in row:
+            idx = int(num.item()) if hasattr(num, "item") else int(num)
+            obj_name = IDX_TO_OBJECT.get(idx)
+            char = map_dict.get(obj_name) if obj_name is not None else None
+            if char is None:
+                char = reverse_map_dict.get(idx, "?")
+            chars.append(str(char))
+        layout_strings.append("".join(chars))
+    return "\n".join(layout_strings)
 
 def interpret_color_map(color_layout, color_map):
     """Convert a MiniGrid color-index layout into its ASCII color map."""

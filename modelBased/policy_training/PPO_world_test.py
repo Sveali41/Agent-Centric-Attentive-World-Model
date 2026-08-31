@@ -80,6 +80,8 @@ def validate_policy(cfg: DictConfig) -> float:
     deterministic = bool(getattr(ppo_cfg, "test_deterministic", True))
     render_delay = float(getattr(ppo_cfg, "render_delay", 0.05))
     gif_fps = int(getattr(ppo_cfg, "gif_fps", 10))
+    gif_max_frames = max(2, int(getattr(ppo_cfg, "gif_max_frames", 300)))
+    gif_downsample = max(1, int(getattr(ppo_cfg, "gif_downsample", 2)))
     total_episodes = int(ppo_cfg.total_test_episodes)
     max_ep_len = int(ppo_cfg.max_ep_len)
 
@@ -122,13 +124,28 @@ def validate_policy(cfg: DictConfig) -> float:
 
     results = []
     total_reward = 0.0
+
+    def capture_frame():
+        frame = env.render()
+        if gif_downsample > 1:
+            frame = frame[::gif_downsample, ::gif_downsample]
+        return frame
+
     for episode in range(1, total_episodes + 1):
         observation, _ = env.reset()
         state = ColRowCanl_to_CanlRowCol(observation["image"])
         episode_reward = 0.0
+        termination_reason = "max_steps"
+        seen_states = set()
+        if deterministic:
+            initial_inventory = carrying_token_from_env(env)
+            seen_states.add(
+                state.tobytes()
+                + np.asarray([initial_inventory], dtype=np.int16).tobytes()
+            )
         frames = []
         if save_gif and not render and episode == 1:
-            frames.append(env.render())
+            frames.append(capture_frame())
 
         for step in range(1, max_ep_len + 1):
             # normalize_obs mutates its input, so preserve the raw discrete state.
@@ -163,22 +180,45 @@ def validate_policy(cfg: DictConfig) -> float:
                 if render_delay > 0:
                     time.sleep(render_delay)
             elif save_gif and episode == 1:
-                frames.append(env.render())
+                if len(frames) < gif_max_frames:
+                    frames.append(capture_frame())
 
-            if terminated or truncated:
+            if terminated:
+                termination_reason = (
+                    "goal" if episode_reward > 0.0 else "terminated"
+                )
                 break
+            if truncated:
+                termination_reason = "truncated"
+                break
+            if deterministic:
+                inventory_token = carrying_token_from_env(env)
+                state_key = (
+                    state.tobytes()
+                    + np.asarray([inventory_token], dtype=np.int16).tobytes()
+                )
+                if state_key in seen_states:
+                    termination_reason = "cycle_detected"
+                    break
+                seen_states.add(state_key)
 
         if render:
             print()
         success = episode_reward > 0.0
         total_reward += episode_reward
-        results.append((episode, step, episode_reward, success))
+        results.append(
+            (episode, step, episode_reward, success, termination_reason)
+        )
         print(
             f"Episode {episode}: steps={step}, reward={episode_reward:.5f}, "
-            f"success={success}"
+            f"success={success}, reason={termination_reason}"
         )
 
         if save_gif and not render and episode == 1 and frames:
+            # For a long failed episode, preserve its final state without
+            # retaining thousands of full-resolution frames in memory.
+            if step + 1 > gif_max_frames:
+                frames[-1] = capture_frame()
             gif_path = gif_dir / "ppo_real_env_test.gif"
             imageio.mimsave(gif_path, frames, fps=gif_fps)
             print(f"Saved GIF: {gif_path}")
@@ -188,7 +228,8 @@ def validate_policy(cfg: DictConfig) -> float:
     if save_csv:
         csv_path = csv_dir / "ppo_real_env_test.csv"
         evaluation_results = pd.DataFrame(
-            results, columns=["episode", "steps", "reward", "success"]
+            results,
+            columns=["episode", "steps", "reward", "success", "reason"],
         )
         evaluation_results = append_mean_row(
             evaluation_results,

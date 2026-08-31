@@ -1,6 +1,7 @@
 import os
 import csv
 import math
+from pathlib import Path
 import torch
 from torch import nn
 import pytorch_lightning as pl
@@ -20,6 +21,13 @@ from domain.minigrid import minigrid_support as minigrid_utils
 from domain.crafter.crafter_support import (
     crafter_effect_loss,
     visualize_crafter_wm,
+)
+from domain.minigrid.transition_codec import (
+    canonical_minigrid_schema,
+    decode_minigrid_transition,
+    minigrid_contract,
+    minigrid_effect_cell_nll,
+    validate_schema as validate_minigrid_schema,
 )
 from . import AttentionWM_support
 from . import Embedding_support
@@ -82,22 +90,65 @@ class AttentionWorldModel(pl.LightningModule):
         self.lambda_ewc = float(getattr(hparams, "lambda_ewc", 1.0))
         self.loss_accumulator = [[[] for _ in range(self.col)] for _ in range(self.row)]
         self.loss_map_result = None
+        self.coverage_map_result = None
         self.inventory_loss_vector_result = None
         self.inventory_loss_accumulator = []
         self._val_step_outputs = []
+        self._val_natural_outputs = []
+        self._val_field_outputs = []
+        self._val_minigrid_diagnostics = []
+        self._val_minigrid_effect_diagnostics = []
 
         self.fisher = 0
         self.old_params = None
         self.env_type = hparams.env_type
         self.frame_stack = getattr(hparams, "frame_stack", 1)
-        self.observation_schema = list(getattr(hparams, "observation_schema", []))
+        self.observation_schema = list(getattr(hparams, "observation_schema", []) or [])
+        if self.env_type == "minigrid":
+            self.minigrid_transition_mode = str(
+                getattr(hparams, "minigrid_transition_mode", "effect")
+            )
+            self.effect_reduction = str(
+                getattr(hparams, "effect_reduction", "balanced_mean")
+            ).strip().lower()
+            self.focal_gamma = float(getattr(hparams, "focal_gamma", 0.0))
+            if not self.observation_schema:
+                self.observation_schema = canonical_minigrid_schema(
+                    self.minigrid_transition_mode,
+                    self.effect_reduction,
+                )
+            else:
+                validate_minigrid_schema(
+                    self.observation_schema,
+                    self.minigrid_transition_mode,
+                    self.effect_reduction,
+                )
+            self.minigrid_contract = minigrid_contract(self.minigrid_transition_mode)
+            if (
+                self.minigrid_transition_mode == "effect"
+                and int(getattr(hparams, "action_norm_values", 6)) != self.minigrid_contract.action_count
+            ):
+                raise ValueError(
+                    "MiniGrid effect mode requires action_norm_values=6 "
+                    f"(compact actions), got {getattr(hparams, 'action_norm_values', None)!r}"
+                )
         if not self.observation_schema:
             raise ValueError("attention_model.observation_schema must define at least one field")
         self.use_bipedal_flag = bool(getattr(hparams, "use_bipedal_attention", False))
         # Keep a single explicit flag for the vector-state BipedalWalker path.
         # Some call sites check `self.is_bipedal`, so define it before first use.
         self.is_bipedal = (self.env_type == "bipedalwalker") or self.use_bipedal_flag
-        print(f"[AttentionWM Init] env_type: {self.env_type} | data_type: {self.data_type} | val_metric: {getattr(self.hparams, 'validation_metric', 'mse')}")
+        print(
+            f"[AttentionWM Init] env_type: {self.env_type} | "
+            f"data_type: {self.data_type} | val_metric: "
+            f"{getattr(hparams, 'validation_metric', 'mse')}"
+            + (
+                f" | effect_reduction: {self.effect_reduction}"
+                if self.env_type == "minigrid"
+                and self.minigrid_transition_mode == "effect"
+                else ""
+            )
+        )
         
         MODEL_MAPPING = {
             'attention': AttentionWM_support.AttentionModule,
@@ -107,6 +158,15 @@ class AttentionWorldModel(pl.LightningModule):
         # Initialize the prediction model.
         module_class = MODEL_MAPPING.get(hparams.model_type.lower())
         if module_class is not None:
+            if (
+                self.env_type == "minigrid"
+                and self.minigrid_transition_mode == "effect"
+                and module_class is not AttentionWM_support.AttentionModule
+            ):
+                raise ValueError(
+                    "MiniGrid effect mode currently requires model_type=Attention; "
+                    "Embedding/MLP heads do not expose the canonical 24/8 outputs."
+                )
             module_kwargs = {
                 "env_type": "bipedalwalker" if self.is_bipedal else self.env_type,
                 "frame_stack": self.frame_stack,
@@ -146,6 +206,8 @@ class AttentionWorldModel(pl.LightningModule):
                     inventory_spec.get("classes", 10)
                 )
                 module_kwargs["crafter_inventory_output_mode"] = inventory_target_mode
+            if module_class is AttentionWM_support.AttentionModule and self.env_type == "minigrid":
+                module_kwargs["minigrid_transition_mode"] = self.minigrid_transition_mode
             self.model = module_class(
                 hparams.data_type,
                 hparams.grid_shape,
@@ -161,13 +223,22 @@ class AttentionWorldModel(pl.LightningModule):
 
         if hparams.freeze_weight:
             utils.load_model_weight(self.model, hparams.model_save_path)
-        self.visual_func = minigrid_utils.Visualization(hparams)
+        # Constructing the visualization helper creates its output directory.
+        # Keep it entirely out of headless training when visualization is off.
+        self.visual_func = (
+            minigrid_utils.Visualization(hparams)
+            if self.visualizationFlag
+            else None
+        )
         self.train_token_loss_accumulator = {}
         self.train_token_acc_accumulator = {}
         self.train_token_loss_csv_path = None
         if self.is_bipedal and hasattr(self.model, "bipedal_token_specs"):
+            metrics_dir = Path(
+                str(getattr(hparams, "metrics_dir", utils.WM_RESULTS_PATH / "world_model"))
+            )
             self.train_token_loss_csv_path = os.path.join(
-                os.path.dirname(hparams.model_save_path),
+                str(metrics_dir),
                 "bipedal_train_token_losses.csv",
             )
         self.save_hyperparameters(hparams)
@@ -280,11 +351,16 @@ class AttentionWorldModel(pl.LightningModule):
 
                 # Forward & Backward (fp32)
                 with torch.amp.autocast("cuda", enabled=False):
-                    pred, _, s_inv_pred = self(s_obs, s_act, s_info, inv=s_inv)
+                    # The model is trained on the agent-centred mask, so
+                    # Fisher must use exactly the same input/target geometry.
+                    # Feeding the full map here silently changed the token
+                    # layout and made the continual-learning importance
+                    # estimate unrelated to the training objective.
+                    pred, _, s_inv_pred = self(s_obs_masked, s_act, s_info, inv=s_inv)
                     loss_sample, _ = self.observation_loss(
                         pred,
                         s_obs_next,
-                        obs_prev=s_obs,
+                        obs_prev=s_obs_masked,
                         aux_pred=s_inv_pred,
                         inv=s_inv,
                         inv_next=s_inv_next,
@@ -453,6 +529,19 @@ class AttentionWorldModel(pl.LightningModule):
                     value = loss_map[dy, dx].item()
                     self.loss_accumulator[global_y][global_x].append(value)
 
+    @staticmethod
+    def average_loss_and_coverage_maps(loss_accumulator):
+        rows = len(loss_accumulator)
+        cols = len(loss_accumulator[0]) if rows else 0
+        avg_loss_map = np.zeros((rows, cols), dtype=np.float32)
+        coverage_map = np.zeros((rows, cols), dtype=np.float32)
+        for y, row in enumerate(loss_accumulator):
+            for x, values in enumerate(row):
+                if values:
+                    avg_loss_map[y, x] = float(np.mean(values))
+                    coverage_map[y, x] = 1.0
+        return avg_loss_map, coverage_map
+
     def compute_cell_loss(self, next_pred, next_true, current=None):
         # Compute the per-cell error map.
         if self.env_type == 'crafter':
@@ -461,12 +550,103 @@ class AttentionWorldModel(pl.LightningModule):
             loss_map = crafter_effect_loss(
                 next_pred, current, next_true, reduction='none'
             )
+        elif self.env_type == 'minigrid':
+            if current is None:
+                raise ValueError("MiniGrid categorical cell loss requires the current state")
+            current_frame = current[:, -next_true.size(1):]
+            loss_map, _ = minigrid_effect_cell_nll(
+                next_pred,
+                current_frame,
+                next_true,
+                mode=self.minigrid_transition_mode,
+            )
         else:
             # Standard Regression error
             error = torch.abs(next_pred - next_true)
             loss_map = error.mean(dim=1)  # (B, H, W)
 
         return loss_map
+
+    @torch.no_grad()
+    def encode_map_features(self, state):
+        """Expose the predictive MiniGrid map representation for UED novelty."""
+        if self.env_type != "minigrid":
+            raise ValueError("encode_map_features is only available for MiniGrid")
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            return self.model.encode_map_features(state)
+        finally:
+            self.model.train(was_training)
+
+    @torch.no_grad()
+    def encode_state_action_features(self, local_states, actions, inventory=None):
+        """Encode agent-centric MiniGrid state/action contexts for novelty.
+
+        The representation reuses the trained categorical convolution and
+        action/inventory embeddings, but stops before the prediction heads and
+        transformer.  ``local_states`` must already be an agent-centered
+        ``[B, 3, H, W]`` patch, so absolute map coordinates cannot enter the
+        novelty archive and no checkpoint parameters are added.
+        """
+        if self.env_type != "minigrid" or self.data_type != "discrete":
+            raise ValueError(
+                "encode_state_action_features is only available for discrete MiniGrid"
+            )
+        state = torch.as_tensor(local_states, device=next(self.parameters()).device)
+        if state.ndim == 3:
+            state = state.unsqueeze(0)
+        if state.ndim != 4 or state.size(1) != 3:
+            raise ValueError(
+                "MiniGrid local state features expect [B,3,H,W], got "
+                f"{tuple(state.shape)}"
+            )
+        actions = torch.as_tensor(actions, device=state.device).long().reshape(-1)
+        if actions.numel() != state.size(0):
+            raise ValueError("State/action batch sizes must match")
+
+        model = self.model
+        was_training = model.training
+        model.eval()
+        try:
+            obj = state[:, 0].long().clamp(0, 10)
+            color = state[:, 1].long().clamp(0, 5)
+            direction = state[:, 2].long().clamp(0, 3)
+            state_emb = torch.cat(
+                [
+                    F.one_hot(obj, num_classes=11),
+                    F.one_hot(color, num_classes=6),
+                    F.one_hot(direction, num_classes=4),
+                ],
+                dim=-1,
+            ).float().permute(0, 3, 1, 2)
+            x = model.relu(model.bn1(model.conv1(state_emb)))
+            x = model.relu(model.bn2(model.conv2(x)))
+            tokens = model.flatten(x).transpose(1, 2)
+            tokens = tokens + model.pos_embedding
+            state_feature = torch.cat(
+                [tokens.mean(dim=1), tokens.amax(dim=1)], dim=1
+            )
+            state_feature = F.normalize(state_feature, p=2, dim=1)
+
+            action_feature = F.normalize(model.action_embedding(actions), p=2, dim=1)
+            if inventory is None:
+                inventory_feature = torch.zeros_like(action_feature)
+            else:
+                inventory = torch.as_tensor(inventory, device=state.device).long().reshape(-1)
+                if inventory.numel() != state.size(0):
+                    raise ValueError("State/inventory batch sizes must match")
+                inventory = inventory.clamp(0, 6)
+                inventory_feature = F.normalize(
+                    model.key_embedding(inventory), p=2, dim=1
+                )
+            return F.normalize(
+                torch.cat([state_feature, action_feature, inventory_feature], dim=1),
+                p=2,
+                dim=1,
+            )
+        finally:
+            model.train(was_training)
 
 
 
@@ -557,9 +737,15 @@ class AttentionWorldModel(pl.LightningModule):
         label_smoothing: float = 0.0,
     ) -> torch.Tensor:
         """Categorical NLL normalized so a uniform predictor has loss 1."""
+        target = target.long()
+        if target.numel() and (target.min() < 0 or target.max() >= num_classes):
+            raise ValueError(
+                f"Categorical target range [{int(target.min())}, {int(target.max())}] "
+                f"is invalid for {num_classes} classes"
+            )
         return F.cross_entropy(
             logits,
-            target.long(),
+            target,
             label_smoothing=label_smoothing,
         ) / math.log(num_classes)
 
@@ -571,6 +757,7 @@ class AttentionWorldModel(pl.LightningModule):
         aux_pred=None,
         inv: torch.Tensor | None = None,
         inv_next: torch.Tensor | None = None,
+        focal_gamma: float | None = None,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Compute one schema-driven observation prediction objective.
 
@@ -674,6 +861,7 @@ class AttentionWorldModel(pl.LightningModule):
                     effect_target,
                     reduction=str(spec.get("effect_reduction", "balanced_mean")),
                     label_smoothing=float(spec.get("label_smoothing", 0.0)),
+                    focal_gamma=self.focal_gamma if focal_gamma is None else float(focal_gamma),
                 )
             elif distribution == "categorical_inventory_gate":
                 if target_source != "inventory" or inv is None or inv_next is None:
@@ -693,6 +881,42 @@ class AttentionWorldModel(pl.LightningModule):
         if not fields:
             raise ValueError("The observation schema produced no loss fields")
         return torch.stack(list(fields.values())).mean(), fields
+
+    def _minigrid_effect_diagnostics(self, obs_pred, obs_next, obs, inv, inv_next, aux_pred):
+        """Return aggregate changed-effect and false-SET validation metrics."""
+        changed_losses, false_set_rates = [], []
+        changed_count = obs_pred.new_zeros(())
+        if self.env_type != "minigrid" or self.minigrid_transition_mode != "effect":
+            return obs_pred.new_zeros(()), obs_pred.new_zeros(()), changed_count
+        for spec in self.observation_schema:
+            if str(spec.get("distribution")) != "categorical_effect":
+                continue
+            if str(spec.get("target_source", "observation")) == "inventory":
+                if inv is None or inv_next is None or not isinstance(aux_pred, torch.Tensor):
+                    continue
+                current, target, prediction = inv, inv_next, aux_pred
+            else:
+                index = int(spec["target_index"])
+                current, target = obs[:, index], obs_next[:, index]
+                start, stop = map(int, spec["prediction_slice"])
+                prediction = obs_pred[:, start:stop]
+            effects = categorical_effect_target(current, target)
+            per_cell = balanced_categorical_effect_loss(
+                prediction, effects, reduction="none",
+                label_smoothing=float(spec.get("label_smoothing", 0.0)),
+                focal_gamma=self.focal_gamma,
+            )
+            changed = effects.ne(0)
+            if changed.any():
+                changed_losses.append(per_cell[changed].mean())
+                changed_count = changed_count + changed.sum().to(dtype=changed_count.dtype)
+            predicted = prediction.argmax(dim=1)
+            keep = effects.eq(0)
+            if keep.any():
+                false_set_rates.append(predicted[keep].ne(0).float().mean())
+        changed_loss = torch.stack(changed_losses).mean() if changed_losses else obs_pred.new_zeros(())
+        false_set = torch.stack(false_set_rates).mean() if false_set_rates else obs_pred.new_zeros(())
+        return changed_loss, false_set, changed_count
 
 
     def configure_optimizers(self):
@@ -784,7 +1008,7 @@ class AttentionWorldModel(pl.LightningModule):
         if self.visualizationFlag and (not self.is_bipedal) and is_last_epoch and (self.step_counter % self.visualize_every == 0):
             if self.env_type == 'crafter':
                 visualize_crafter_wm(obs, obs_next, obs_pred, int(act[0].item()), self.step_counter, 
-                                     save_dir=os.path.join("modelBased/log", "wm_visual/train"),
+                                     save_dir=str(utils.WM_VISUALIZATIONS_PATH / "world_model" / "train"),
                                      full_map_size=batch['obs'].shape[-2:],
                                      agent_pos=agent_pos[0],
                                      inv=inv[0].cpu().numpy() if inv is not None else None,
@@ -792,7 +1016,7 @@ class AttentionWorldModel(pl.LightningModule):
             else:
                 # Fallback to legacy visualize_data for MiniGrid (requires whole map)
                 # Note: this part needs whole map, which we have in 'batch'
-                self.visual_func.visualize_data(batch['obs'], batch['obs'] + batch['obs_next'], act, obs, obs_next, info, self.step_counter, agent_pos)
+                self.visual_func.visualize_data(batch['obs'], batch['obs_next'], act, obs, obs_next, info, self.step_counter, agent_pos)
 
         if obs_next.dtype != obs_pred.dtype:
             obs_next = obs_next.float()
@@ -950,7 +1174,7 @@ class AttentionWorldModel(pl.LightningModule):
         if self.visualizationFlag and (not self.is_bipedal) and batch_idx == 0:
             if self.env_type == 'crafter':
                 visualize_crafter_wm(obs, obs_next, obs_pred, int(act[0].item()), self.step_counter, 
-                                     save_dir=os.path.join("modelBased/log", "wm_visual/val"),
+                                     save_dir=str(utils.WM_VISUALIZATIONS_PATH / "world_model" / "val"),
                                      full_map_size=batch['obs'].shape[-2:],
                                      agent_pos=agent_position[0],
                                      inv=batch['inv'][0].cpu().numpy() if 'inv' in batch else None,
@@ -961,7 +1185,7 @@ class AttentionWorldModel(pl.LightningModule):
             obs = obs.float()
 
         # Validation uses exactly the same observation objective as training.
-        loss_val, _ = self.observation_loss(
+        loss_val, field_values = self.observation_loss(
             obs_pred,
             obs_next,
             obs_prev=obs,
@@ -969,6 +1193,45 @@ class AttentionWorldModel(pl.LightningModule):
             inv=inv,
             inv_next=inv_next,
         )
+
+        natural_loss, natural_field_values = self.observation_loss(
+            obs_pred, obs_next, obs_prev=obs, aux_pred=inv_pred,
+            inv=inv, inv_next=inv_next, focal_gamma=0.0,
+        )
+        self._val_natural_outputs.append(natural_loss.detach())
+        self._val_field_outputs.append({
+            name: value.detach() for name, value in natural_field_values.items()
+        })
+        if self.env_type == "minigrid":
+            with torch.no_grad():
+                changed_focal, false_set, changed_count = self._minigrid_effect_diagnostics(
+                    obs_pred, obs_next, obs, inv, inv_next, inv_pred
+                )
+                decoded, decoded_inv, diagnostics = decode_minigrid_transition(
+                    obs_pred,
+                    obs,
+                    inv_pred,
+                    inv,
+                    mode=self.minigrid_transition_mode,
+                    constrain_agent=False,
+                )
+                target = obs_next.long()
+                changed = obs.ne(target)
+                self._val_minigrid_diagnostics.append({
+                    "decoded_accuracy": decoded.eq(target).float().mean(),
+                    "changed_accuracy": decoded.eq(target)[changed].float().mean()
+                    if changed.any() else decoded.new_tensor(0.0, dtype=torch.float32),
+                    "agent_missing_rate": diagnostics["raw_agent_count"].eq(0).float().mean(),
+                    "agent_duplicate_rate": diagnostics["raw_agent_count"].gt(1).float().mean(),
+                    "inventory_accuracy": decoded_inv.eq(inv_next.long()).float().mean()
+                    if decoded_inv is not None and inv_next is not None
+                    else decoded.new_tensor(0.0, dtype=torch.float32),
+                })
+                self._val_minigrid_effect_diagnostics.append({
+                    "changed_focal_loss": changed_focal.detach(),
+                    "false_set_rate": false_set.detach(),
+                    "changed_count": changed_count.detach(),
+                })
 
         self._val_step_outputs.append(loss_val.detach())
 
@@ -978,21 +1241,23 @@ class AttentionWorldModel(pl.LightningModule):
 
     def on_validation_epoch_start(self):
         self._val_step_outputs = []
+        self._val_natural_outputs = []
+        self._val_field_outputs = []
+        self._val_minigrid_diagnostics = []
+        self._val_minigrid_effect_diagnostics = []
         if getattr(self.hparams, "keep_cell_loss", False):
             self.loss_accumulator = [[[] for _ in range(self.col)] for _ in range(self.row)]
+            self.loss_map_result = None
+            self.coverage_map_result = None
             self.inventory_loss_accumulator = []
             if getattr(self, "is_bipedal", False):
                 self.bipedal_semantic_acc = []
 
     def on_validation_epoch_end(self):
         if getattr(self.hparams, "keep_cell_loss", False) and not getattr(self, 'is_bipedal', False):
-            avg_loss_map = torch.zeros((self.row, self.col), device=self.device)
-            for y in range(self.row):
-                for x in range(self.col):
-                    vals = self.loss_accumulator[y][x]
-                    avg_loss_map[y, x] = sum(vals) / len(vals) if vals else 0
-
-            self.loss_map_result = avg_loss_map.cpu().numpy()
+            self.loss_map_result, self.coverage_map_result = (
+                self.average_loss_and_coverage_maps(self.loss_accumulator)
+            )
             if self.env_type == 'minigrid':
                 if self.loss_map_result.size > 0:
                     print(f"[WM-Debug] Final Heatmap Stats - Max: {self.loss_map_result.max():.6f}, Non-zero cells: {np.count_nonzero(self.loss_map_result)}")
@@ -1022,10 +1287,37 @@ class AttentionWorldModel(pl.LightningModule):
             avg_loss = torch.tensor(0.0, device=self.device)
 
         self.log("val/observation_loss", avg_loss)
+        if self._val_natural_outputs:
+            self.log("val/natural_ce", torch.stack(self._val_natural_outputs).mean())
+        if self._val_field_outputs:
+            field_names = sorted({name for row in self._val_field_outputs for name in row})
+            for name in field_names:
+                values = [row[name] for row in self._val_field_outputs if name in row]
+                if values:
+                    self.log(f"val/{name}_nll", torch.stack(values).mean())
+        if self._val_minigrid_diagnostics:
+            for name in self._val_minigrid_diagnostics[0]:
+                self.log(
+                    f"val/{name}",
+                    torch.stack([row[name] for row in self._val_minigrid_diagnostics]).mean(),
+                )
+        if self._val_minigrid_effect_diagnostics:
+            for name in ("changed_focal_loss", "false_set_rate", "changed_count"):
+                self.log(
+                    f"val/{name}",
+                    torch.stack([
+                        row[name] for row in self._val_minigrid_effect_diagnostics
+                    ]).mean(),
+                )
         self._val_step_outputs = []
+        self._val_natural_outputs = []
+        self._val_field_outputs = []
+        self._val_minigrid_diagnostics = []
+        self._val_minigrid_effect_diagnostics = []
 
     def on_save_checkpoint(self, checkpoint):
-        # Example checkpoint customization: removing specific keys if needed
+        if hasattr(self.model, "checkpoint_contract"):
+            checkpoint["world_model_contract"] = dict(self.model.checkpoint_contract)
         t = checkpoint['state_dict']
         pass  # No specific filtering needed for a simple NN
 
@@ -1070,7 +1362,7 @@ class AttentionWorldModel(pl.LightningModule):
         if self.visualizationFlag and self.env_type == 'crafter':
             # We don't easily have the last batch here, but we can signal or just rely on the last training_step/val_step
             # For now, we prints a message to confirm.
-            print(f"[WM] Training ended. Final visualizations saved in modelBased/log/wm_visual/")
+            print(f"[WM] Training ended. Final visualizations saved in {utils.WM_VISUALIZATIONS_PATH / 'world_model'}/")
 
 
 

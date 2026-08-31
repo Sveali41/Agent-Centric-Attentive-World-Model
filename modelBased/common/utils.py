@@ -238,7 +238,61 @@ def load_model_weight(model, weight_path, freeze=True):
             state_dict = checkpoint
         cleaned_state_dict = {k.replace("model.", ""): v for k, v in state_dict.items()}
 
-        model.load_state_dict(cleaned_state_dict, strict=False)
+        expected_contract = getattr(model, "checkpoint_contract", None)
+        saved_contract = checkpoint.get("world_model_contract") if isinstance(checkpoint, dict) else None
+        if expected_contract is not None:
+            if saved_contract is not None:
+                mismatches = {
+                    key: (saved_contract.get(key), expected_contract.get(key))
+                    for key in expected_contract
+                    if saved_contract.get(key) != expected_contract.get(key)
+                }
+                if mismatches:
+                    raise RuntimeError(
+                        "World-model checkpoint contract mismatch: "
+                        f"{mismatches}"
+                    )
+            elif str(expected_contract.get("transition_mode", "")) == "effect":
+                raise RuntimeError(
+                    "Effect-mode MiniGrid model cannot load a checkpoint without "
+                    "world_model_contract metadata; train or export a compatible effect checkpoint."
+                )
+
+        model_state = model.state_dict()
+        compatible_state = {}
+        shape_skipped = {}
+        for key, value in cleaned_state_dict.items():
+            if key not in model_state:
+                continue
+            if tuple(value.shape) != tuple(model_state[key].shape):
+                shape_skipped[key] = (tuple(value.shape), tuple(model_state[key].shape))
+                continue
+            compatible_state[key] = value
+
+        missing = sorted(set(model_state) - set(compatible_state))
+        unexpected = sorted(set(cleaned_state_dict) - set(model_state))
+        if missing or unexpected or shape_skipped:
+            print(
+                f"[Load] State-dict differences: missing={missing[:8]} "
+                f"unexpected={unexpected[:8]} "
+                f"shape_skipped={list(shape_skipped)[:8]}"
+            )
+            if shape_skipped:
+                for key, (saved_shape, expected_shape) in list(shape_skipped.items())[:8]:
+                    print(
+                        f"[Load] Skipping incompatible key {key}: "
+                        f"checkpoint={saved_shape}, model={expected_shape}"
+                    )
+        if not compatible_state:
+            raise RuntimeError(
+                f"No shape-compatible parameters found in world-model checkpoint: {weight_path}"
+            )
+
+        load_result = model.load_state_dict(compatible_state, strict=False)
+        print(
+            f"[Load] Loaded {len(compatible_state)} compatible tensors; "
+            f"missing after filtering={len(load_result.missing_keys)}"
+        )
 
         model.to(device)
         model.eval()
@@ -860,6 +914,10 @@ def generate_minitasks_until_covered(
 
 load_envs()
 PROJECT_ROOT : Path = Path(get_env("PROJECT_ROOT"))
+WM_ROOT : Path = Path(get_env("WM_ROOT", str(PROJECT_ROOT / "wm")))
+WM_OUTPUTS_PATH : Path = WM_ROOT / "outputs"
+WM_RESULTS_PATH : Path = WM_OUTPUTS_PATH / "results"
+WM_VISUALIZATIONS_PATH : Path = WM_OUTPUTS_PATH / "visualizations"
 GENERATOR_PATH : Path = Path(get_env("GENERATOR_PATH"))
 TRAINER_PATH : Path = Path(get_env("TRAINER_PATH"))
 LEVEL_PATH : Path = Path(get_env("ENV_PATH"))

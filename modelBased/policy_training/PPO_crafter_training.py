@@ -28,7 +28,7 @@ from datetime import datetime
 from omegaconf import DictConfig
 
 from modelBased.common import utils
-from modelBased.common.utils import PROJECT_ROOT  # re-import for clarity
+from modelBased.common.utils import PROJECT_ROOT, WM_VISUALIZATIONS_PATH  # re-import for clarity
 from modelBased.world_model.crafter_dynamics import (
     imagined_crafter_step_batch as _shared_imagined_crafter_step_batch,
 )
@@ -205,8 +205,13 @@ def _init_crafter_wandb(cfg, default_project: str):
     ppo_cfg = cfg.PPO
     wandb_group, wandb_run_name, training_source = policy_wandb_identity(cfg)
     task_name = str(cfg.domains["crafter"].task_name)
+    wandb_dir = Path(
+        str(getattr(getattr(cfg, "paths", None), "wandb", utils.WM_OUTPUTS_PATH / "wandb"))
+    ).expanduser().resolve()
+    wandb_dir.mkdir(parents=True, exist_ok=True)
     wandb.login()
     init_kwargs = {
+        "dir": str(wandb_dir),
         "project": str(getattr(ppo_cfg, "wandb_project", default_project)),
         "name": wandb_run_name,
         "group": wandb_group,
@@ -653,7 +658,7 @@ def _save_real_env_coverage(cfg, tracker):
             getattr(
                 ppo_cfg,
                 "real_env_coverage_save_path",
-                PROJECT_ROOT / "outputs" / "real_env_coverage",
+                WM_VISUALIZATIONS_PATH / "real_env_coverage",
             )
         )
     ).expanduser().resolve()

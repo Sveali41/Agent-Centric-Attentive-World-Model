@@ -151,7 +151,15 @@ def collect_crafter_single_p2e(cfg: DictConfig) -> list[str]:
         return {"entropy": entropy, "effective_actions": float(np.exp(entropy)), "coverage": float(nonzero.mean()), "counts": counts.astype(int).tolist()}
     all_action_summary = _action_summary(exported["act"])
     explorer_action_summary = _action_summary(exported["act"][int(prefill):])
-    metrics_path = data_path.with_suffix(".p2e_metrics.json")
+    configured_metrics = getattr(cfg.p2e, "metrics_path", None)
+    metrics_path = (
+        Path(str(configured_metrics)).expanduser().resolve()
+        if configured_metrics is not None
+        else Path(str(cfg.paths.results)).expanduser().resolve()
+        / "exploration"
+        / f"{data_path.stem}.p2e_metrics.json"
+    )
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
     metrics_path.write_text(json.dumps({
         "artifact": "p2e_official_dv2_attnwm_v1", "total_steps": int(total_steps), "prefill_steps": int(prefill),
         "unique_inventory_states": unique_inventory, "inventory_presence": presence,

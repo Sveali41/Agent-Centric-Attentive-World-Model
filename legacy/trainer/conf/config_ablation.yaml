@@ -1,3 +1,17 @@
+paths:
+  outputs: ${oc.env:WM_ROOT}/outputs
+  visualizations: ${paths.outputs}/visualizations/legacy
+  evaluation: ${paths.outputs}/evaluation/legacy
+  wandb: ${paths.outputs}/wandb
+
+hydra:
+  run:
+    dir: ${paths.outputs}/hydra/legacy/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ${paths.outputs}/hydra/legacy/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  output_subdir: .hydra
+
 # 1. load the generator
 training_generator:
   # data 
@@ -70,7 +84,7 @@ attention_model:
   # plot
   visualization: False     
   visualize_every: 1000
-  save_path: ${oc.env:TRAINER_PATH}/visulization
+  save_path: ${paths.visualizations}/world_model
   direction_map: {0: 'right', 1: 'down', 2: 'left', 3: 'up'}
   action_map: {0: 'left', 1: 'right', 2: 'forward', 3: 'pickup', 4: 'drop', 5: 'toggle', 6: 'done'}
   lambda_ewc: 500
@@ -115,9 +129,9 @@ PPO:
   render: True
   visualize: false
   save_gif: True
-  save_path_gif: ${oc.env:PROJECT_ROOT}/modelBased/visulization/PPO/PPO_gif
+  save_path_gif: ${paths.evaluation}/ppo/gif
   save_csv: False
-  save_path_csv: ${oc.env:PROJECT_ROOT}/modelBased/visulization/PPO/PPO_csv
+  save_path_csv: ${paths.evaluation}/ppo/csv
   use_wandb: False
   wandb_run_name: None
 

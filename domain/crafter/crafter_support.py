@@ -486,7 +486,7 @@ def visualize_crafter_wm(
     obs_pred_logits: torch.Tensor,
     action: int,
     step: int,
-    save_dir: str = "outputs/wm_visual",
+    save_dir: str | None = None,
     full_map_size: tuple = (64, 64),
     agent_pos: tuple = (32, 32),
     inv: np.ndarray = None,
@@ -496,6 +496,9 @@ def visualize_crafter_wm(
     Visualize WM prediction for Crafter with 5 panels.
     """
     import os
+    if save_dir is None:
+        wm_root = Path(os.environ.get("WM_ROOT", Path(__file__).resolve().parents[2]))
+        save_dir = str(wm_root / "outputs" / "visualizations" / "world_model")
     os.makedirs(save_dir, exist_ok=True)
     
     # Handle batch dimension if present

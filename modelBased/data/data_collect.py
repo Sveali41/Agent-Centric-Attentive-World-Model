@@ -7,10 +7,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 try:
     # Package import (e.g., `python -m modelBased.data.data_collect`)
-    from ..common.utils import normalize_obs, WORLD_MODEL_PATH, PROJECT_ROOT
+    from ..common.utils import normalize_obs, WORLD_MODEL_PATH, PROJECT_ROOT, WM_VISUALIZATIONS_PATH
 except ImportError:
     # Script import (e.g., `python modelBased/data/data_collect.py`)
-    from modelBased.common.utils import normalize_obs, WORLD_MODEL_PATH, PROJECT_ROOT
+    from modelBased.common.utils import normalize_obs, WORLD_MODEL_PATH, PROJECT_ROOT, WM_VISUALIZATIONS_PATH
 from modelBased.common.artifacts import metadata_array
 from domain.minigrid.action_codec import (
     carrying_token_from_env,
@@ -139,7 +139,11 @@ class SB3BipedalPolicy:
 def _resolve_coverage_vis_target(cfg):
     collect_cfg = cfg.env.collect if hasattr(cfg.env, "collect") else cfg.env
     filename = getattr(collect_cfg, "visualize_filename", "coverage.png")
-    vis_save_path = getattr(collect_cfg, "visualize_save_path", "outputs/dataset_visualization")
+    vis_save_path = getattr(
+        collect_cfg,
+        "visualize_save_path",
+        str(WM_VISUALIZATIONS_PATH / "datasets"),
+    )
     env_type = str(getattr(cfg.env, "env_type", "")).lower()
     data_type = str(getattr(collect_cfg, "data_type", "random")).lower()
 
@@ -157,13 +161,13 @@ def _resolve_coverage_vis_target(cfg):
         if hasattr(cfg, "domains") and domain_name in cfg.domains:
             task_group = str(getattr(cfg.domains[domain_name], "task_group", ""))
         if task_group == "target":
-            vis_save_path = os.path.join(
-                PROJECT_ROOT,
-                "trainer",
-                "logs",
-                "dataset_visualization",
-                "target",
-                "bipedal",
+            configured_root = getattr(
+                getattr(cfg, "paths", None),
+                "visualizations",
+                WM_VISUALIZATIONS_PATH,
+            )
+            vis_save_path = str(
+                Path(str(configured_root)) / "datasets" / "target" / "bipedal"
             )
 
     return filename, vis_save_path
@@ -677,7 +681,15 @@ def run_env(
         img = _coerce_render_image(img)
         
         # --- save locally ---
-        env_vis_path = getattr(collect_cfg, "env_visualize_save_path", getattr(cfg.env, "visualize_save_path", "outputs/env_visualization"))
+        env_vis_path = getattr(
+            collect_cfg,
+            "env_visualize_save_path",
+            getattr(
+                cfg.env,
+                "visualize_save_path",
+                str(WM_VISUALIZATIONS_PATH / "environments"),
+            ),
+        )
         os.makedirs(env_vis_path, exist_ok=True)
         img_filename = getattr(collect_cfg, "env_visualize_filename", f"{log_name}_env.png")
         save_path = os.path.join(env_vis_path, img_filename)
@@ -755,15 +767,11 @@ def run_env(
         return torch.tensor(obs_chw, dtype=torch.float32, device=device)
 
     with tqdm(total=target_episodes, desc="Collecting Episodes") as pbar:
-        info_list.append([{
-            'carrying_key': False,
-            'carrying_token': _minigrid_carrying_token(),
-        }])
-
         # Condition: Keep collecting if (episodes < target) OR (total_steps < mini_dataset_size)
         # We check len(obs_list) for total steps.
         while episodes < target_episodes or (mini_dataset_size > 0 and len(obs_list) < mini_dataset_size):
             step_in_episode += 1
+            current_carrying_token = _minigrid_carrying_token()
 
             # --- 1. CORE RANDOMIZATION (Every Step in Uniform Mode) ---
             if randomize_inventory and is_crafter:
@@ -909,14 +917,46 @@ def run_env(
                         done = True
                         stuck_terminated = True
 
+            # In MiniGrid target-uniform collection, random starts only take
+            # effect when the environment is reset. Bound each rollout so a
+            # large transition budget produces many independent random starts
+            # instead of a few very long random walks. Crafter keeps the same
+            # periodic-reset behavior it previously had below.
+            uniform_reset_steps = int(
+                getattr(collect_cfg, "uniform_reset_steps", 50 if is_crafter else 300)
+            )
+            periodic_uniform_reset = (
+                uniform_reset_steps > 0
+                and step_in_episode >= uniform_reset_steps
+                and (
+                    (is_minigrid and data_type == "uniform")
+                    or (is_crafter and randomize_inventory)
+                )
+            )
+            if periodic_uniform_reset:
+                done = True
+                info = dict(info) if isinstance(info, dict) else {}
+                info["uniform_reset"] = True
+
+            # Keep per-transition metadata schema stable.  Event-only keys
+            # otherwise make PyTorch's default dictionary collator fail when a
+            # batch mixes ordinary and forced-reset transitions.
+            info = dict(info) if isinstance(info, dict) else {}
+            info["uniform_reset"] = bool(periodic_uniform_reset)
+
             if is_minigrid:
                 next_carrying_token = _minigrid_carrying_token()
+                # Store both sides on the record belonging to this exact
+                # transition. Do not mutate a previous record or use a reset
+                # placeholder: terminal transitions also need their true
+                # post-action inventory target.
+                info = dict(info) if isinstance(info, dict) else {}
+                info['current_carrying_key'] = current_carrying_token > 0
+                info['current_carrying_token'] = current_carrying_token
                 info['carrying_key'] = next_carrying_token > 0
                 info['carrying_token'] = next_carrying_token
-                # info_list is aligned with the current observation. Attach the
-                # post-action inventory target to that same transition.
-                info_list[-1][0]['next_carrying_key'] = next_carrying_token > 0
-                info_list[-1][0]['next_carrying_token'] = next_carrying_token
+                info['next_carrying_key'] = next_carrying_token > 0
+                info['next_carrying_token'] = next_carrying_token
             else:
                 info['carrying_key'] = False
             if policy is not None and hasattr(policy, "set_carrying_key"):
@@ -964,14 +1004,11 @@ def run_env(
             if is_crafter and isinstance(obs_next, dict) and 'inventory' in obs_next:
                 inv_list_next.append(obs_next['inventory'].copy())   
             rew_list.append([reward])
-            done_list.append([done])
+            # Truncation and a periodic uniform reset are both real sequence
+            # boundaries for replay/frame stacking, even when the environment
+            # did not report a native terminal state.
+            done_list.append([bool(done or trunc)])
             info_list.append([info])
-
-            # For Crafter uniform interaction, we use a balanced interval (e.g. 50 steps)
-            # enough to interact but frequent enough for variety.
-            uniform_reset_steps = getattr(collect_cfg, "uniform_reset_steps", 50 if is_crafter else 300)
-            if randomize_inventory and step_in_episode >= uniform_reset_steps:
-                done = True
 
             # --- early stop if dataset size reached ---
             if maximum_dataset_size is not None and len(obs_list) >= maximum_dataset_size:
@@ -997,8 +1034,6 @@ def run_env(
 
             # Reset environment on episode end
             if done or trunc:
-                if not is_bipedal:
-                    info_list.pop()
                 episodes += 1
                 pbar.update(1)
                 
@@ -1048,10 +1083,6 @@ def run_env(
                     # Sync observation after injection
                     obs = env.unwrapped._extract_obs()
 
-                info_list.append([{
-                    'carrying_key': False,
-                    'carrying_token': _minigrid_carrying_token(),
-                }])
                 has_carried_key_this_episode = False  # Reset per-episode state.
                 step_in_episode = 0
             else:
@@ -1063,7 +1094,6 @@ def run_env(
     if policy is not None and hasattr(policy, "mark_rollout_boundary"):
         policy.mark_rollout_boundary()
 
-    info_list.pop()
     if is_bipedal:
         print(f"[RunEnv] Final global max distance across collected data: {max_x_global:.2f}m")
     # Convert collected data to numpy arrays

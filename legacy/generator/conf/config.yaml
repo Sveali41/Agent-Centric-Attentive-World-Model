@@ -1,3 +1,16 @@
+paths:
+  outputs: ${oc.env:WM_ROOT}/outputs
+  visualizations: ${paths.outputs}/visualizations/legacy/generator
+  wandb: ${paths.outputs}/wandb
+
+hydra:
+  run:
+    dir: ${paths.outputs}/hydra/legacy/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ${paths.outputs}/hydra/legacy/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  output_subdir: .hydra
+
 data_generator:
   map_width: 12
   map_height: 6

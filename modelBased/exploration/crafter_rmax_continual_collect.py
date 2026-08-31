@@ -121,7 +121,15 @@ def collect_crafter_rmax_continual(cfg: DictConfig) -> list[str]:
         save_dataset_coverage(phase_cfg, data_path=data_path)
         phase_outputs.append(str(data_path)); _save_state(checkpoint, ppo, counter, phase_index + 1, global_step)
         print(f"[Crafter RMax continual] phase={phase_index + 1}/{len(phases)} steps={len(merged['act'])} unique_sa={counter.unique_state_actions} data={data_path}")
-    metrics_path = checkpoint.with_suffix(".metrics.json")
+    configured_metrics = getattr(cfg.rmax_like, "continual_metrics_path", None)
+    metrics_path = (
+        Path(str(configured_metrics)).expanduser().resolve()
+        if configured_metrics is not None
+        else Path(str(cfg.paths.results)).expanduser().resolve()
+        / "exploration"
+        / f"{checkpoint.stem}.metrics.json"
+    )
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
     metrics_path.write_text(json.dumps({"total_steps": global_step, "unique_state_actions": counter.unique_state_actions, "phases": phase_outputs}, indent=2), encoding="utf-8")
     return phase_outputs
 

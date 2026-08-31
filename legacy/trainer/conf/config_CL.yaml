@@ -1,3 +1,18 @@
+paths:
+  outputs: ${oc.env:WM_ROOT}/outputs
+  results: ${paths.outputs}/results/legacy
+  visualizations: ${paths.outputs}/visualizations/legacy
+  evaluation: ${paths.outputs}/evaluation/legacy
+  wandb: ${paths.outputs}/wandb
+
+hydra:
+  run:
+    dir: ${paths.outputs}/hydra/legacy/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ${paths.outputs}/hydra/legacy/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  output_subdir: .hydra
+
 # 1. load the generator
 training_generator:
   # data 
@@ -30,7 +45,7 @@ env:
   # env_name: MiniGrid-Empty-8x8-v0 #MiniGrid-Dynamic-Obstacles-8x8-v0 # Name of environment, or comma-separate list of environment names to instantiate as each env in the VecEnv.
   visualize: False # to choose whether your want to see the env during interaction or not
   save_visualized_img: True
-  visualize_save_path: ${oc.env:TRAINER_PATH}/logs/env_visualization/
+  visualize_save_path: ${paths.visualizations}/environments/
   collect:
     env_type: norm # empty means empty only wall in preprocess no info for keys, lava/door/key/wall/norm
     data_type: random # random/ uniform -- data collection   random -- training
@@ -40,7 +55,7 @@ env:
     data_save_path: ${oc.env:TRAINER_PATH}/data/gridworld_trainer.npz # folder where to save the rollouts
     num_workers: 0 # number of workers to use for data collection
     save_coverage_visualize: True
-    visualize_save_path: ${oc.env:TRAINER_PATH}/logs/dataset_visualization/
+    visualize_save_path: ${paths.visualizations}/datasets/
     visualize_filename: "agent_coverage_uniform.png"
     ignore_done: true  # whether or not to ignore the done signal during data collection
     merge_subsets: True  # whether or not to merge subsets during data collection
@@ -84,7 +99,7 @@ attention_model:
   # plot
   visualization: False     
   visualize_every: 1000
-  save_path: ${oc.env:TRAINER_PATH}/visulization
+  save_path: ${paths.visualizations}/world_model
   direction_map: {0: 'right', 1: 'down', 2: 'left', 3: 'up'}
   action_map: {0: 'left', 1: 'right', 2: 'forward', 3: 'pickup', 4: 'drop', 5: 'toggle', 6: 'done'}
   lambda_ewc: 80
@@ -133,9 +148,9 @@ PPO:
   render: True
   visualize: false
   save_gif: False
-  save_path_gif: ${oc.env:PROJECT_ROOT}/modelBased/visulization/PPO/PPO_gif
+  save_path_gif: ${paths.evaluation}/ppo/gif
   save_csv: False
-  save_path_csv: ${oc.env:PROJECT_ROOT}/modelBased/visulization/PPO/PPO_csv
+  save_path_csv: ${paths.evaluation}/ppo/csv
   use_wandb: True
   wandb_run_name: None
 
