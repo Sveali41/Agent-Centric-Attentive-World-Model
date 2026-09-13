@@ -454,7 +454,33 @@ def dataset_metadata(path: str | Path) -> dict[str, Any] | None:
 
 def dataset_matches(path: str | Path, cfg: Any, domain: str | None = None) -> bool:
     """Return whether a saved dataset matches the active experiment config."""
-    return dataset_metadata(path) == identity_from_config(cfg, domain)
+    metadata = dataset_metadata(path)
+    identity = identity_from_config(cfg, domain)
+    if metadata == identity:
+        return True
+    if not isinstance(metadata, dict):
+        return False
+
+    # Dataset metadata records absolute layout paths.  Those paths are not a
+    # semantic part of a MiniGrid layout and legitimately change when a
+    # workspace is relocated.  Content hashes are the required proof that the
+    # two paths describe the same layout; without matching, present hashes we
+    # retain the strict full-identity comparison above.
+    metadata_hash = metadata.get("layout_hash")
+    identity_hash = identity.get("layout_hash")
+    if not metadata_hash or not identity_hash or metadata_hash != identity_hash:
+        return False
+    if any(
+        field not in metadata or field not in identity
+        for field in ("env_path", "layout_path")
+    ):
+        return False
+    metadata_without_paths = dict(metadata)
+    identity_without_paths = dict(identity)
+    for field in ("env_path", "layout_path"):
+        metadata_without_paths.pop(field, None)
+        identity_without_paths.pop(field, None)
+    return metadata_without_paths == identity_without_paths
 
 
 def metadata_array(cfg: Any, domain: str | None = None) -> np.ndarray:
