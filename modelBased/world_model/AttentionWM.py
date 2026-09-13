@@ -98,10 +98,59 @@ class AttentionWorldModel(pl.LightningModule):
         self._val_field_outputs = []
         self._val_minigrid_diagnostics = []
         self._val_minigrid_effect_diagnostics = []
+        self._val_stochastic_outcomes = []
 
         self.fisher = 0
         self.old_params = None
         self.env_type = hparams.env_type
+        # ``stochastic_enabled`` is the single domain-level switch exposed by
+        # the MiniGrid configs.  Keep the model-specific fields below as
+        # backwards-compatible internal/ablation controls, but do not require
+        # users to repeat the switch in every pipeline block.
+        domain_stochastic_setting = getattr(hparams, "stochastic_enabled", None)
+        domain_stochastic_enabled = bool(domain_stochastic_setting)
+        stochastic_latent_cfg = getattr(hparams, "stochastic_latent", None)
+        if isinstance(stochastic_latent_cfg, dict):
+            self.stochastic_latent_enabled = bool(stochastic_latent_cfg.get("enabled", False))
+            self.stochastic_latent_loss_weight = float(stochastic_latent_cfg.get("loss_weight", 1.0))
+        else:
+            self.stochastic_latent_enabled = bool(
+                getattr(stochastic_latent_cfg, "enabled", False)
+            ) if stochastic_latent_cfg is not None else False
+            self.stochastic_latent_loss_weight = float(
+                getattr(stochastic_latent_cfg, "loss_weight", 1.0)
+            ) if stochastic_latent_cfg is not None else 1.0
+        # v1 is retained as a labelled outcome-classifier ablation. Legacy
+        # hparams without the domain switch can still select it explicitly;
+        # resolved MiniGrid configs always let the domain switch win.
+        configured_stochastic_model = getattr(hparams, "stochastic_model", None)
+        if domain_stochastic_setting is not None:
+            # A resolved domain flag is authoritative in both directions.
+            # This prevents a legacy per-block model selector from enabling a
+            # stochastic WM while the environment is deterministic.
+            configured_stochastic_model = (
+                "latent_v2" if domain_stochastic_enabled else "none"
+            )
+        elif configured_stochastic_model is None:
+            configured_stochastic_model = (
+                "latent_v2" if domain_stochastic_enabled
+                else ("outcome_v1" if self.stochastic_latent_enabled else "none")
+            )
+        self.stochastic_model = str(configured_stochastic_model).lower()
+        if self.stochastic_model not in {"none", "outcome_v1", "latent_v2"}:
+            raise ValueError("stochastic_model must be one of none, outcome_v1, latent_v2")
+        self.stochastic_latent_v2_enabled = self.stochastic_model == "latent_v2"
+        self.stochastic_latent_enabled = self.stochastic_model == "outcome_v1"
+        def _latent_cfg_value(name, default):
+            if isinstance(stochastic_latent_cfg, dict):
+                return stochastic_latent_cfg.get(name, default)
+            return getattr(stochastic_latent_cfg, name, default) if stochastic_latent_cfg is not None else default
+        self.latent_num_factors = int(_latent_cfg_value("num_factors", 1))
+        self.latent_num_classes = int(_latent_cfg_value("num_classes", 2))
+        self.latent_kl_weight = float(_latent_cfg_value("kl_weight", 0.1))
+        self.latent_supervision_weight = float(_latent_cfg_value("supervision_weight", 1.0))
+        if (self.stochastic_latent_enabled or self.stochastic_latent_v2_enabled) and self.env_type != "minigrid":
+            raise ValueError("MiniGrid stochastic models are currently supported only for MiniGrid")
         self.frame_stack = getattr(hparams, "frame_stack", 1)
         self.observation_schema = list(getattr(hparams, "observation_schema", []) or [])
         if self.env_type == "minigrid":
@@ -208,6 +257,10 @@ class AttentionWorldModel(pl.LightningModule):
                 module_kwargs["crafter_inventory_output_mode"] = inventory_target_mode
             if module_class is AttentionWM_support.AttentionModule and self.env_type == "minigrid":
                 module_kwargs["minigrid_transition_mode"] = self.minigrid_transition_mode
+                module_kwargs["stochastic_outcome"] = self.stochastic_latent_enabled
+                module_kwargs["stochastic_model"] = self.stochastic_model
+                module_kwargs["latent_num_factors"] = self.latent_num_factors
+                module_kwargs["latent_num_classes"] = self.latent_num_classes
             self.model = module_class(
                 hparams.data_type,
                 hparams.grid_shape,
@@ -652,6 +705,71 @@ class AttentionWorldModel(pl.LightningModule):
             next_state_pred, attentionWeight = out
             return next_state_pred, attentionWeight, None
 
+    def forward_stochastic(self, state, action, info, inv=None):
+        """Predict the MiniGrid success branch and its two-way outcome prior.
+
+        The ordinary ``forward`` contract intentionally remains unchanged for
+        deterministic experiments and existing rollout consumers.
+        """
+        if not self.stochastic_latent_enabled:
+            raise ValueError("forward_stochastic requires stochastic_latent.enabled=true")
+        state_logits, attention, inventory_logits, outcome_logits = self.model(
+            state, action, info, inv=inv, return_outcome=True
+        )
+        return {
+            "state_logits": state_logits,
+            "attention_weights": attention,
+            "inventory_logits": inventory_logits,
+            "outcome_logits": outcome_logits,
+            "outcome_probs": torch.softmax(outcome_logits, dim=-1),
+        }
+
+    def forward_distribution(
+        self, state, action, info=None, inv=None, next_state=None,
+        next_inventory=None, latent_labels=None, sample_mode="sample", generator=None,
+    ):
+        """One-step categorical latent distribution (v2).
+
+        `next_state` is training-only: when absent, the returned sample comes
+        from the prior and is safe for future imagined rollout integration.
+        """
+        if not self.stochastic_latent_v2_enabled:
+            raise ValueError("forward_distribution requires stochastic_model='latent_v2'")
+        return self.model(
+            state, action, info, inv=inv, return_distribution=True,
+            next_state=next_state, next_inventory=next_inventory,
+            latent_labels=latent_labels,
+            sample_mode=sample_mode, generator=generator,
+        )
+
+    @staticmethod
+    def _categorical_kl(posterior_logits, prior_logits):
+        posterior_log_probs = F.log_softmax(posterior_logits, dim=-1)
+        posterior_probs = posterior_log_probs.exp()
+        return (posterior_probs * (posterior_log_probs - F.log_softmax(prior_logits, dim=-1))).sum(dim=-1).mean()
+
+    @staticmethod
+    def _optional_action_failed_target(info, batch_size, device):
+        if not isinstance(info, dict) or "action_failed" not in info:
+            return None
+        target = torch.as_tensor(info["action_failed"], device=device).reshape(-1).long()
+        if target.numel() != batch_size or ((target < 0) | (target > 1)).any():
+            raise ValueError("Invalid MiniGrid action_failed outcome target")
+        return target
+
+    def _stochastic_outcome_target(self, info, batch_size, device):
+        if not self.stochastic_latent_enabled:
+            return None
+        if not isinstance(info, dict) or "action_failed" not in info:
+            raise ValueError(
+                "MiniGrid stochastic latent training requires batched info['action_failed']; "
+                "recollect the dataset with the stochastic environment."
+            )
+        target = torch.as_tensor(info["action_failed"], device=device).reshape(-1).long()
+        if target.numel() != batch_size or ((target < 0) | (target > 1)).any():
+            raise ValueError("Invalid MiniGrid action_failed outcome target")
+        return target
+
 
     @staticmethod
     def _symlog(value: torch.Tensor) -> torch.Tensor:
@@ -858,7 +976,11 @@ class AttentionWorldModel(pl.LightningModule):
             if not param.requires_grad:
                 continue
             # `fc` is the output head that predicts tile classes.
-            if 'model.fc.' in name or 'model.inv_head.' in name:
+            if (
+                'model.fc.' in name
+                or 'model.inv_head.' in name
+                or 'model.outcome_head.' in name
+            ):
                 head_params.append(param)
             else:
                 base_params.append(param)
@@ -925,7 +1047,30 @@ class AttentionWorldModel(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         # Forward pass and primary loss.
         obs, act, obs_next, info, elements_mask, agent_pos, inv, inv_next = self.preprocess_batch(batch, True)
-        obs_pred, attentionWeight, aux_pred = self(obs, act, info, inv=inv)
+        outcome_target = self._stochastic_outcome_target(
+            info, obs.shape[0], obs.device
+        ) if self.stochastic_latent_enabled else None
+        latent_target = self._optional_action_failed_target(info, obs.shape[0], obs.device) \
+            if self.stochastic_latent_v2_enabled else None
+        latent_prediction = None
+        if self.stochastic_latent_v2_enabled:
+            latent_prediction = self.forward_distribution(
+                obs, act, info, inv=inv, next_state=obs_next,
+                next_inventory=inv_next, latent_labels=latent_target,
+            )
+            obs_pred = latent_prediction["state_logits"]
+            attentionWeight = latent_prediction["attention_weights"]
+            aux_pred = latent_prediction["inventory_logits"]
+            outcome_logits = None
+        elif self.stochastic_latent_enabled:
+            stochastic_prediction = self.forward_stochastic(obs, act, info, inv=inv)
+            obs_pred = stochastic_prediction["state_logits"]
+            attentionWeight = stochastic_prediction["attention_weights"]
+            aux_pred = stochastic_prediction["inventory_logits"]
+            outcome_logits = stochastic_prediction["outcome_logits"]
+        else:
+            obs_pred, attentionWeight, aux_pred = self(obs, act, info, inv=inv)
+            outcome_logits = None
 
         # Restrict Crafter visualization to the final epoch to reduce overhead.
         is_last_epoch = False
@@ -954,14 +1099,44 @@ class AttentionWorldModel(pl.LightningModule):
         if obs.dtype != obs_pred.dtype:
             obs = obs.float()
 
-        observation_loss, field_losses = self.observation_loss(
-            obs_pred,
-            obs_next,
-            obs_prev=obs,
-            aux_pred=aux_pred,
-            inv=inv,
-            inv_next=inv_next,
+        # v1 predicts only the execute branch.  v2 conditions the decoder on
+        # its outcome latent, hence both successful and failed transitions are
+        # legitimate reconstruction targets.
+        success_mask = outcome_target.eq(0) if outcome_target is not None else None
+        if success_mask is None or bool(success_mask.any()):
+            loss_mask = success_mask if success_mask is not None else slice(None)
+            observation_loss, field_losses = self.observation_loss(
+                obs_pred[loss_mask], obs_next[loss_mask], obs_prev=obs[loss_mask],
+                aux_pred=aux_pred[loss_mask] if isinstance(aux_pred, torch.Tensor) else aux_pred,
+                inv=inv[loss_mask] if inv is not None else None,
+                inv_next=inv_next[loss_mask] if inv_next is not None else None,
+            )
+        else:
+            # Retain a gradient-bearing zero for all-failure batches.
+            observation_loss = obs_pred.sum() * 0.0
+            field_losses = {}
+
+        outcome_loss = (
+            F.cross_entropy(outcome_logits, outcome_target)
+            if outcome_logits is not None else observation_loss.new_zeros(())
         )
+        if latent_prediction is not None:
+            posterior_logits = latent_prediction["posterior_logits"]
+            if posterior_logits is None:
+                raise RuntimeError("latent_v2 training requires a posterior")
+            latent_kl = self._categorical_kl(
+                posterior_logits, latent_prediction["prior_logits"]
+            )
+            if latent_target is not None:
+                latent_supervision = (
+                    F.cross_entropy(latent_prediction["prior_logits"][:, 0], latent_target)
+                    + F.cross_entropy(posterior_logits[:, 0], latent_target)
+                ) * 0.5
+            else:
+                latent_supervision = observation_loss.new_zeros(())
+        else:
+            latent_kl = observation_loss.new_zeros(())
+            latent_supervision = observation_loss.new_zeros(())
 
         # Preserve field-level values only in the local Bipedal diagnostics CSV.
         if self.is_bipedal and hasattr(self.model, "bipedal_token_specs"):
@@ -977,9 +1152,19 @@ class AttentionWorldModel(pl.LightningModule):
 
         if self.ewc_enabled:
             ewc_raw = self.ewc_loss()
-            optimization_objective = observation_loss + self.lambda_ewc * ewc_raw
+            optimization_objective = (
+                observation_loss
+                + self.stochastic_latent_loss_weight * outcome_loss
+                + self.latent_kl_weight * latent_kl
+                + self.latent_supervision_weight * latent_supervision
+                + self.lambda_ewc * ewc_raw
+            )
         else:
-            optimization_objective = observation_loss
+            optimization_objective = (
+                observation_loss + self.stochastic_latent_loss_weight * outcome_loss
+                + self.latent_kl_weight * latent_kl
+                + self.latent_supervision_weight * latent_supervision
+            )
 
         # One public training-loss curve for every domain.
         self.log(
@@ -989,6 +1174,14 @@ class AttentionWorldModel(pl.LightningModule):
             on_step=True,
             on_epoch=False,
         )
+        if outcome_logits is not None:
+            outcome_probs = torch.softmax(outcome_logits, dim=-1)
+            self.log("train/outcome_loss", outcome_loss, on_step=True, on_epoch=False)
+            self.log("train/failure_probability", outcome_probs[:, 1].mean(), on_step=True, on_epoch=False)
+            self.log("train/failure_rate", outcome_target.float().mean(), on_step=True, on_epoch=False)
+        if latent_prediction is not None:
+            self.log("train/latent_kl", latent_kl, on_step=True, on_epoch=False)
+            self.log("train/latent_supervision", latent_supervision, on_step=True, on_epoch=False)
         return optimization_objective
 
     def on_train_epoch_start(self):
@@ -1052,7 +1245,30 @@ class AttentionWorldModel(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         obs, act, obs_next, info, elements_mask, agent_position, inv, inv_next = self.preprocess_batch(batch)
-        obs_pred, attention_weight, inv_pred = self(obs, act, info, inv=inv)
+        outcome_target = self._stochastic_outcome_target(
+            info, obs.shape[0], obs.device
+        ) if self.stochastic_latent_enabled else None
+        latent_target = self._optional_action_failed_target(info, obs.shape[0], obs.device) \
+            if self.stochastic_latent_v2_enabled else None
+        latent_prediction = None
+        if self.stochastic_latent_v2_enabled:
+            latent_prediction = self.forward_distribution(
+                obs, act, info, inv=inv, next_state=obs_next,
+                next_inventory=inv_next, latent_labels=latent_target, sample_mode="mode",
+            )
+            obs_pred = latent_prediction["state_logits"]
+            attention_weight = latent_prediction["attention_weights"]
+            inv_pred = latent_prediction["inventory_logits"]
+            outcome_logits = None
+        elif self.stochastic_latent_enabled:
+            stochastic_prediction = self.forward_stochastic(obs, act, info, inv=inv)
+            obs_pred = stochastic_prediction["state_logits"]
+            attention_weight = stochastic_prediction["attention_weights"]
+            inv_pred = stochastic_prediction["inventory_logits"]
+            outcome_logits = stochastic_prediction["outcome_logits"]
+        else:
+            obs_pred, attention_weight, inv_pred = self(obs, act, info, inv=inv)
+            outcome_logits = None
         # if self.hparams.freeze_weight:
         #     diff = torch.abs(obs_pred - obs_next)  # (128, 3, 3, 3)
         #     max_diff_per_group, max_indices = diff.reshape(diff.shape[0], -1).max(dim=1)  
@@ -1114,38 +1330,83 @@ class AttentionWorldModel(pl.LightningModule):
             obs = obs.float()
 
         # Validation uses exactly the same observation objective as training.
-        loss_val, field_values = self.observation_loss(
-            obs_pred,
-            obs_next,
-            obs_prev=obs,
-            aux_pred=inv_pred,
-            inv=inv,
-            inv_next=inv_next,
+        success_mask = outcome_target.eq(0) if outcome_target is not None else None
+        if success_mask is None or bool(success_mask.any()):
+            loss_mask = success_mask if success_mask is not None else slice(None)
+            transition_loss, field_values = self.observation_loss(
+                obs_pred[loss_mask], obs_next[loss_mask], obs_prev=obs[loss_mask],
+                aux_pred=inv_pred[loss_mask] if isinstance(inv_pred, torch.Tensor) else inv_pred,
+                inv=inv[loss_mask] if inv is not None else None,
+                inv_next=inv_next[loss_mask] if inv_next is not None else None,
+            )
+        else:
+            transition_loss = obs_pred.sum() * 0.0
+            field_values = {}
+        outcome_loss = (
+            F.cross_entropy(outcome_logits, outcome_target)
+            if outcome_logits is not None else transition_loss.new_zeros(())
+        )
+        if latent_prediction is not None:
+            latent_kl = self._categorical_kl(
+                latent_prediction["posterior_logits"], latent_prediction["prior_logits"]
+            )
+            latent_supervision = (
+                (F.cross_entropy(latent_prediction["prior_logits"][:, 0], latent_target)
+                 + F.cross_entropy(latent_prediction["posterior_logits"][:, 0], latent_target)) * 0.5
+                if latent_target is not None else transition_loss.new_zeros(())
+            )
+        else:
+            latent_kl = transition_loss.new_zeros(())
+            latent_supervision = transition_loss.new_zeros(())
+        loss_val = (
+            transition_loss + self.stochastic_latent_loss_weight * outcome_loss
+            + self.latent_kl_weight * latent_kl
+            + self.latent_supervision_weight * latent_supervision
         )
 
-        natural_loss, natural_field_values = self.observation_loss(
-            obs_pred, obs_next, obs_prev=obs, aux_pred=inv_pred,
-            inv=inv, inv_next=inv_next, focal_gamma=0.0,
-        )
+        if success_mask is None or bool(success_mask.any()):
+            natural_loss, natural_field_values = self.observation_loss(
+                obs_pred[loss_mask], obs_next[loss_mask], obs_prev=obs[loss_mask],
+                aux_pred=inv_pred[loss_mask] if isinstance(inv_pred, torch.Tensor) else inv_pred,
+                inv=inv[loss_mask] if inv is not None else None,
+                inv_next=inv_next[loss_mask] if inv_next is not None else None,
+                focal_gamma=0.0,
+            )
+        else:
+            natural_loss, natural_field_values = transition_loss, {}
         self._val_natural_outputs.append(natural_loss.detach())
         self._val_field_outputs.append({
             name: value.detach() for name, value in natural_field_values.items()
         })
         if self.env_type == "minigrid":
             with torch.no_grad():
+                # The spatial/inventory heads represent the execute branch;
+                # do not score their deterministic decode against failure
+                # transitions, whose exact successor is the current state.
+                diagnostic_mask = success_mask if success_mask is not None else slice(None)
+                diagnostic_obs_pred = obs_pred[diagnostic_mask]
+                diagnostic_obs_next = obs_next[diagnostic_mask]
+                diagnostic_obs = obs[diagnostic_mask]
+                diagnostic_inv = inv[diagnostic_mask] if inv is not None else None
+                diagnostic_inv_next = inv_next[diagnostic_mask] if inv_next is not None else None
+                diagnostic_inv_pred = (
+                    inv_pred[diagnostic_mask]
+                    if isinstance(inv_pred, torch.Tensor) else inv_pred
+                )
                 changed_focal, false_set, changed_count = self._minigrid_effect_diagnostics(
-                    obs_pred, obs_next, obs, inv, inv_next, inv_pred
+                    diagnostic_obs_pred, diagnostic_obs_next, diagnostic_obs,
+                    diagnostic_inv, diagnostic_inv_next, diagnostic_inv_pred
                 )
                 decoded, decoded_inv, diagnostics = decode_minigrid_transition(
-                    obs_pred,
-                    obs,
-                    inv_pred,
-                    inv,
+                    diagnostic_obs_pred,
+                    diagnostic_obs,
+                    diagnostic_inv_pred,
+                    diagnostic_inv,
                     mode=self.minigrid_transition_mode,
                     constrain_agent=False,
                 )
-                target = obs_next.long()
-                changed = obs.ne(target)
+                target = diagnostic_obs_next.long()
+                changed = diagnostic_obs.ne(target)
                 self._val_minigrid_diagnostics.append({
                     "decoded_accuracy": decoded.eq(target).float().mean(),
                     "changed_accuracy": decoded.eq(target)[changed].float().mean()
@@ -1161,6 +1422,19 @@ class AttentionWorldModel(pl.LightningModule):
                     "false_set_rate": false_set.detach(),
                     "changed_count": changed_count.detach(),
                 })
+        if outcome_logits is not None:
+            outcome_probs = torch.softmax(outcome_logits, dim=-1)
+            self._val_stochastic_outcomes.append({
+                "outcome_loss": outcome_loss.detach(),
+                "failure_probability": outcome_probs[:, 1].mean().detach(),
+                "failure_rate": outcome_target.float().mean().detach(),
+                "outcome_accuracy": outcome_logits.argmax(dim=-1).eq(outcome_target).float().mean().detach(),
+            })
+        if latent_prediction is not None:
+            self._val_stochastic_outcomes.append({
+                "latent_kl": latent_kl.detach(),
+                "latent_supervision": latent_supervision.detach(),
+            })
 
         self._val_step_outputs.append(loss_val.detach())
 
@@ -1174,6 +1448,7 @@ class AttentionWorldModel(pl.LightningModule):
         self._val_field_outputs = []
         self._val_minigrid_diagnostics = []
         self._val_minigrid_effect_diagnostics = []
+        self._val_stochastic_outcomes = []
         if getattr(self.hparams, "keep_cell_loss", False):
             self.loss_accumulator = [[[] for _ in range(self.col)] for _ in range(self.row)]
             self.loss_map_result = None
@@ -1238,11 +1513,18 @@ class AttentionWorldModel(pl.LightningModule):
                         row[name] for row in self._val_minigrid_effect_diagnostics
                     ]).mean(),
                 )
+        if self._val_stochastic_outcomes:
+            for name in self._val_stochastic_outcomes[0]:
+                self.log(
+                    f"val/{name}",
+                    torch.stack([row[name] for row in self._val_stochastic_outcomes]).mean(),
+                )
         self._val_step_outputs = []
         self._val_natural_outputs = []
         self._val_field_outputs = []
         self._val_minigrid_diagnostics = []
         self._val_minigrid_effect_diagnostics = []
+        self._val_stochastic_outcomes = []
 
     def on_save_checkpoint(self, checkpoint):
         if hasattr(self.model, "checkpoint_contract"):

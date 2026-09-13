@@ -59,7 +59,21 @@ def rollout_minigrid_wm(
     masked = utils.extract_masked_state_torch(
         states, int(attention_mask_size), agent_positions
     )
-    prediction, _, inventory_logits = model(masked, actions, None, inv=inventory_tokens)
+    # The same domain-level switch that selected the latent-v2 WM also
+    # selects stochastic imagined transitions.  Prior-only sampling is used
+    # here because future states are unavailable during rollout.
+    if bool(getattr(model, "stochastic_latent_v2_enabled", False)):
+        distribution = model.forward_distribution(
+            masked,
+            actions,
+            None,
+            inv=inventory_tokens,
+            sample_mode="sample",
+        )
+        prediction = distribution["state_logits"]
+        inventory_logits = distribution["inventory_logits"]
+    else:
+        prediction, _, inventory_logits = model(masked, actions, None, inv=inventory_tokens)
     next_masked, next_inventory, decoder_diagnostics = decode_minigrid_transition(
         prediction,
         masked,

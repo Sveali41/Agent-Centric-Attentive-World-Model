@@ -177,6 +177,10 @@ class AttentionModule(nn.Module):
         crafter_inventory_classes=10,
         crafter_inventory_output_mode="categorical_gate",
         minigrid_transition_mode="effect",
+        stochastic_outcome=False,
+        stochastic_model="none",
+        latent_num_factors=1,
+        latent_num_classes=2,
     ):
         super().__init__()
         self.data_type = data_type
@@ -186,6 +190,19 @@ class AttentionModule(nn.Module):
         self.crafter_inventory_classes = int(crafter_inventory_classes)
         self.crafter_inventory_output_mode = str(crafter_inventory_output_mode)
         self.minigrid_transition_mode = str(minigrid_transition_mode)
+        self.stochastic_model = str(stochastic_model).lower()
+        # ``stochastic_outcome`` is the v1 ablation flag.  Keep accepting it
+        # so existing checkpoints/configurations retain their exact contract.
+        self.stochastic_outcome = bool(stochastic_outcome) or self.stochastic_model == "outcome_v1"
+        self.stochastic_latent_v2 = self.stochastic_model == "latent_v2"
+        self.latent_num_factors = int(latent_num_factors)
+        self.latent_num_classes = int(latent_num_classes)
+        if self.stochastic_outcome and env_type != "minigrid":
+            raise ValueError("stochastic_outcome is currently supported only for MiniGrid")
+        if self.stochastic_latent_v2 and env_type != "minigrid":
+            raise ValueError("stochastic latent v2 is currently supported only for MiniGrid")
+        if self.stochastic_latent_v2 and (self.latent_num_factors < 1 or self.latent_num_classes < 2):
+            raise ValueError("latent_v2 requires num_factors >= 1 and num_classes >= 2")
         self.is_bipedal = (env_type == "bipedalwalker")
         self.embed_dim = embed_dim
         if data_type == 'discrete':
@@ -350,6 +367,41 @@ class AttentionModule(nn.Module):
                 "inventory_output_classes": contract.inventory_output_classes,
                 "semantic_action_count": contract.action_count,
             }
+            if self.stochastic_outcome:
+                # 0 = requested action executes; 1 = navigation action drops.
+                self.outcome_head = nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim),
+                    nn.ReLU(),
+                    nn.Linear(embed_dim, 2),
+                )
+                self.checkpoint_contract["stochastic_outcome"] = {
+                    "version": "minigrid_action_outcome_v1",
+                    "classes": ["execute", "noop_failure"],
+                    "supervised_field": "action_failed",
+                }
+            if self.stochastic_latent_v2:
+                # A factorised categorical latent is deliberately separate
+                # from v1's labelled outcome classifier.  Its embedding is
+                # injected before *both* spatial and inventory decoders.
+                self.prior_head = nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim), nn.ReLU(),
+                    nn.Linear(embed_dim, self.latent_num_factors * self.latent_num_classes),
+                )
+                self.posterior_head = nn.Sequential(
+                    # Current-state/action features, next-state features, and
+                    # an optional next inventory token.
+                    nn.Linear(embed_dim * 3, embed_dim), nn.ReLU(),
+                    nn.Linear(embed_dim, self.latent_num_factors * self.latent_num_classes),
+                )
+                self.latent_embedding = nn.Parameter(
+                    torch.empty(self.latent_num_factors, self.latent_num_classes, embed_dim)
+                )
+                nn.init.normal_(self.latent_embedding, std=0.02)
+                self.checkpoint_contract["stochastic_latent"] = {
+                    "version": "one_step_discrete_latent_v2",
+                    "num_factors": self.latent_num_factors,
+                    "num_classes": self.latent_num_classes,
+                }
         
         self.dropout_conv = nn.Dropout(p=0.1)
 
@@ -431,7 +483,45 @@ class AttentionModule(nn.Module):
         return out, contact_logits
 
 
-    def forward(self, state, action, info, inv=None):
+    def _encode_discrete_tokens(self, state):
+        """Shared state-only encoder used by the v2 posterior."""
+        B, TotalC, H, W = state.size()
+        K = self.frame_stack
+        C_base = TotalC // K
+        all_frames_emb = []
+        for k in range(K):
+            frame = state[:, k*C_base:(k+1)*C_base]
+            if self.env_type == 'crafter':
+                obj_oh = F.one_hot(frame[:, 0].reshape(B, -1).long(), num_classes=20)
+                dir_oh = F.one_hot(frame[:, 1].reshape(B, -1).long(), num_classes=5)
+                frame_emb = torch.cat([obj_oh, dir_oh], dim=-1).float()
+            else:
+                obj_oh = F.one_hot(frame[:, 0].reshape(B, -1).long(), num_classes=11)
+                color_oh = F.one_hot(frame[:, 1].reshape(B, -1).long(), num_classes=6)
+                dir_oh = F.one_hot(frame[:, 2].reshape(B, -1).long(), num_classes=4)
+                frame_emb = torch.cat([obj_oh, color_oh, dir_oh], dim=-1).float()
+            all_frames_emb.append(frame_emb)
+        state_emb = torch.cat(all_frames_emb, dim=-1).transpose(1, 2)
+        state_emb = state_emb.reshape(B, self.input_channel, H, W)
+        x = self.relu(self.bn1(self.conv1(state_emb)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        x = self.dropout_conv(x)
+        return self.flatten(x).transpose(1, 2) + self.pos_embedding
+
+    def _sample_latent(self, logits, sample_mode="sample", generator=None):
+        if sample_mode not in {"sample", "mode"}:
+            raise ValueError("sample_mode must be 'sample' or 'mode'")
+        if sample_mode == "mode":
+            return logits.argmax(dim=-1)
+        probs = torch.softmax(logits, dim=-1)
+        return torch.multinomial(
+            probs.reshape(-1, probs.shape[-1]), 1, generator=generator
+        ).reshape(logits.shape[:-1])
+
+    def forward(self, state, action, info, inv=None, return_outcome=False,
+                return_distribution=False, next_state=None, next_inventory=None,
+                latent_labels=None,
+                sample_mode="sample", generator=None):
         orginal_dim = state.ndim
         if self.is_bipedal:
             if orginal_dim == 1:
@@ -471,37 +561,13 @@ class AttentionModule(nn.Module):
 
         # ==== State encoding ====
         if self.data_type == 'discrete':
-            all_frames_emb = []
-            for k in range(K):
-                frame = state[:, k*C_base:(k+1)*C_base]
-                if self.env_type == 'crafter':
-                    obj = frame[:, 0]
-                    dir_id = frame[:, 1]
-                    obj_oh = F.one_hot(obj.reshape(B, -1).long(), num_classes=20)  # IDs 0-19
-                    dir_oh = F.one_hot(dir_id.reshape(B, -1).long(), num_classes=5)
-                    frame_emb = torch.cat([obj_oh, dir_oh], dim=-1).float()
-                else:
-                    obj = frame[:, 0]
-                    color = frame[:, 1]
-                    dir_id = frame[:, 2]
-                    obj_oh = F.one_hot(obj.reshape(B, -1).long(), num_classes=11)
-                    color_oh = F.one_hot(color.reshape(B, -1).long(), num_classes=6)
-                    dir_oh = F.one_hot(dir_id.reshape(B, -1).long(), num_classes=4)
-                    frame_emb = torch.cat([obj_oh, color_oh, dir_oh], dim=-1).float()
-                all_frames_emb.append(frame_emb)
-            
-            # Combine all stacked frames' embeddings
-            state_emb = torch.cat(all_frames_emb, dim=-1)
-            state_emb = state_emb.transpose(1, 2).reshape(B, self.input_channel, H, W)
+            x = self._encode_discrete_tokens(state)
         else:
             state_emb = state
-
-        # ==== Convolutional feature extraction ====
-        x = self.relu(self.bn1(self.conv1(state_emb)))
-        x = self.relu(self.bn2(self.conv2(x)))
-        x = self.dropout_conv(x)
-        x = self.flatten(x).transpose(1, 2)  # (B, N, D)
-        x = x + self.pos_embedding  # Add positional encoding.
+            x = self.relu(self.bn1(self.conv1(state_emb)))
+            x = self.relu(self.bn2(self.conv2(x)))
+            x = self.dropout_conv(x)
+            x = self.flatten(x).transpose(1, 2) + self.pos_embedding
 
         # ==== Prepare action embedding ====
         if self.data_type == 'discrete':
@@ -547,6 +613,62 @@ class AttentionModule(nn.Module):
         # ==== Residual MLP before FC ====
         x = self.res_mlp(x)  # shape: (B, N, D)
 
+        prior_logits = posterior_logits = latent_sample = None
+        if return_distribution:
+            if not self.stochastic_latent_v2:
+                raise ValueError("Distribution prediction requires stochastic_model='latent_v2'")
+            x_pooled_before_latent = x.mean(dim=1)
+            prior_logits = self.prior_head(x_pooled_before_latent).reshape(
+                B, self.latent_num_factors, self.latent_num_classes
+            )
+            posterior_logits = None
+            selection_logits = prior_logits
+            if next_state is not None:
+                if next_state.ndim == 3:
+                    next_state = next_state.unsqueeze(0)
+                if next_state.shape[0] != B:
+                    raise ValueError("next_state batch size must match state")
+                next_tokens = self._encode_discrete_tokens(next_state)
+                next_pooled = next_tokens.mean(dim=1)
+                if next_inventory is not None:
+                    next_inventory_token = torch.as_tensor(
+                        next_inventory, device=x.device
+                    ).long().reshape(-1)
+                    if next_inventory_token.numel() != B:
+                        raise ValueError("next_inventory batch size must match state")
+                    next_inventory_emb = self.key_embedding(next_inventory_token)
+                else:
+                    next_inventory_emb = torch.zeros_like(next_pooled)
+                posterior_logits = self.posterior_head(
+                    torch.cat(
+                        [x_pooled_before_latent, next_pooled, next_inventory_emb],
+                        dim=-1,
+                    )
+                ).reshape(B, self.latent_num_factors, self.latent_num_classes)
+                selection_logits = posterior_logits
+            latent_sample = self._sample_latent(selection_logits, sample_mode, generator)
+            # During training the posterior's sampled categorical assignment
+            # must influence reconstruction; a straight-through Gumbel sample
+            # keeps the decoder input discrete while passing that gradient.
+            # Inference remains an explicitly generator-controlled categorical
+            # draw from the prior.
+            if self.training and posterior_logits is not None:
+                assignments = F.gumbel_softmax(selection_logits, tau=1.0, hard=True, dim=-1)
+                latent_sample = assignments.argmax(dim=-1)
+            else:
+                assignments = F.one_hot(latent_sample, self.latent_num_classes).float()
+            # Observed MiniGrid failures supervise factor 0 without making the
+            # rest of the factorised interface environment-specific.
+            if latent_labels is not None:
+                labels = torch.as_tensor(latent_labels, device=x.device).reshape(-1).long()
+                if labels.numel() != B or ((labels < 0) | (labels >= self.latent_num_classes)).any():
+                    raise ValueError("latent_labels must contain one valid class per batch row")
+                assignments[:, 0] = F.one_hot(labels, self.latent_num_classes).float()
+                latent_sample = latent_sample.clone()
+                latent_sample[:, 0] = labels
+            latent_context = torch.einsum("bfc,fcd->bd", assignments, self.latent_embedding)
+            x = x + latent_context.unsqueeze(1)
+
         # ==== Output head ====
         x_out = self.fc(x)
         x_out = x_out.transpose(1, 2).reshape(B, self.out_channel, H, W)
@@ -571,8 +693,20 @@ class AttentionModule(nn.Module):
                         B, 12, self.crafter_inventory_classes
                     ).transpose(1, 2).contiguous(),
                 }
+            outcome_logits = (
+                self.outcome_head(x_pooled)
+                if return_outcome and self.stochastic_outcome
+                else None
+            )
         else:
             inv_pred = None
+            outcome_logits = None
+
+        if return_outcome and outcome_logits is None:
+            raise ValueError(
+                "Stochastic outcome logits were requested from a model without "
+                "the MiniGrid stochastic outcome head"
+            )
 
         if orginal_dim == 3:
             x_out = x_out.squeeze(0)
@@ -581,4 +715,17 @@ class AttentionModule(nn.Module):
                     inv_pred = {key: value.squeeze(0) for key, value in inv_pred.items()}
                 else:
                     inv_pred = inv_pred.squeeze(0)
+            if outcome_logits is not None:
+                outcome_logits = outcome_logits.squeeze(0)
+        if return_outcome:
+            return x_out, attn_weights, inv_pred, outcome_logits
+        if return_distribution:
+            return {
+                "state_logits": x_out,
+                "attention_weights": attn_weights,
+                "inventory_logits": inv_pred,
+                "prior_logits": prior_logits,
+                "posterior_logits": posterior_logits,
+                "latent_sample": latent_sample,
+            }
         return x_out, attn_weights, inv_pred

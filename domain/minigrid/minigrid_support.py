@@ -31,6 +31,26 @@ def _get_env_visualize(cfg) -> bool:
         return False
 
 
+def stochastic_env_kwargs(cfg) -> dict:
+    """Return the shared stochastic MiniGrid constructor arguments.
+
+    Older configs do not have a ``domains.minigrid.stochastic`` block, so
+    they retain the deterministic environment by default.
+    """
+    try:
+        stochastic_cfg = cfg.domains.minigrid.stochastic
+    except (AttributeError, KeyError, TypeError):
+        stochastic_cfg = None
+    if stochastic_cfg is None:
+        return {"stochastic_enabled": False, "move_failure_prob": 0.2}
+    return {
+        "stochastic_enabled": bool(getattr(stochastic_cfg, "enabled", False)),
+        "move_failure_prob": float(
+            getattr(stochastic_cfg, "move_failure_prob", 0.2)
+        ),
+    }
+
+
 def wrap_env(env_layout, cfg):
     render_mode = "human" if _get_env_visualize(cfg) else None
     layout_string = generate_obj_map(env_layout, cfg.training_generator.map_element)
@@ -42,6 +62,7 @@ def wrap_env(env_layout, cfg):
             color_str=color_string,
             custom_mission="Navigate to the start position.",
             render_mode=render_mode,
+            **stochastic_env_kwargs(cfg),
         )
     )
     return env
@@ -55,6 +76,7 @@ def wrap_env_from_text(file_path, max_steps, cfg):
             custom_mission="Navigate to the start position.",
             max_steps=max_steps,
             render_mode=render_mode,
+            **stochastic_env_kwargs(cfg),
         )
     )
     return env

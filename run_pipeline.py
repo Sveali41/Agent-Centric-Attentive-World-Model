@@ -120,6 +120,17 @@ def domain_runtime_overrides(cfg: DictConfig, domain: str) -> list[str]:
             f"domains.{domain}.minigrid_transition_mode="
             f"{domain_cfg.minigrid_transition_mode}"
         )
+    if domain == "minigrid":
+        stochastic_cfg = getattr(domain_cfg, "stochastic", None)
+        if stochastic_cfg is not None:
+            overrides.extend(
+                [
+                    "domains.minigrid.stochastic.enabled="
+                    f"{str(bool(getattr(stochastic_cfg, 'enabled', False))).lower()}",
+                    "domains.minigrid.stochastic.move_failure_prob="
+                    f"{float(getattr(stochastic_cfg, 'move_failure_prob', 0.2))}",
+                ]
+            )
     collection_cfg = getattr(domain_cfg, "data_collection", None)
     if collection_cfg is not None:
         for name in (
@@ -214,6 +225,17 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
             f"domains.{domain}.minigrid_transition_mode="
             f"{domain_cfg.minigrid_transition_mode}"
         )
+    if domain == "minigrid":
+        stochastic_cfg = getattr(domain_cfg, "stochastic", None)
+        if stochastic_cfg is not None:
+            policy_identity_overrides.extend(
+                [
+                    "domains.minigrid.stochastic.enabled="
+                    f"{str(bool(getattr(stochastic_cfg, 'enabled', False))).lower()}",
+                    "domains.minigrid.stochastic.move_failure_prob="
+                    f"{float(getattr(stochastic_cfg, 'move_failure_prob', 0.2))}",
+                ]
+            )
     if hasattr(cfg, "p2e"):
         policy_identity_overrides.append(
             f"p2e.enabled={str(bool(cfg.p2e.enabled)).lower()}"

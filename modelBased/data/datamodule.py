@@ -70,6 +70,32 @@ class WMRLDataset(Dataset):
         self.act_norm_values = hparams.action_norm_values
         self.data = self.make_data(loaded, replay_data)
 
+    def _minigrid_stochastic_latent_enabled(self):
+        """Whether MiniGrid stochastic training needs natural sampling."""
+        domain_switch = getattr(self.hparams, "stochastic_enabled", None)
+        if domain_switch is not None:
+            return bool(domain_switch)
+        model = getattr(self.hparams, "stochastic_model", None)
+        if model is not None:
+            return str(model).lower() in {"outcome_v1", "latent_v2"}
+        config = getattr(self.hparams, "stochastic_latent", None)
+        if config is None:
+            return False
+        if isinstance(config, dict):
+            return bool(config.get("enabled", False))
+        return bool(getattr(config, "enabled", False))
+
+    def _minigrid_outcome_labels_required(self):
+        """Whether the selected stochastic model requires action_failed labels."""
+        # The unified domain switch selects latent_v2, whose labels are only
+        # optional auxiliary supervision rather than a dataset requirement.
+        if getattr(self.hparams, "stochastic_enabled", None) is not None:
+            return False
+        model = getattr(self.hparams, "stochastic_model", None)
+        if model is not None:
+            return str(model).lower() == "outcome_v1"
+        return self._minigrid_stochastic_latent_enabled()
+
     @staticmethod
     def _to_crafter_nchw(arr):
         """
@@ -230,7 +256,7 @@ class WMRLDataset(Dataset):
                     record.get("carrying_token", 0),
                 )
             )
-            normalized.append({
+            normalized_record = {
                 "current_carrying_key": bool(current_token > 0),
                 "current_carrying_token": current_token,
                 "carrying_key": bool(next_token > 0),
@@ -238,7 +264,13 @@ class WMRLDataset(Dataset):
                 "next_carrying_key": bool(next_token > 0),
                 "next_carrying_token": next_token,
                 "uniform_reset": bool(record.get("uniform_reset", False)),
-            })
+                # Keep the environment's transition-outcome label.  It is
+                # deliberately not used as a model input: the stochastic
+                # latent predicts it from state and requested action.
+            }
+            if "action_failed" in record:
+                normalized_record["action_failed"] = bool(record["action_failed"])
+            normalized.append(normalized_record)
         return np.asarray(normalized, dtype=object)
 
     def state_batch_preprocess(self, state):
@@ -514,6 +546,31 @@ class WMRLDataset(Dataset):
                 data['_sampling_bucket'] = action_ids * 16 + signature
             else:
                 data['_sampling_bucket'] = action_ids * 2 + transition_changed.astype(np.int64)
+        if env_type == 'minigrid' and self._minigrid_outcome_labels_required():
+            if info is None:
+                raise ValueError(
+                    "[DataModule][MiniGrid] stochastic_latent.enabled requires "
+                    "transition info with an action_failed label; recollect the dataset."
+                )
+            records = np.asarray(info, dtype=object).reshape(-1)
+            if len(records) != len(obs):
+                raise ValueError(
+                    "[DataModule][MiniGrid] stochastic_latent.enabled requires "
+                    "one transition info record per sample, including replay data; "
+                    "recollect or rebuild the replay dataset. "
+                    f"records={len(records)} samples={len(obs)}"
+                )
+            missing = []
+            for index, value in enumerate(records):
+                record = value.item() if isinstance(value, np.ndarray) and value.size == 1 else value
+                if not isinstance(record, dict) or "action_failed" not in record:
+                    missing.append(index)
+            if missing:
+                raise ValueError(
+                    "[DataModule][MiniGrid] stochastic_latent.enabled requires "
+                    "action_failed on every transition; recollect the dataset. "
+                    f"missing={missing[:10]}"
+                )
         if env_type == 'minigrid' and info is not None:
             info = self._normalize_minigrid_info_for_batch(info)
         if env_type in ('with_obj', 'minigrid') and info is not None:
@@ -628,6 +685,14 @@ class WMRLDataModule(pl.LightningDataModule):
         sample_weights = None
         dataset = self.data_train.dataset
         indices = np.asarray(self.data_train.indices, dtype=np.int64)
+        if (
+            getattr(self.data_train.dataset, "_minigrid_stochastic_latent_enabled", lambda: False)()
+            and bool(getattr(self.cfg, "transition_balanced_sampling", False))
+        ):
+            raise ValueError(
+                "[DataModule][MiniGrid] stochastic_latent requires natural transition "
+                "sampling; set transition_balanced_sampling=false."
+            )
         if bool(getattr(self.cfg, "transition_balanced_sampling", False)):
             buckets = dataset.data.get('_sampling_bucket', None)
             if buckets is not None:

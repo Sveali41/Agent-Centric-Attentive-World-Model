@@ -9,6 +9,12 @@ from minigrid.wrappers import FullyObsWrapper, RGBImgObsWrapper
 import numpy as np  # Ensure numpy is imported
 import textwrap
 from pathlib import Path
+from gymnasium import spaces
+
+
+# Internal outcome marker for a dropped action. This is not a MiniGrid/native
+# action and is never exposed through the policy action space.
+INTERNAL_NOOP_ACTION = -1
 
 
 def char_to_color(char: str) -> Optional[str]:
@@ -80,6 +86,8 @@ class CustomMiniGridEnv(MiniGridEnv):
             initial_carrying_key_color: Optional[str] = None,
             custom_mission: str = "Explore and interact with objects.",
             max_steps: Optional[int] = None,
+            stochastic_enabled: bool = False,
+            move_failure_prob: float = 0.2,
             **kwargs,
     ) -> None:
         """
@@ -102,6 +110,9 @@ class CustomMiniGridEnv(MiniGridEnv):
                 key on every reset; ``None`` starts with an empty carrying slot.
             custom_mission (str): Custom mission description.
             max_steps (Optional[int]): Maximum number of steps in an episode.
+            stochastic_enabled (bool): Whether navigation actions can fail.
+            move_failure_prob (float): Probability that a left, right, or
+                forward action becomes a no-op.
             **kwargs: Additional keyword arguments for MiniGridEnv.
         """
         self.txt_file_path = txt_file_path
@@ -115,6 +126,13 @@ class CustomMiniGridEnv(MiniGridEnv):
         self.s_positions = []  # List to store positions of 'S'
         self.replace_start_with_empty = bool(replace_start_with_empty)
         self.initial_carrying_key_color = initial_carrying_key_color
+        self.stochastic_enabled = bool(stochastic_enabled)
+        try:
+            self.move_failure_prob = float(move_failure_prob)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("move_failure_prob must be a number in [0, 1].") from exc
+        if not 0.0 <= self.move_failure_prob <= 1.0:
+            raise ValueError("move_failure_prob must be in [0, 1].")
 
         # Determine the size of the environment if not provided
         if size is None:
@@ -136,6 +154,10 @@ class CustomMiniGridEnv(MiniGridEnv):
             height=self.height,
             **kwargs,
         )
+        # The project contract exposes exactly six MiniGrid actions. Native
+        # ``done`` remains unavailable to callers; stochastic failures are
+        # represented as unchanged transitions inside ``step``.
+        self.action_space = spaces.Discrete(6)
 
         # Determine the starting position and direction of the agent
         self.rand_agent_start_pos = agent_start_pos is None
@@ -156,6 +178,57 @@ class CustomMiniGridEnv(MiniGridEnv):
         # The symbolic grid does not encode carrying, but regenerating keeps
         # this reset contract correct for wrappers that extend gen_obs().
         return self.gen_obs(), info
+
+    def step(self, action):
+        """Execute one action, optionally dropping navigation actions.
+
+        A dropped action follows the environment's private no-op path without
+        invoking MiniGrid's native ``done`` action.
+        """
+        action_id = int(action)
+        if not self.action_space.contains(action_id):
+            raise ValueError(
+                f"Invalid MiniGrid action {action_id}; expected action ids 0..5"
+            )
+        requested_action = self.actions(action_id)
+        executed_action = requested_action
+        action_failed = False
+        navigation_actions = {
+            self.actions.left,
+            self.actions.right,
+            self.actions.forward,
+        }
+        if (
+            self.stochastic_enabled
+            and requested_action in navigation_actions
+            and self.np_random.random() < self.move_failure_prob
+        ):
+            executed_action = INTERNAL_NOOP_ACTION
+            action_failed = True
+
+        if action_failed:
+            obs, reward, terminated, truncated, info = self._step_noop()
+        else:
+            obs, reward, terminated, truncated, info = super().step(executed_action)
+        info = dict(info)
+        info.update(
+            requested_action=int(requested_action),
+            executed_action=int(executed_action),
+            action_failed=action_failed,
+            stochastic_enabled=self.stochastic_enabled,
+            move_failure_prob=self.move_failure_prob,
+        )
+        return obs, reward, terminated, truncated, info
+
+    def _step_noop(self):
+        """Advance time and observe without invoking a native action."""
+        self.step_count += 1
+        reward = 0
+        terminated = False
+        truncated = self.step_count >= self.max_steps
+        if self.render_mode == "human":
+            self.render()
+        return self.gen_obs(), reward, terminated, truncated, {}
 
     def determine_layout_size_from_file(self) -> Tuple[int, int]:
         """
@@ -208,33 +281,39 @@ class CustomMiniGridEnv(MiniGridEnv):
         else:
             self.read_layout_from_strings()
 
-        # If 'S' positions are specified in the layout, use them as the agent's starting positions
-        if self.s_positions:
-            # For simplicity, use the first 'S' position as the agent's start
-            self.agent_start_pos = self.s_positions[0]
-            self.agent_dir = self.agent_start_dir if not self.rand_agent_start_dir else np.random.randint(0, 4)
-            self.agent_pos = self.agent_start_pos
-        else:
+        # An explicit start position always takes precedence.  Otherwise an S
+        # marker is required outside collection mode; only uniform collection
+        # (replace_start_with_empty=True) samples a random empty start.
+        if not self.rand_agent_start_pos:
+            start_pos = self.agent_start_pos
+        elif self.s_positions:
+            start_pos = self.s_positions[0]
+        elif self.replace_start_with_empty:
             # Find all 'E' positions (empty spots)
-            empty_positions = [(x, y) for x in range(self.width) for y in range(self.height) 
-                            if self.grid.get(x, y) is None]
-            
+            empty_positions = [
+                (x, y)
+                for x in range(self.width)
+                for y in range(self.height)
+                if self.grid.get(x, y) is None
+            ]
             if not empty_positions:
                 raise ValueError("No empty position found marked with 'E'.")
+            start_pos = empty_positions[self.np_random.integers(len(empty_positions))]
+        else:
+            raise ValueError(
+                "No start position: provide agent_start_pos or include an 'S' "
+                "marker (random starts require replace_start_with_empty=True)."
+            )
 
-            # Randomly assign a starting position within the 'E' positions
-            self.agent_start_pos = empty_positions[np.random.randint(0, len(empty_positions))]
-
-            # Set direction (could be random or predefined)
-            if self.rand_agent_start_dir:
-                self.agent_start_dir = np.random.randint(0, 4)
-
-            # Set the agent's position and direction
-            self.agent_pos = self.agent_start_pos
-            self.agent_dir = self.agent_start_dir
-            
-        self.start_pos = self.agent_start_pos
-        self.start_dir = self.agent_start_dir
+        start_dir = (
+            int(self.np_random.integers(0, 4))
+            if self.rand_agent_start_dir
+            else self.agent_start_dir
+        )
+        self.agent_pos = start_pos
+        self.agent_dir = start_dir
+        self.start_pos = start_pos
+        self.start_dir = start_dir
 
     def find_empty_position_in_area(self, x1: int, y1: int, x2: int, y2: int) -> Tuple[int, int]:
         """
@@ -253,8 +332,8 @@ class CustomMiniGridEnv(MiniGridEnv):
         max_attempts = 100
         while attempts < max_attempts:
             # Randomly pick a position within the area
-            x = np.random.randint(x1, x2 + 1)
-            y = np.random.randint(y1, y2 + 1)
+            x = self.np_random.integers(x1, x2 + 1)
+            y = self.np_random.integers(y1, y2 + 1)
 
             if self.grid.get(x, y) is None:
                 return (x, y)
@@ -341,8 +420,7 @@ class CustomMiniGridEnv(MiniGridEnv):
                            if self.grid.get(x, y) is None]
         if not empty_positions:
             raise ValueError("No empty position available on the grid.")
-        # Use random.randint to select an index and then retrieve the position
-        index = np.random.randint(0, len(empty_positions))
+        index = self.np_random.integers(len(empty_positions))
         return empty_positions[index]
     
     def get_agent_position(self, obs=None):

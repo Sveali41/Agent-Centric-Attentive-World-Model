@@ -341,6 +341,17 @@ def identity_from_config(cfg: Any, domain: str | None = None) -> dict[str, Any]:
     if domain == "minigrid":
         identity["observation_pair_encoding"] = "absolute_state_pair_v1"
         identity["action_encoding"] = "compact6_v1"
+        stochastic_cfg = getattr(domain_cfg, "stochastic", None)
+        identity["stochastic"] = {
+            "enabled": bool(getattr(stochastic_cfg, "enabled", False))
+            if stochastic_cfg is not None
+            else False,
+            "move_failure_prob": float(
+                getattr(stochastic_cfg, "move_failure_prob", 0.2)
+            )
+            if stochastic_cfg is not None
+            else 0.2,
+        }
         collect_cfg = getattr(getattr(cfg, "env", None), "collect", None)
         identity["collection_replace_start_with_empty"] = bool(
             getattr(collect_cfg, "replace_start_with_empty", False)

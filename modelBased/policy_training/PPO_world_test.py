@@ -28,7 +28,10 @@ from domain.minigrid.action_codec import (
     compact_to_native,
 )
 from domain.minigrid.minigrid_custom_env import CustomMiniGridEnv
-from domain.minigrid.minigrid_support import ColRowCanl_to_CanlRowCol
+from domain.minigrid.minigrid_support import (
+    ColRowCanl_to_CanlRowCol,
+    stochastic_env_kwargs,
+)
 from modelBased.common.artifacts import append_mean_row
 from modelBased.common.utils import normalize_obs
 from modelBased.policy_training.PPO import PPO
@@ -59,7 +62,7 @@ def _select_eval_action(ppo_agent: PPO, state: torch.Tensor, deterministic: bool
     return int(action)
 
 
-def _make_real_env(ppo_cfg, max_ep_len: int):
+def _make_real_env(ppo_cfg, max_ep_len: int, stochastic_kwargs: dict):
     """Construct one independent real MiniGrid evaluation environment."""
     return FullyObsWrapper(
         CustomMiniGridEnv(
@@ -67,6 +70,7 @@ def _make_real_env(ppo_cfg, max_ep_len: int):
             custom_mission="Reach the goal.",
             max_steps=max_ep_len,
             render_mode="rgb_array",
+            **stochastic_kwargs,
         )
     )
 
@@ -93,7 +97,10 @@ def _parallel_validate_policy(
     environment.  The expensive policy forward pass and dense-reward tensor
     work are batched, while each slot keeps its own seed and reward state.
     """
-    envs = [_make_real_env(ppo_cfg, max_ep_len) for _ in range(test_num_envs)]
+    envs = [
+        _make_real_env(ppo_cfg, max_ep_len, stochastic_env_kwargs(cfg))
+        for _ in range(test_num_envs)
+    ]
     results: list[tuple] = []
     total_reward = 0.0
     next_episode = 1
@@ -480,6 +487,7 @@ def validate_policy(cfg: DictConfig) -> float:
             custom_mission="Reach the goal.",
             max_steps=max_ep_len,
             render_mode=render_mode,
+            **stochastic_env_kwargs(cfg),
         )
     )
 

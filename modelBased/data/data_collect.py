@@ -21,6 +21,7 @@ from domain.minigrid.minigrid_support import (
     ColRowCanl_to_CanlRowCol,
     Visualization,
     get_agent_position,
+    stochastic_env_kwargs,
 )
 from domain.minigrid.minigrid_custom_env import *
 from minigrid.wrappers import FullyObsWrapper, ImgObsWrapper
@@ -1942,6 +1943,7 @@ def data_collect(cfg: DictConfig):
                 custom_mission="Find the key and open the door.",
                 max_steps=max_steps,
                 render_mode=mode,
+                **stochastic_env_kwargs(cfg),
             )
         )
         if replace_start_with_empty:

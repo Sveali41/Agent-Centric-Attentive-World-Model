@@ -9,6 +9,7 @@ if str(SCRIPT_ROOT) not in sys.path:
 
 from modelBased.common.utils import PROJECT_ROOT as REPO_ROOT
 from domain.minigrid.minigrid_custom_env import CustomMiniGridEnv
+from domain.minigrid.minigrid_support import stochastic_env_kwargs
 from minigrid.wrappers import FullyObsWrapper
 import torch
 import numpy as np
@@ -660,7 +661,8 @@ def run_ppo_wm(cfg):
     # 3. Real environment
     env = FullyObsWrapper(
         CustomMiniGridEnv(txt_file_path=env_path, custom_mission="Find the key and open the door.",
-                        max_steps=max_ep_len, render_mode=None))
+                        max_steps=max_ep_len, render_mode=None,
+                        **stochastic_env_kwargs(cfg)))
     # 4. Initialize training
     i_episode = 0
     print_freq = console_log_every_steps
@@ -2089,7 +2091,8 @@ def run_training_real_env(cfg):
     print(f"[PPO] Seed: {seed}")
     env = FullyObsWrapper(
         CustomMiniGridEnv(txt_file_path=env_path, custom_mission="Find the key and open the door.",
-                        max_steps=max_ep_len, render_mode=None))
+                        max_steps=max_ep_len, render_mode=None,
+                        **stochastic_env_kwargs(cfg)))
     
     state_dim = np.prod(env.observation_space['image'].shape) + INVENTORY_TOKEN_COUNT
 

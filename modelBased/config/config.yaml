@@ -162,6 +162,9 @@ domains:
 
   minigrid:
     env_type: minigrid
+    stochastic:
+      enabled: false
+      move_failure_prob: 0.2
     # Representative large target layout used for direct policy planning.
     task_name: target_task2
     data_collection:
@@ -343,6 +346,15 @@ attention_model:
   # Balance generic (action, state-changed) buckets. This teaches rare valid
   # interactions without encoding pickup/drop/toggle rules in the collector.
   transition_balanced_sampling: ${domains.${domain}.transition_balanced_sampling}
+  # The domain-level stochastic switch is the only user-facing stochastic
+  # control. Model selection is derived at runtime.
+  stochastic_enabled: ${oc.select:domains.${domain}.stochastic.enabled,false}
+  stochastic_latent:
+    loss_weight: 1.0
+    num_factors: 1
+    num_classes: 2
+    kl_weight: 0.1
+    supervision_weight: 1.0
   # Cover the MiniGrid object/color vocabulary used by supported layouts.
   valid_values_obj: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
   valid_values_color: [0, 1, 2, 3, 4, 5]
