@@ -77,6 +77,7 @@ class CustomMiniGridEnv(MiniGridEnv):
             agent_start_pos: Optional[tuple[int, int]] = None,  # Allow None for random initialization
             agent_start_dir: Optional[int] = None,  # Allow None for random initialization
             replace_start_with_empty: bool = False,
+            initial_carrying_key_color: Optional[str] = None,
             custom_mission: str = "Explore and interact with objects.",
             max_steps: Optional[int] = None,
             **kwargs,
@@ -97,6 +98,8 @@ class CustomMiniGridEnv(MiniGridEnv):
             replace_start_with_empty (bool): Treat layout ``S`` cells as ``E``.
                 Intended for random data collection; policy environments keep
                 the default and therefore still start from ``S``.
+            initial_carrying_key_color (Optional[str]): Restore this one carried
+                key on every reset; ``None`` starts with an empty carrying slot.
             custom_mission (str): Custom mission description.
             max_steps (Optional[int]): Maximum number of steps in an episode.
             **kwargs: Additional keyword arguments for MiniGridEnv.
@@ -104,8 +107,14 @@ class CustomMiniGridEnv(MiniGridEnv):
         self.txt_file_path = txt_file_path
         self.layout_str = layout_str
         self.color_str = color_str
+        # A policy rollout resets this same environment many times.  Keep the
+        # immutable text layout in memory so reset does not repeatedly read and
+        # split the target file; objects are still reconstructed on every
+        # reset, preserving MiniGrid's per-episode object state semantics.
+        self._cached_file_sections = None
         self.s_positions = []  # List to store positions of 'S'
         self.replace_start_with_empty = bool(replace_start_with_empty)
+        self.initial_carrying_key_color = initial_carrying_key_color
 
         # Determine the size of the environment if not provided
         if size is None:
@@ -137,6 +146,17 @@ class CustomMiniGridEnv(MiniGridEnv):
         # Mission or objects within the environment
         self.mission = custom_mission
 
+    def reset(self, *, seed=None, options=None):
+        obs, info = super().reset(seed=seed, options=options)
+        self.carrying = (
+            Key(self.initial_carrying_key_color)
+            if self.initial_carrying_key_color is not None
+            else None
+        )
+        # The symbolic grid does not encode carrying, but regenerating keeps
+        # this reset contract correct for wrappers that extend gen_obs().
+        return self.gen_obs(), info
+
     def determine_layout_size_from_file(self) -> Tuple[int, int]:
         """
         Reads the layout from the file to determine the environment's size based on its width and height.
@@ -144,13 +164,22 @@ class CustomMiniGridEnv(MiniGridEnv):
         Returns:
             Tuple[int, int]: The height and width of the layout.
         """
-        with open(self.txt_file_path, 'r') as file:
-            sections = file.read().split('\n\n')
-            layout_lines = sections[0].strip().split('\n')
-            # Set the environment's width and height based on the layout
-            height = len(layout_lines)
-            width = max(len(line) for line in layout_lines)
-            return height, width
+        layout_str, _ = self._file_layout_sections()
+        layout_lines = layout_str.split('\n')
+        # Set the environment's width and height based on the layout
+        height = len(layout_lines)
+        width = max(len(line) for line in layout_lines)
+        return height, width
+
+    def _file_layout_sections(self) -> Tuple[str, str]:
+        """Load and cache the immutable layout text for this environment."""
+        if self._cached_file_sections is None:
+            with open(self.txt_file_path, 'r') as file:
+                sections = file.read().split('\n\n')
+            if len(sections) != 2:
+                raise ValueError("File must contain exactly two sections separated by one empty line.")
+            self._cached_file_sections = (sections[0].strip(), sections[1].strip())
+        return self._cached_file_sections
 
     def determine_layout_size_from_strings(self) -> Tuple[int, int]:
         """
@@ -170,6 +199,10 @@ class CustomMiniGridEnv(MiniGridEnv):
         Generates the grid for the environment based on the layout specified in the file or strings.
         """
         self.grid = Grid(width, height)
+        # ``_gen_grid`` runs on every reset.  Keep only the spawn markers for
+        # the current grid; accumulating the same ``S`` position on each reset
+        # needlessly grows memory and makes the cached-reset path slower.
+        self.s_positions.clear()
         if self.txt_file_path:
             self.read_layout_from_file()
         else:
@@ -232,42 +265,34 @@ class CustomMiniGridEnv(MiniGridEnv):
         """
         Parses the text file specified by 'txt_file_path' to set the objects in the environment's grid.
         """
-        with open(self.txt_file_path, 'r') as file:
-            sections = file.read().split('\n\n')
-            if len(sections) != 2:
-                raise ValueError("File must contain exactly two sections separated by one empty line.")
+        layout_str, color_str = self._file_layout_sections()
+        # Save both the original string and the split lines.
+        self.layout_str = layout_str
+        self.color_str = color_str
+        layout_lines = self.layout_str.split('\n')
+        color_lines = self.color_str.split('\n')
 
-            layout_lines = sections[0].strip().split('\n')
-            color_lines = sections[1].strip().split('\n')
+        if len(layout_lines) != len(color_lines) or any(
+                len(layout) != len(color) for layout, color in zip(layout_lines, color_lines)):
+            raise ValueError("Object and color matrices must have the same size.")
 
-            # Save both the original string and the split lines
-            self.layout_str = sections[0].strip()       # <-- the real multiline string
-            self.color_str = sections[1].strip()
-
-            layout_lines = self.layout_str.split('\n')  # for internal parsing
-            color_lines = self.color_str.split('\n')
-
-            if len(layout_lines) != len(color_lines) or any(
-                    len(layout) != len(color) for layout, color in zip(layout_lines, color_lines)):
-                raise ValueError("Object and color matrices must have the same size.")
-
-            for y, (layout_line, color_line) in enumerate(zip(layout_lines, color_lines)):
-                for x, (char, color_char) in enumerate(zip(layout_line, color_line)):
-                    if char.upper() == 'S':
-                        if self.replace_start_with_empty:
-                            # Collection-only mode: S behaves exactly like E.
-                            # No object and no fixed spawn marker are created.
-                            continue
-                        # Record 'S' position as agent's start position
-                        self.s_positions.append((x, y))
-                        # S is a spawn marker, not a grid object. Keeping its
-                        # cell empty makes the physical layout identical to
-                        # collection mode, where S is parsed as E.
+        for y, (layout_line, color_line) in enumerate(zip(layout_lines, color_lines)):
+            for x, (char, color_char) in enumerate(zip(layout_line, color_line)):
+                if char.upper() == 'S':
+                    if self.replace_start_with_empty:
+                        # Collection-only mode: S behaves exactly like E.
+                        # No object and no fixed spawn marker are created.
                         continue
-                    color = char_to_color(color_char)
-                    obj = char_to_object(char, color)
-                    if obj:
-                        self.grid.set(x, y, obj)  # Place the object on the grid
+                    # Record 'S' position as agent's start position
+                    self.s_positions.append((x, y))
+                    # S is a spawn marker, not a grid object. Keeping its
+                    # cell empty makes the physical layout identical to
+                    # collection mode, where S is parsed as E.
+                    continue
+                color = char_to_color(color_char)
+                obj = char_to_object(char, color)
+                if obj:
+                    self.grid.set(x, y, obj)  # Place the object on the grid
 
     def read_layout_from_strings(self) -> None:
         """

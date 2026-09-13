@@ -346,6 +346,48 @@ def identity_from_config(cfg: Any, domain: str | None = None) -> dict[str, Any]:
             getattr(collect_cfg, "replace_start_with_empty", False)
         )
         identity["inventory_encoding"] = "key_color_token_v1"
+        interaction_fraction = float(
+            getattr(collect_cfg, "minigrid_interaction_fraction", 0.0)
+        )
+        collection_type = str(getattr(collect_cfg, "data_type", "random")).lower()
+        if collection_type == "rmax":
+            rmax_cfg = getattr(domain_cfg, "rmax_like", None)
+            if rmax_cfg is None:
+                raise ValueError(
+                    "MiniGrid data_type='rmax' requires domains.minigrid.rmax_like"
+                )
+            identity["collection_policy"] = "minigrid_spatial_feedforward_position_v1"
+            identity["rmax_like"] = {
+                "reward_version": "map_local_first_visit_position_v1",
+                "count_scope": "map_local_v1",
+                "policy_input": (
+                    "canonical_spatial_frontier_inventory_adaptive_pool_v2"
+                ),
+                "policy_memory": "visited_and_frontier_per_minienv_v1",
+                "feature_dim": int(getattr(rmax_cfg, "feature_dim", 128)),
+                "object_embedding_dim": int(
+                    getattr(rmax_cfg, "object_embedding_dim", 8)
+                ),
+                "color_embedding_dim": int(
+                    getattr(rmax_cfg, "color_embedding_dim", 4)
+                ),
+                "state_embedding_dim": int(
+                    getattr(rmax_cfg, "state_embedding_dim", 4)
+                ),
+                "conv_channels": int(getattr(rmax_cfg, "conv_channels", 64)),
+                "ppo_minibatch_transitions": int(
+                    getattr(rmax_cfg, "ppo_minibatch_transitions", 512)
+                ),
+            }
+            identity["collection_strategy"] = (
+                "rmax_interaction_mix_v1"
+                if interaction_fraction > 0
+                else "rmax_v1"
+            )
+            identity["interaction_fraction"] = interaction_fraction
+        elif interaction_fraction > 0:
+            identity["collection_strategy"] = "spatial_interaction_mix_v1"
+            identity["interaction_fraction"] = interaction_fraction
     elif domain == "crafter":
         identity["reward_schema"] = "crafter_native_v1"
         identity["inventory_encoding"] = "crafter_inventory_v1"

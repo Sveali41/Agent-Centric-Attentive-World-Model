@@ -375,6 +375,7 @@ def run_ppo_crafter_wm(cfg: DictConfig):
         normalize_advantages=normalize_advantages,
         normalize_returns=normalize_returns,
         max_grad_norm=max_grad_norm,
+        minibatch_size=int(getattr(hparams_ppo, "minibatch_size", 0)),
     )
 
     # ---- 6. WandB ----
@@ -718,6 +719,7 @@ def _run_ppo_crafter_real_parallel(cfg: DictConfig, num_real_envs: int):
             normalize_advantages=bool(getattr(ppo_cfg, "normalize_advantages", True)),
             normalize_returns=bool(getattr(ppo_cfg, "normalize_returns", False)),
             max_grad_norm=float(getattr(ppo_cfg, "max_grad_norm", 0.5)),
+            minibatch_size=int(getattr(ppo_cfg, "minibatch_size", 0)),
         )
         use_wandb = bool(getattr(ppo_cfg, "use_wandb", False))
         sub_run = _init_crafter_wandb(cfg, "crafter_policy_training") if use_wandb else None
@@ -907,6 +909,7 @@ def run_ppo_crafter_real(cfg: DictConfig):
         normalize_advantages=bool(getattr(ppo_cfg, "normalize_advantages", True)),
         normalize_returns=bool(getattr(ppo_cfg, "normalize_returns", False)),
         max_grad_norm=float(getattr(ppo_cfg, "max_grad_norm", 0.5)),
+        minibatch_size=int(getattr(ppo_cfg, "minibatch_size", 0)),
     )
     use_wandb = bool(getattr(ppo_cfg, "use_wandb", False))
     sub_run = _init_crafter_wandb(cfg, "crafter_policy_training") if use_wandb else None

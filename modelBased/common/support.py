@@ -26,7 +26,9 @@ class Support:
         env = CustomCrafterEnv(txt_file_path=file_path, max_steps=max_steps)
         return env
 
-    def interpret_env(self, env, color_array=None, inventory_vec=None):
+    def interpret_env(
+        self, env, color_array=None, state_array=None, inventory_vec=None
+    ):
         if self.cfg.attention_model.env_type == 'crafter':
             from domain.crafter import crafter_support
 
@@ -34,7 +36,9 @@ class Support:
         if self.cfg.attention_model.env_type == 'bipedalwalker':
             active_width = getattr(getattr(self.cfg, "generator_agent", None), "active_width", None)
             return bipedalwalker_support.interpret_env(env, active_width=active_width)
-        return minigrid_support.interpret_env(env, self.cfg, color_array=color_array)
+        return minigrid_support.interpret_env(
+            env, self.cfg, color_array=color_array, state_array=state_array
+        )
 
     def collect_data_trainer(
         self,

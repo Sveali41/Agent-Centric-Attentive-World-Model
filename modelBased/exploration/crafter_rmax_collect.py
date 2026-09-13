@@ -104,6 +104,7 @@ def _make_ppo(cfg: DictConfig, state_dim: int) -> PPO:
         normalize_advantages=bool(rmax_cfg.normalize_advantages),
         normalize_returns=bool(rmax_cfg.normalize_returns),
         max_grad_norm=float(rmax_cfg.max_grad_norm),
+        minibatch_size=int(getattr(rmax_cfg, "minibatch_size", 0)),
     )
 
 

@@ -163,7 +163,7 @@ domains:
   minigrid:
     env_type: minigrid
     # Representative large target layout used for direct policy planning.
-    task_name: target_task0
+    task_name: target_task2
     data_collection:
       max_steps: 5000
       data_type: random
@@ -171,26 +171,26 @@ domains:
       mini_dataset_size: 8000
       maximum_dataset_size: 60000
       uniform_reset_steps: 5000
+      # In uniform mode, reserve this fraction for staged real key/door steps.
+      interaction_fraction: 0.3
     policy:
-      # One PPO rollout spans a complete 4000-step imagined episode in each
-      # of the 16 parallel environments: 65536 / 16 = 4096 temporal steps.
-      max_ep_len: 4000
-      rollout_steps: 65536
-      num_imagined_envs: 16
-      # Preserve sparse goal credit over the long target_task0 horizon.
+      # Match the faster baseline: 128 temporal steps per imagined environment.
+      max_ep_len: 512
+      rollout_steps: 32768
+      num_imagined_envs: 256
       gamma: 0.999
-      # 100 complete PPO rollout updates: 100 * 65536 transitions.
-      max_training_timesteps: 6553600
-      total_test_episodes: 1000
+      # 32768 * 915: approximately 30M transitions in complete rollouts.
+      max_training_timesteps: 32768000
+      total_test_episodes: 100
     grid_shape: [3, 0, 0]
-    attention_mask_size: 3
+    attention_mask_size: 5
     obs_norm_values: [10, 5, 3]
     action_norm_values: 6  # Compact IDs 0..5; native done (6) is excluded.
     minigrid_transition_mode: effect
     # Canonical layout source. Normally only task_name needs to change.
-    layout_path: /home/siyao/phd_file/Research/rlPractice/Curriculum_world_model_learning/trainer/level/minigrid/target_task/target_task14.txt
+    layout_path: /home/siyao/phd_file/Research/rlPractice/Curriculum_world_model_learning/trainer/level/minigrid/target_task/target_task2.txt
     data_save_path: ${oc.env:TRAIN_DATASET_PATH}/minigrid_${domains.minigrid.task_name}_inventory_v1_${env.collect.data_type}.npz
-    world_model_checkpoint: /home/siyao/phd_file/Research/rlPractice/Curriculum_world_model_learning/wm/modelBased/models/AttentionWM/dr_attention_world_model_minigrid_none_effect.ckpt
+    world_model_checkpoint: /home/siyao/phd_file/Research/rlPractice/Curriculum_world_model_learning/wm/modelBased/models/AttentionWM/dr_attention_world_model_minigrid_none_effect_seed10.ckpt
     validation_data_dir: null
     visualize_filename: ${domains.minigrid.task_name}_${env.collect.data_type}_coverage.png
     env_visualize_filename: ${domains.minigrid.task_name}_${env.collect.data_type}_env.png
@@ -266,7 +266,7 @@ rmax_like:
   # Time-limit truncation is not penalized; set to 0.0 for the old behavior.
   death_penalty: 5.0
   # Fixed acquisition seed. The five PPO.seed values share this dataset/WM.
-  seed: 0
+  seed: 1
   rollout_steps: 4096
   start_method: spawn
   checkpoint_path: ${oc.env:MODEL_FPATH}/Policy/explorer_crafter_${domains.crafter.task_name}_rmax_count_local5_inv12_v1_no_continual_seed${rmax_like.seed}.ckpt
@@ -392,6 +392,7 @@ env:
     # training still reads the original layout and uses S as its fixed start.
     replace_start_with_empty: ${oc.select:domains.${domain}.collection_replace_start_with_empty,false}
     uniform_reset_steps: ${domains.${domain}.data_collection.uniform_reset_steps}
+    minigrid_interaction_fraction: ${oc.select:domains.${domain}.data_collection.interaction_fraction,0.0}
     episodes: ${domains.${domain}.data_collection.episodes}
     mini_dataset_size: ${domains.${domain}.data_collection.mini_dataset_size}
     maximum_dataset_size: ${domains.${domain}.data_collection.maximum_dataset_size}
@@ -410,7 +411,7 @@ PPO:
   train_in_real_env: False
   # ``ppo`` preserves imagined-policy training. Planning modes expand futures
   # only in the frozen WM and execute selected actions in the real env.
-  wm_control_mode: astar  # ppo | mpc | mcts | astar
+  wm_control_mode: ppo  # ppo | mpc | mcts | astar
   mpc:
     horizon: 16
     population: 128
@@ -444,7 +445,7 @@ PPO:
     execution_mode: open_loop  # receding | open_loop
     max_depth: 128
     max_expansions: 100000
-    progress_every_expansions: 5000
+    progress_every_expansions: 1000
     max_real_steps: ${domains.minigrid.policy.max_ep_len}
     initial_directions: [0]
     seeds:
@@ -459,9 +460,7 @@ PPO:
     # Optional batch evaluation over trainer/level/minigrid/target_task/*.txt.
     evaluate_all_targets: true
     target_dir: /home/siyao/phd_file/Research/rlPractice/Curriculum_world_model_learning/trainer/level/minigrid/target_task
-    # null derives <checkpoint-prefix>_astar_results automatically, e.g.
-    # dr_*.ckpt -> dr_astar_results. An explicit override still takes priority.
-    output_dir: null
+    output_dir: ${paths.planning}/dr_seed10_astar_all_targets
   # Number of independent real Crafter environments used by PPO sampling.
   # Set to 1 to use the original serial collector.
   num_real_envs: 8
@@ -475,10 +474,10 @@ PPO:
   action_set: a6_drop_inventory  # Six actions + colour-aware inventory observation; preserves older checkpoints.
   # Change this value for independent runs. It controls PPO initialization,
   # stochastic actions, and MiniGrid reset randomness in both real and WM modes.
-  seed: 0
+  seed: 1
   # Separates the single-environment RMax/no-continual policy checkpoint,
   # WandB group/run, and the shared multi-seed validation CSV.
-  experiment_label: target0_ppo_shaped_novelty_milestone_g0999_h4096_rerun
+  experiment_label: null
   env_type: ${domains.${domain}.env_type}
   has_continuous_action_space: False
   # Maximum actions before an unfinished episode resets. Increase this with
@@ -490,7 +489,10 @@ PPO:
   # episodes.
   max_ep_len: ${domains.${domain}.policy.max_ep_len}
   action_std: 0.1  # set same std for action distribution which was used while saving
-  K_epochs: 8  # update policy for K epochs
+  K_epochs: 4  # update policy for K epochs
+  # 32768 / 16384 = 2 shuffled minibatches per epoch (8 optimizer steps/update).
+  # Set to 0 to retain the historical full-rollout PPO update.
+  minibatch_size: 8192
   eps_clip: 0.2  # clip parameter for PPO
   gamma: ${oc.select:domains.${domain}.policy.gamma,0.99}  # discount factor
   # Standard PPO rollout/update settings. A rollout spans multiple episodes;
@@ -504,7 +506,7 @@ PPO:
   num_imagined_envs: ${oc.select:domains.${domain}.policy.num_imagined_envs,64}
   # Zero is the usual choice when deterministic argmax performance matters;
   # positive entropy explicitly rewards keeping the policy stochastic.
-  entropy_coef: 0.005
+  entropy_coef: 0.01
   normalize_advantages: True
   normalize_returns: False
   max_grad_norm: 0.5
@@ -528,18 +530,51 @@ PPO:
   planner_bc_min_accuracy: 0.99
   planner_bc_min_target_probability: 0.99
   planner_bc_validation_horizon: 1000
-  step_penalty: 0.0  # Step penalty set to 0.0 (original reward already incorporates step decay)
+  step_penalty: -0.001
+  # Optional port of curriculum_world_model_learning-main's current MiniGrid
+  # reward. False preserves this workspace's existing PPO baseline exactly.
+  use_main_dense_reward: True
+  main_dense_reward:
+    step_penalty: -0.001
+    # Standard local BFS progress everywhere outside the goal room.
+    progress_weight: 0.20
+    progress_clip: 1.0
+    # Disabled: use the previous local-BFS reward without gated best-distance
+    # bonuses.
+    best_progress_weight: 0.0
+    best_progress_clip: 1.0
+    best_progress_start_fraction: 0.25
+    # Disabled for the old-reward-plus-critical-door ablation.
+    progress_milestone_fraction: 0.50
+    progress_milestone_reward: 0.0
+    # Keep the expensive per-step A* action-distance reward disabled; the
+    # inexpensive goal-directed interaction rewards below bridge local stalls.
+    goal_region_action_progress_enabled: false
+    goal_region_action_progress_weight: 0.20
+    action_distance_max_expansions: 5000
+    goal_region_reward: 1.0
+    goal_region_reward_once: true
+    # One-time, goal-directed interactions in the goal room only: pickup a
+    # forward-BFS key or open a forward-BFS closed/locked door.
+    goal_region_key_pickup_reward: 0.2
+    goal_region_door_open_reward: 0.2
+    # Keep critical-door crossing diagnostics, but do not add a separate
+    # shaping reward in the baseline reward ablation.
+    critical_door_crossing_reward: 0.0
+    critical_door_crossing_once: true
+    success_reward: 50.0
+    lava_reward: -1.0
   # Training-only shaping computed exclusively from imagined WM states.
   # Native goal reward and success are logged separately from these bonuses.
-  reward_shaping_enabled: true
+  reward_shaping_enabled: false
   # Disable the global-count and Manhattan experiment. The target map requires
   # detours around walls, so direct Manhattan progress is often misleading.
   global_position_count_beta: 0.0
   manhattan_progress_reward_scale: 0.0
   # Previous episodic novelty and interaction milestone shaping.
-  position_novelty_reward: 0.002
-  key_pickup_reward: 0.1
-  door_open_reward: 0.1
+  position_novelty_reward: 0.0
+  key_pickup_reward: 0.0
+  door_open_reward: 0.0
   lr_actor: 0.0003  # learning rate for actor
   lr_critic: 0.001  # learning rate for critic
   # Leave null to select the matching source-specific path automatically.
@@ -550,32 +585,46 @@ PPO:
   checkpoint_path_planning: ${oc.env:MODEL_FPATH}/Policy/policy_${domain}_${domains.${domain}.task_name}_seed${PPO.seed}.ckpt
   # Leave null to select the standard or continual WM path automatically.
   # run_pipeline.py passes the resolved path explicitly to policy training.
-  checkpoint_path_wm: null
+  checkpoint_path_wm: /home/siyao/phd_file/Research/rlPractice/Curriculum_world_model_learning/wm/modelBased/models/AttentionWM/mac_attention_world_model_minigrid_none_effect_seed0.ckpt
   compute_regret: False
   regret_eval_freq: 5000
   regret_eval_episodes: 5
   episodes_eval: 10
-  wandb_project: ${domain}_policy_training
+  wandb_project: minigrid-ppo-dr
   wandb_entity: null  # null uses the default entity from your `wandb login`
   # Runtime grouping is automatic and layout-specific. Planning preserves
   # <domain>_<task_name>_policy; real training uses
   # <domain>_<task_name>_realenv_policy. Each group contains its seed runs.
-  rolling_window_episodes: 50  # WandB rolling metrics use the latest N episodes
+  rolling_window_episodes: 500  # Match main's completed-episode metric window.
   # Print movement, goal-distance, blocked-action and sparse-reward evidence
   # after each PPO update. These diagnostics do not change reward or training.
   policy_diagnostics: true
-  diagnostics_every_updates: 1
+  diagnostics_every_updates: 10
+  # Aggregate episode metrics and PPO diagnostics before writing them.  This
+  # changes only console/W&B resolution, never rollout sampling or updates.
+  console_log_every_steps: 32768
+  episode_log_every_steps: 32768
+  wandb_log_every_updates: 10
   max_training_timesteps: ${domains.${domain}.policy.max_training_timesteps}
   action_std_decay_freq: 2.5e5
   action_std_decay_rate: 0.05
   min_action_std: 0.1
-  save_model_freq: 1e4
+  # The final checkpoint is always saved separately.
+  save_model_freq: 1e6
   ########################################
   # test
   total_test_episodes: ${domains.${domain}.policy.total_test_episodes}
+  # Batch policy inference across independent real environments. Set to 1 for
+  # the serial evaluator; GIF/render require one environment.
+  test_num_envs: 128
+  # Print live throughput/progress during batched evaluation.
+  test_progress_every_steps: 100
   render: False
   # False samples from the learned categorical policy. True uses actor argmax.
   test_deterministic: False
+  # Reproducible, episode-independent stochastic evaluation starts.
+  eval_seed: 0
+  test_reward_mode: wm
   render_delay: 0.05
   gif_fps: 10
   gif_max_frames: 300

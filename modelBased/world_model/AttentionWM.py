@@ -579,77 +579,6 @@ class AttentionWorldModel(pl.LightningModule):
         finally:
             self.model.train(was_training)
 
-    @torch.no_grad()
-    def encode_state_action_features(self, local_states, actions, inventory=None):
-        """Encode agent-centric MiniGrid state/action contexts for novelty.
-
-        The representation reuses the trained categorical convolution and
-        action/inventory embeddings, but stops before the prediction heads and
-        transformer.  ``local_states`` must already be an agent-centered
-        ``[B, 3, H, W]`` patch, so absolute map coordinates cannot enter the
-        novelty archive and no checkpoint parameters are added.
-        """
-        if self.env_type != "minigrid" or self.data_type != "discrete":
-            raise ValueError(
-                "encode_state_action_features is only available for discrete MiniGrid"
-            )
-        state = torch.as_tensor(local_states, device=next(self.parameters()).device)
-        if state.ndim == 3:
-            state = state.unsqueeze(0)
-        if state.ndim != 4 or state.size(1) != 3:
-            raise ValueError(
-                "MiniGrid local state features expect [B,3,H,W], got "
-                f"{tuple(state.shape)}"
-            )
-        actions = torch.as_tensor(actions, device=state.device).long().reshape(-1)
-        if actions.numel() != state.size(0):
-            raise ValueError("State/action batch sizes must match")
-
-        model = self.model
-        was_training = model.training
-        model.eval()
-        try:
-            obj = state[:, 0].long().clamp(0, 10)
-            color = state[:, 1].long().clamp(0, 5)
-            direction = state[:, 2].long().clamp(0, 3)
-            state_emb = torch.cat(
-                [
-                    F.one_hot(obj, num_classes=11),
-                    F.one_hot(color, num_classes=6),
-                    F.one_hot(direction, num_classes=4),
-                ],
-                dim=-1,
-            ).float().permute(0, 3, 1, 2)
-            x = model.relu(model.bn1(model.conv1(state_emb)))
-            x = model.relu(model.bn2(model.conv2(x)))
-            tokens = model.flatten(x).transpose(1, 2)
-            tokens = tokens + model.pos_embedding
-            state_feature = torch.cat(
-                [tokens.mean(dim=1), tokens.amax(dim=1)], dim=1
-            )
-            state_feature = F.normalize(state_feature, p=2, dim=1)
-
-            action_feature = F.normalize(model.action_embedding(actions), p=2, dim=1)
-            if inventory is None:
-                inventory_feature = torch.zeros_like(action_feature)
-            else:
-                inventory = torch.as_tensor(inventory, device=state.device).long().reshape(-1)
-                if inventory.numel() != state.size(0):
-                    raise ValueError("State/inventory batch sizes must match")
-                inventory = inventory.clamp(0, 6)
-                inventory_feature = F.normalize(
-                    model.key_embedding(inventory), p=2, dim=1
-                )
-            return F.normalize(
-                torch.cat([state_feature, action_feature, inventory_feature], dim=1),
-                p=2,
-                dim=1,
-            )
-        finally:
-            model.train(was_training)
-
-
-
     def encode(self, state, inv=None):
         """
         Extract latent feature representations from observations.
@@ -1356,6 +1285,80 @@ class AttentionWorldModel(pl.LightningModule):
             inv_next=inv_next,
         )
         return {"loss_obs": loss_obs}
+
+    @torch.no_grad()
+    def calc_minigrid_probe_metrics(self, trajectory_data, include_spatial=False):
+        """Evaluate held-out MiniGrid loss and optional global spatial error maps."""
+        if self.env_type != "minigrid" or not trajectory_data:
+            result = {"changed_focal_loss": 0.0}
+            if include_spatial:
+                result.update({
+                    "error_map": np.zeros((self.row, self.col), dtype=np.float32),
+                    "coverage_map": np.zeros((self.row, self.col), dtype=np.float32),
+                })
+            return result
+
+        was_training = self.training
+        self.eval()
+        try:
+            batch = {
+                "obs": trajectory_data["obs"].to(self.device),
+                "act": trajectory_data["act"].to(self.device),
+                "obs_next": trajectory_data["obs_next"].to(self.device),
+                "info": trajectory_data.get("info"),
+            }
+            for name in ("inv", "inv_next"):
+                value = trajectory_data.get(name)
+                if value is not None:
+                    batch[name] = value.to(self.device) if torch.is_tensor(value) else value
+
+            obs, act, obs_next, info, _, agent_positions, inv, inv_next = self.preprocess_batch(batch)
+            obs_pred, _, aux_pred = self(obs, act, info, inv=inv)
+            changed_focal, _, changed_count = self._minigrid_effect_diagnostics(
+                obs_pred, obs_next, obs, inv, inv_next, aux_pred
+            )
+            result = {
+                "changed_focal_loss": (
+                    float(changed_focal.item())
+                    if float(changed_count.item()) > 0.0
+                    else 0.0
+                )
+            }
+            if include_spatial:
+                local_loss_maps = self.compute_cell_loss(
+                    obs_pred, obs_next, current=obs
+                ).detach().cpu()
+                loss_accumulator = [
+                    [[] for _ in range(self.col)] for _ in range(self.row)
+                ]
+                half = self.mask_size // 2
+                for sample_index, agent_position in enumerate(agent_positions):
+                    agent_y, agent_x = map(int, agent_position)
+                    for local_y in range(self.mask_size):
+                        for local_x in range(self.mask_size):
+                            global_y = agent_y + local_y - half
+                            global_x = agent_x + local_x - half
+                            if 0 <= global_y < self.row and 0 <= global_x < self.col:
+                                loss_accumulator[global_y][global_x].append(
+                                    float(local_loss_maps[sample_index, local_y, local_x])
+                                )
+                error_map, coverage_map = self.average_loss_and_coverage_maps(
+                    loss_accumulator
+                )
+                result.update({
+                    "error_map": error_map,
+                    "coverage_map": coverage_map,
+                })
+            return result
+        finally:
+            self.train(was_training)
+
+    @torch.no_grad()
+    def calc_minigrid_changed_focal_loss(self, trajectory_data):
+        """Evaluate changed-effect focal loss for one collected trajectory."""
+        return float(
+            self.calc_minigrid_probe_metrics(trajectory_data)["changed_focal_loss"]
+        )
 
     def on_train_end(self):
         """Save a final visualization at the end of training."""

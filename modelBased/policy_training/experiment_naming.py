@@ -34,9 +34,17 @@ def policy_training_source(cfg) -> str:
 def policy_experiment_label(cfg) -> str:
     """Return a filesystem/WandB-safe optional policy experiment label."""
     configured = getattr(cfg.PPO, "experiment_label", None)
-    if configured is None or str(configured).strip().lower() in {"", "null", "none"}:
+    label = (
+        ""
+        if configured is None
+        or str(configured).strip().lower() in {"", "null", "none"}
+        else str(configured).strip()
+    )
+    if bool(getattr(cfg.PPO, "use_main_dense_reward", False)):
+        label = f"{label}_main_dense" if label else "main_dense"
+    if not label:
         return ""
-    label = re.sub(r"[^A-Za-z0-9._-]+", "_", str(configured).strip())
+    label = re.sub(r"[^A-Za-z0-9._-]+", "_", label)
     label = label.strip("._-")
     if not label:
         raise ValueError("PPO.experiment_label must contain a letter or number")

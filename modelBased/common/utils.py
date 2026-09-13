@@ -113,6 +113,34 @@ def get_agent_position_torch(state):
     raise ValueError("Expected a (C,H,W) or (B,C,H,W) tensor.")
 
 
+# These small index tensors are reused on every imagined step.  The cache is
+# intentionally keyed by device/dtype/shape so callers with different maps or
+# CPU/GPU placement cannot alias one another.
+_MINIGRID_MASK_OFFSET_CACHE = {}
+_MINIGRID_MASK_BATCH_CACHE = {}
+
+
+def _cached_minigrid_mask_offsets(mask_size, device, dtype):
+    key = (int(mask_size), str(device), dtype)
+    offsets = _MINIGRID_MASK_OFFSET_CACHE.get(key)
+    if offsets is None:
+        half = int(mask_size) // 2
+        offsets = torch.arange(
+            -half, int(mask_size) - half, device=device, dtype=dtype
+        )
+        _MINIGRID_MASK_OFFSET_CACHE[key] = offsets
+    return offsets
+
+
+def _cached_minigrid_batch_indices(batch_size, device):
+    key = (int(batch_size), str(device))
+    batch_indices = _MINIGRID_MASK_BATCH_CACHE.get(key)
+    if batch_indices is None:
+        batch_indices = torch.arange(int(batch_size), device=device)
+        _MINIGRID_MASK_BATCH_CACHE[key] = batch_indices
+    return batch_indices
+
+
 def extract_masked_state_torch(state, mask_size, agent_position_yx=None, pad_value=None):
     """GPU-native MiniGrid local-state extraction for PPO imagined rollouts."""
     single = state.ndim == 3
@@ -125,16 +153,15 @@ def extract_masked_state_torch(state, mask_size, agent_position_yx=None, pad_val
         else agent_position_yx.reshape(-1, 2)
     )
     bsz, channels, rows, cols = batch.shape
-    half = mask_size // 2
-    offsets = torch.arange(
-        -half, mask_size - half, device=batch.device, dtype=positions.dtype
+    offsets = _cached_minigrid_mask_offsets(
+        mask_size, batch.device, positions.dtype
     )
     ys = positions[:, 0, None, None] + offsets[None, :, None]
     xs = positions[:, 1, None, None] + offsets[None, None, :]
     ys = ys.expand(-1, mask_size, mask_size)
     xs = xs.expand(-1, mask_size, mask_size)
     valid = (ys >= 0) & (ys < rows) & (xs >= 0) & (xs < cols)
-    batch_ids = torch.arange(bsz, device=batch.device)[:, None, None]
+    batch_ids = _cached_minigrid_batch_indices(bsz, batch.device)[:, None, None]
     gathered = batch[
         batch_ids,
         :,
@@ -160,26 +187,38 @@ def put_back_masked_state_torch(state_masked, original_state, mask_size, agent_p
     masked = state_masked.unsqueeze(0) if state_masked.ndim == 3 else state_masked
     original = original_state.unsqueeze(0) if single else original_state
     positions = agent_position_yx.reshape(-1, 2).to(original.device)
-    output = original.clone()
+    # The flattened scatter below must address the returned tensor directly;
+    # make the clone contiguous so non-contiguous caller views cannot cause
+    # ``reshape`` to allocate a detached temporary.
+    output = original.clone().contiguous()
     bsz, channels, rows, cols = output.shape
-    half = mask_size // 2
-    offsets = torch.arange(
-        -half, mask_size - half, device=output.device, dtype=positions.dtype
+    offsets = _cached_minigrid_mask_offsets(
+        mask_size, output.device, positions.dtype
     )
     ys = positions[:, 0, None, None] + offsets[None, :, None]
     xs = positions[:, 1, None, None] + offsets[None, None, :]
     ys = ys.expand(-1, mask_size, mask_size)
     xs = xs.expand(-1, mask_size, mask_size)
     valid = (ys >= 0) & (ys < rows) & (xs >= 0) & (xs < cols)
-    batch_ids = torch.arange(bsz, device=output.device)[:, None, None]
-    expanded_batch_ids = batch_ids.expand_as(ys)
-    for channel in range(channels):
-        output[
-            expanded_batch_ids[valid],
-            channel,
-            ys[valid],
-            xs[valid],
-        ] = masked[:, channel][valid].to(output.dtype)
+    batch_ids = _cached_minigrid_batch_indices(bsz, output.device).view(
+        bsz, 1, 1, 1
+    )
+    channel_ids = torch.arange(channels, device=output.device).view(
+        1, channels, 1, 1
+    )
+    expanded_batch_ids = batch_ids.expand(bsz, channels, mask_size, mask_size)
+    expanded_channel_ids = channel_ids.expand_as(expanded_batch_ids)
+    expanded_ys = ys[:, None, :, :].expand_as(expanded_batch_ids)
+    expanded_xs = xs[:, None, :, :].expand_as(expanded_batch_ids)
+    expanded_valid = valid[:, None, :, :].expand_as(expanded_batch_ids)
+    linear_indices = (
+        ((expanded_batch_ids * channels + expanded_channel_ids) * rows
+         + expanded_ys) * cols
+        + expanded_xs
+    )
+    output.reshape(-1)[linear_indices[expanded_valid]] = masked[
+        expanded_valid
+    ].to(output.dtype)
     return output[0] if single else output
 
 def put_back_masked_state(state_masked, orginal_state, mask_size, agent_position_yx):

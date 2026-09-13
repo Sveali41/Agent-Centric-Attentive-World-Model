@@ -28,6 +28,15 @@ class RolloutBuffer:
         self.rewards = []
         self.state_values = []
         self.is_terminals = []
+        self.valid_masks = []
+        self._transition_count = 0
+        # Batched imagined rollouts live on CUDA.  Keeping this accumulator on
+        # the same device avoids a host synchronization for every environment
+        # step.  ``_transition_count`` is the most recently synchronized exact
+        # value, while ``_possible_transition_count`` is a cheap upper bound.
+        self._valid_transition_count_tensor = None
+        self._possible_transition_count = 0
+        self._synced_possible_transition_count = 0
 
     def clear(self):
         del self.actions[:]
@@ -36,13 +45,45 @@ class RolloutBuffer:
         del self.rewards[:]
         del self.state_values[:]
         del self.is_terminals[:]
+        del self.valid_masks[:]
+        self._transition_count = 0
+        self._valid_transition_count_tensor = None
+        self._possible_transition_count = 0
+        self._synced_possible_transition_count = 0
 
     def transition_count(self):
         """Return transitions, not merely the number of temporal batches."""
-        total = 0
-        for reward in self.rewards:
-            total += int(reward.numel()) if torch.is_tensor(reward) else 1
-        return total
+        self._synchronize_transition_count()
+        return self._transition_count
+
+    def _synchronize_transition_count(self):
+        """Synchronize the exact batched valid-transition count only on demand."""
+        if self._valid_transition_count_tensor is not None:
+            self._transition_count = int(
+                self._valid_transition_count_tensor.detach().cpu().item()
+            )
+            self._synced_possible_transition_count = self._possible_transition_count
+
+    def has_at_least_transitions(self, threshold):
+        """Precisely test a rollout threshold with no unnecessary CUDA sync.
+
+        Before the Python upper bound reaches ``threshold`` the answer is
+        known to be false.  Once it might be true, synchronize exactly once;
+        after an unsuccessful check, the cached exact count plus the number of
+        newly appended slots provides another safe no-sync fast path.
+        """
+        threshold = int(threshold)
+        if threshold <= 0:
+            return True
+        if self._possible_transition_count < threshold:
+            return False
+        unsynced_possible = (
+            self._possible_transition_count - self._synced_possible_transition_count
+        )
+        if self._transition_count + unsynced_possible < threshold:
+            return False
+        self._synchronize_transition_count()
+        return self._transition_count >= threshold
 
 
 class ActorCritic(nn.Module):
@@ -184,6 +225,7 @@ class PPO:
         normalize_returns=True,
         max_grad_norm=0.0,
         freeze_actor_until_first_reward=False,
+        minibatch_size=None,
     ):
 
         self.has_continuous_action_space = has_continuous_action_space
@@ -198,6 +240,10 @@ class PPO:
         self.normalize_advantages = bool(normalize_advantages)
         self.normalize_returns = bool(normalize_returns)
         self.max_grad_norm = float(max_grad_norm)
+        # None or 0 preserves the historical full-rollout PPO update.
+        self.minibatch_size = (
+            0 if minibatch_size is None else max(0, int(minibatch_size))
+        )
         self.freeze_actor_until_first_reward = bool(
             freeze_actor_until_first_reward
         )
@@ -314,6 +360,18 @@ class PPO:
         self.buffer.state_values.append(_buffer_tensor(state_value, ensure_1d=True))
         self.buffer.rewards.append(reward)
         self.buffer.is_terminals.append(is_terminal)
+        self.buffer.valid_masks.append(True)
+        self.buffer._possible_transition_count += 1
+        if self.buffer._valid_transition_count_tensor is None:
+            self.buffer._transition_count += 1
+            self.buffer._synced_possible_transition_count += 1
+        else:
+            # A mixed batch/single rollout keeps the GPU accumulator as the
+            # source of truth; leave the cached Python count untouched until
+            # the next exact synchronization.
+            self.buffer._valid_transition_count_tensor = (
+                self.buffer._valid_transition_count_tensor + 1
+            )
 
     def save_buffer_batch(
         self,
@@ -323,6 +381,7 @@ class PPO:
         state_values,
         rewards,
         is_terminals,
+        valid_mask=None,
     ):
         """Save one temporal slice from B parallel trajectories.
 
@@ -338,6 +397,9 @@ class PPO:
             "rewards": rewards,
             "is_terminals": is_terminals,
         }
+        if valid_mask is None:
+            valid_mask = torch.ones(batch_size, dtype=torch.bool, device=states.device)
+        tensors["valid_mask"] = valid_mask
         for name, value in tensors.items():
             value = torch.as_tensor(value)
             if value.reshape(-1).numel() != batch_size:
@@ -348,10 +410,14 @@ class PPO:
 
         buffer_device = states.device
         self.buffer.states.append(states.detach())
-        self.buffer.actions.append(actions.detach().reshape(batch_size))
-        self.buffer.logprobs.append(logprobs.detach().reshape(batch_size))
+        self.buffer.actions.append(
+            actions.detach().to(buffer_device).reshape(batch_size)
+        )
+        self.buffer.logprobs.append(
+            logprobs.detach().to(buffer_device).reshape(batch_size)
+        )
         self.buffer.state_values.append(
-            state_values.detach().reshape(batch_size)
+            state_values.detach().to(buffer_device).reshape(batch_size)
         )
         self.buffer.rewards.append(
             torch.as_tensor(
@@ -363,6 +429,25 @@ class PPO:
                 is_terminals, dtype=torch.bool, device=buffer_device
             ).reshape(batch_size)
         )
+        self.buffer.valid_masks.append(
+            torch.as_tensor(
+                valid_mask, dtype=torch.bool, device=buffer_device
+            ).reshape(batch_size)
+        )
+        self.buffer._possible_transition_count += batch_size
+        valid_count = self.buffer.valid_masks[-1].sum()
+        if self.buffer._valid_transition_count_tensor is None:
+            self.buffer._valid_transition_count_tensor = (
+                valid_count + torch.as_tensor(
+                    self.buffer._transition_count,
+                    device=valid_count.device,
+                    dtype=valid_count.dtype,
+                )
+            )
+        else:
+            self.buffer._valid_transition_count_tensor = (
+                self.buffer._valid_transition_count_tensor + valid_count
+            )
         
 
     def estimate_old_value(self, state):
@@ -494,7 +579,7 @@ class PPO:
         )
         return metrics
 
-    def update(self, bootstrap_value=0.0):
+    def update(self, bootstrap_value=0.0, collect_metrics=True):
         """
         Update PPO from the current rollout buffer.
 
@@ -516,8 +601,11 @@ class PPO:
 
         if parallel_rollout:
             rewards_tb = torch.stack(self.buffer.rewards, dim=0).float()
+            valid_tb = torch.stack(self.buffer.valid_masks, dim=0).to(
+                rewards_tb.device
+            ).bool()
             reward_signal_in_rollout = bool(
-                rewards_tb.detach().abs().gt(1e-12).any().item()
+                rewards_tb[valid_tb].detach().abs().gt(1e-12).any().item()
             )
         else:
             reward_signal_in_rollout = any(
@@ -544,7 +632,12 @@ class PPO:
         # rollout boundary. For vectorized environments, every column is an
         # independent trajectory and terminal markers reset only that column.
         if parallel_rollout:
-            terminals_tb = torch.stack(self.buffer.is_terminals, dim=0).bool()
+            terminals_tb = torch.stack(self.buffer.is_terminals, dim=0).to(
+                rewards_tb.device
+            ).bool()
+            state_values_tb = torch.stack(
+                self.buffer.state_values, dim=0
+            ).to(rewards_tb.device).float()
             batch_size = rewards_tb.shape[1]
             discounted_reward = torch.as_tensor(
                 bootstrap_value,
@@ -561,17 +654,37 @@ class PPO:
             if zero_unrewarded_bootstrap:
                 discounted_reward.zero_()
             returns = []
-            for reward_t, terminal_t in zip(
-                reversed(rewards_tb), reversed(terminals_tb)
+            for reward_t, terminal_t, valid_t, state_value_t in zip(
+                reversed(rewards_tb),
+                reversed(terminals_tb),
+                reversed(valid_tb),
+                reversed(state_values_tb),
             ):
+                invalid_bootstrap = (
+                    torch.zeros_like(state_value_t)
+                    if zero_unrewarded_bootstrap
+                    else state_value_t.detach()
+                )
                 discounted_reward = torch.where(
-                    terminal_t,
+                    valid_t,
+                    discounted_reward,
+                    invalid_bootstrap,
+                )
+                discounted_reward = torch.where(
+                    terminal_t & valid_t,
                     torch.zeros_like(discounted_reward),
                     discounted_reward,
                 )
-                discounted_reward = reward_t + self.gamma * discounted_reward
+                valid_return = reward_t + self.gamma * discounted_reward
+                discounted_reward = torch.where(
+                    valid_t,
+                    valid_return,
+                    discounted_reward,
+                )
                 returns.append(discounted_reward)
-            rewards = torch.stack(list(reversed(returns)), dim=0).reshape(-1).to(device)
+            valid_flat = valid_tb.reshape(-1)
+            rewards = torch.stack(list(reversed(returns)), dim=0).reshape(-1)
+            rewards = rewards[valid_flat].to(device)
         else:
             rewards = []
             discounted_reward = (
@@ -597,13 +710,13 @@ class PPO:
         # convert list to tensor
         if parallel_rollout:
             old_states = torch.stack(self.buffer.states, dim=0).reshape(
-                rollout_size, -1
-            ).detach().to(device)
-            old_actions = torch.stack(self.buffer.actions, dim=0).reshape(-1).detach().to(device)
-            old_logprobs = torch.stack(self.buffer.logprobs, dim=0).reshape(-1).detach().to(device)
+                -1, self.buffer.states[0].shape[-1]
+            )[valid_flat].detach().to(device)
+            old_actions = torch.stack(self.buffer.actions, dim=0).reshape(-1)[valid_flat].detach().to(device)
+            old_logprobs = torch.stack(self.buffer.logprobs, dim=0).reshape(-1)[valid_flat].detach().to(device)
             old_state_values = torch.stack(
                 self.buffer.state_values, dim=0
-            ).reshape(-1).detach().to(device)
+            ).reshape(-1)[valid_flat].detach().to(device)
         else:
             old_states = torch.squeeze(torch.stack(self.buffer.states, dim=0)).detach().to(device)
             old_actions = torch.squeeze(torch.stack(self.buffer.actions, dim=0)).detach().to(device)
@@ -617,90 +730,139 @@ class PPO:
                 advantages - advantages.mean()
             ) / (advantages.std() + 1e-7)
 
-        # Track the parameters across the complete K-epoch update.  A positive
-        # delta is a direct confirmation that the policy weights changed.
-        parameters_before = {
-            name: parameter.detach().clone()
-            for name, parameter in self.policy.named_parameters()
-        }
-        last_loss = None
-        last_grad_norm = 0.0
-        last_actor_loss = 0.0
-        last_critic_loss = 0.0
-        last_entropy = 0.0
+        collect_metrics = bool(collect_metrics)
+        # Parameter copies and scalar host transfers are diagnostic-only.  Do
+        # not perform them on updates whose metrics will not be consumed.
+        parameters_before = (
+            {
+                name: parameter.detach().clone()
+                for name, parameter in self.policy.named_parameters()
+            }
+            if collect_metrics
+            else None
+        )
+        last_loss = last_grad_norm = last_actor_loss = None
+        last_critic_loss = last_entropy = None
+        num_samples = int(old_states.shape[0])
+        minibatch_size = self.minibatch_size or num_samples
+        minibatch_size = min(minibatch_size, num_samples)
 
         # Optimize policy for K epochs
         for _ in range(self.K_epochs):
-            # Evaluating old actions and values
-            logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
+            # Preserve the historical full-batch execution order when the
+            # feature is disabled. Minibatch PPO shuffles independently at
+            # every epoch as required by the standard update.
+            permutation = (
+                torch.randperm(num_samples, device=device)
+                if self.minibatch_size
+                else torch.arange(num_samples, device=device)
+            )
+            if collect_metrics:
+                metric_weight = torch.zeros((), device=device)
+                metric_loss = torch.zeros((), device=device)
+                metric_actor_loss = torch.zeros((), device=device)
+                metric_critic_loss = torch.zeros((), device=device)
+                metric_entropy = torch.zeros((), device=device)
+                metric_grad_norm = torch.zeros((), device=device)
+            for start in range(0, num_samples, minibatch_size):
+                indices = permutation[start : start + minibatch_size]
+                batch_states = old_states[indices]
+                batch_actions = old_actions[indices]
+                batch_logprobs = old_logprobs[indices]
+                batch_rewards = rewards[indices]
+                batch_advantages = advantages[indices]
 
-            # match state_values tensor dimensions with rewards tensor
-            state_values = torch.squeeze(state_values)
-
-            # Finding the ratio (pi_theta / pi_theta__old)
-            ratios = torch.exp(logprobs - old_logprobs.detach())
-
-            critic_loss = 0.5 * self.MseLoss(state_values, rewards)
-            if actor_update_enabled:
-                # Finding Surrogate Loss
-                surr1 = ratios * advantages
-                surr2 = torch.clamp(
-                    ratios, 1 - self.eps_clip, 1 + self.eps_clip
-                ) * advantages
-                actor_loss = -torch.min(surr1, surr2).mean()
-                entropy = dist_entropy.mean()
-                loss_mean = (
-                    actor_loss
-                    + critic_loss
-                    - self.entropy_coef * entropy
+                # Evaluating old actions and values for this shuffled minibatch.
+                logprobs, state_values, dist_entropy = self.policy.evaluate(
+                    batch_states, batch_actions
                 )
-            else:
-                # Actor and critic are disjoint modules.  Omitting both the
-                # surrogate and entropy terms leaves actor gradients as None,
-                # so Adam cannot move the policy while reward is ungrounded.
-                actor_loss = torch.zeros((), device=state_values.device)
-                entropy = torch.zeros((), device=state_values.device)
-                loss_mean = critic_loss
+                state_values = torch.squeeze(state_values)
+                ratios = torch.exp(logprobs - batch_logprobs.detach())
 
-            # take gradient step
-            self.optimizer.zero_grad()
-            loss_mean.backward()
-            last_loss = float(loss_mean.detach().cpu().item())
-            last_actor_loss = float(actor_loss.detach().cpu().item())
-            last_critic_loss = float(critic_loss.detach().cpu().item())
-            last_entropy = float(entropy.detach().cpu().item())
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.policy.parameters(), self.max_grad_norm
-            ) if self.max_grad_norm > 0.0 else None
-            if self.max_grad_norm > 0.0:
-                last_grad_norm = float(grad_norm.detach().cpu().item())
-            else:
-                grad_squared_norm = 0.0
-                for parameter in self.policy.parameters():
-                    if parameter.grad is not None:
-                        grad_squared_norm += float(parameter.grad.detach().norm(2).item() ** 2)
-                last_grad_norm = grad_squared_norm ** 0.5
-            self.optimizer.step()
+                critic_loss = 0.5 * self.MseLoss(state_values, batch_rewards)
+                if actor_update_enabled:
+                    surr1 = ratios * batch_advantages
+                    surr2 = torch.clamp(
+                        ratios, 1 - self.eps_clip, 1 + self.eps_clip
+                    ) * batch_advantages
+                    actor_loss = -torch.min(surr1, surr2).mean()
+                    entropy = dist_entropy.mean()
+                    loss_mean = (
+                        actor_loss + critic_loss - self.entropy_coef * entropy
+                    )
+                else:
+                    # Actor and critic are disjoint modules. Omitting both the
+                    # surrogate and entropy terms prevents an ungrounded actor
+                    # update before a genuine reward has been observed.
+                    actor_loss = torch.zeros((), device=state_values.device)
+                    entropy = torch.zeros((), device=state_values.device)
+                    loss_mean = critic_loss
+
+                self.optimizer.zero_grad()
+                loss_mean.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.policy.parameters(), self.max_grad_norm
+                ) if self.max_grad_norm > 0.0 else None
+                if collect_metrics:
+                    if self.max_grad_norm > 0.0:
+                        grad_norm_value = grad_norm.detach()
+                    else:
+                        grad_squared_norm = torch.zeros((), device=device)
+                        for parameter in self.policy.parameters():
+                            if parameter.grad is not None:
+                                grad_squared_norm = grad_squared_norm + parameter.grad.detach().square().sum()
+                        grad_norm_value = grad_squared_norm.sqrt()
+                self.optimizer.step()
+                if collect_metrics:
+                    weight = torch.as_tensor(len(indices), device=device)
+                    metric_weight += weight
+                    metric_loss += loss_mean.detach() * weight
+                    metric_actor_loss += actor_loss.detach() * weight
+                    metric_critic_loss += critic_loss.detach() * weight
+                    metric_entropy += entropy.detach() * weight
+                    metric_grad_norm += grad_norm_value * weight
+
+            # Report a sample-weighted mean across all optimizer steps in the
+            # final epoch, rather than an arbitrary last minibatch.
+            if collect_metrics:
+                # Only one host synchronization per reported PPO update.
+                metrics_tensor = torch.stack((
+                    metric_loss / metric_weight,
+                    metric_actor_loss / metric_weight,
+                    metric_critic_loss / metric_weight,
+                    metric_entropy / metric_weight,
+                    metric_grad_norm / metric_weight,
+                ))
+                (
+                    last_loss,
+                    last_actor_loss,
+                    last_critic_loss,
+                    last_entropy,
+                    last_grad_norm,
+                ) = metrics_tensor.detach().cpu().tolist()
 
         # Copy new weights into old policy
         self.policy_old.load_state_dict(self.policy.state_dict())
 
-        parameter_delta = 0.0
-        actor_parameter_delta = 0.0
-        critic_parameter_delta = 0.0
-        for name, parameter in self.policy.named_parameters():
-            squared_delta = float(
-                (parameter.detach() - parameters_before[name]).norm(2).item()
-                ** 2
-            )
-            parameter_delta += squared_delta
-            if name.startswith("actor."):
-                actor_parameter_delta += squared_delta
-            elif name.startswith("critic."):
-                critic_parameter_delta += squared_delta
-        parameter_delta = parameter_delta ** 0.5
-        actor_parameter_delta = actor_parameter_delta ** 0.5
-        critic_parameter_delta = critic_parameter_delta ** 0.5
+        parameter_delta = actor_parameter_delta = critic_parameter_delta = None
+        if collect_metrics:
+            parameter_delta_sq = torch.zeros((), device=device)
+            actor_delta_sq = torch.zeros((), device=device)
+            critic_delta_sq = torch.zeros((), device=device)
+            for name, parameter in self.policy.named_parameters():
+                squared_delta = (parameter.detach() - parameters_before[name]).square().sum()
+                parameter_delta_sq += squared_delta
+                if name.startswith("actor."):
+                    actor_delta_sq += squared_delta
+                elif name.startswith("critic."):
+                    critic_delta_sq += squared_delta
+            (
+                parameter_delta,
+                actor_parameter_delta,
+                critic_parameter_delta,
+            ) = torch.stack((
+                parameter_delta_sq.sqrt(), actor_delta_sq.sqrt(), critic_delta_sq.sqrt()
+            )).detach().cpu().tolist()
         self.update_count += 1
         metrics = {
             "updated": True,
@@ -718,14 +880,15 @@ class PPO:
             "reward_signal_in_rollout": reward_signal_in_rollout,
             "has_seen_reward_signal": self.has_seen_reward_signal,
         }
-        print(
-            f"[PPO UPDATE #{self.update_count}] rollout={rollout_size} "
-            f"loss={last_loss:.6f} grad_norm={last_grad_norm:.6f} "
-            f"actor_delta={actor_parameter_delta:.6e} "
-            f"critic_delta={critic_parameter_delta:.6e} "
-            f"actor_update={actor_update_enabled} "
-            f"reward_signal={reward_signal_in_rollout}"
-        )
+        if collect_metrics:
+            print(
+                f"[PPO UPDATE #{self.update_count}] rollout={rollout_size} "
+                f"loss={last_loss:.6f} grad_norm={last_grad_norm:.6f} "
+                f"actor_delta={actor_parameter_delta:.6e} "
+                f"critic_delta={critic_parameter_delta:.6e} "
+                f"actor_update={actor_update_enabled} "
+                f"reward_signal={reward_signal_in_rollout}"
+            )
 
         # clear buffer
         self.buffer.clear()

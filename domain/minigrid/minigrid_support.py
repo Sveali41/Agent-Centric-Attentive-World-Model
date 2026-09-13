@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from matplotlib import pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
+from minigrid.core.constants import OBJECT_TO_IDX, STATE_TO_IDX
 from minigrid.wrappers import FullyObsWrapper
 
 from domain.minigrid.minigrid_custom_env import CustomMiniGridEnv
@@ -59,8 +60,28 @@ def wrap_env_from_text(file_path, max_steps, cfg):
     return env
 
 
-def interpret_env(env, cfg, color_array=None):
-    layout_string = generate_obj_map(env, cfg.training_generator.map_element)
+def interpret_env(env, cfg, color_array=None, state_array=None):
+    map_element = dict(cfg.training_generator.map_element)
+    layout_string = generate_obj_map(env, map_element)
+    if state_array is not None:
+        object_array = np.asarray(env)
+        state_array = np.asarray(state_array)
+        if state_array.shape != object_array.shape:
+            raise ValueError(
+                "MiniGrid state map must match the object map shape, got "
+                f"{state_array.shape} and {object_array.shape}"
+            )
+        door_mask = object_array == OBJECT_TO_IDX["door"]
+        valid_door_states = (STATE_TO_IDX["closed"], STATE_TO_IDX["locked"])
+        invalid_door_state = door_mask & ~np.isin(state_array, valid_door_states)
+        if np.any(invalid_door_state):
+            raise ValueError("Generated MiniGrid doors must use state 1 or 2")
+        rows = [list(row) for row in layout_string.splitlines()]
+        for y, x in np.argwhere(
+            door_mask & (state_array == STATE_TO_IDX["locked"])
+        ):
+            rows[int(y)][int(x)] = "D"
+        layout_string = "\n".join("".join(row) for row in rows)
     if color_array is None:
         color_string = generate_color_map(layout_string)
     else:

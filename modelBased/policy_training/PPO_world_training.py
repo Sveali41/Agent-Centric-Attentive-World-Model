@@ -34,6 +34,13 @@ from modelBased.policy_training.dijkstra_planner import (
     replay_actions_in_world_model,
 )
 from modelBased.policy_training.minigrid_wm_rollout import rollout_minigrid_wm
+from modelBased.policy_training.minigrid_dense_reward import (
+    build_goal_distance_map as build_main_goal_distance_map,
+    build_door_topology,
+    build_goal_region_mask,
+    main_dense_rewards,
+    reward_settings as main_dense_reward_settings,
+)
 
 from omegaconf import DictConfig, OmegaConf 
 from modelBased.world_model import AttentionWM_support
@@ -212,32 +219,6 @@ def minigrid_front_cells(states, agent_positions):
 def process_data(state, maks_size):
     return utils.extract_masked_state_torch(state, maks_size)
 
-def evaluate_policy(policy, env, episodes, obs_norm_values):
-    """
-    Evaluate the policy by running it in the environment for a number of episodes.
-    """
-    total_reward = 0
-    for _ in range(episodes):
-        obs = env.reset()[0]['image']
-        state = utils.ColRowCanl_to_CanlRowCol(obs)
-        done = False
-        ep_reward = 0
-        for _ in range(env.max_steps):
-            state_tensor = preprocess_observation(
-                state,
-                obs_norm_values,
-                inventory_token=carrying_token_from_env(env),
-                inventory_classes=INVENTORY_TOKEN_COUNT,
-            )
-            action, _, _, _, _ = policy.select_action(state_tensor.flatten())
-            obs, reward, done, _, _ = env.step(compact_to_native(action))
-            state = utils.ColRowCanl_to_CanlRowCol(obs['image'])
-            ep_reward += reward
-            if done:
-                break
-        total_reward += ep_reward
-    return total_reward / episodes
-
 def imagined_minigrid_step_batch(
     model,
     states,
@@ -247,6 +228,8 @@ def imagined_minigrid_step_batch(
     valid_values_obj=None,
     valid_values_color=None,
     valid_values_state=None,
+    *,
+    agent_positions=None,
 ):
     """Advance B imagined states and inventories with one learned WM call."""
     next_states, inventory_tokens, _ = rollout_minigrid_wm(
@@ -255,6 +238,8 @@ def imagined_minigrid_step_batch(
         actions,
         carrying_key.long() + 1,
         attention_mask_size,
+        agent_positions=agent_positions,
+        collect_diagnostics=False,
     )
     return next_states, inventory_tokens - 1
 
@@ -622,6 +607,19 @@ def run_ppo_wm(cfg):
             "PPO.max_training_timesteps must be divisible by "
             "PPO.num_imagined_envs"
         )
+    console_log_every_steps = int(
+        getattr(hparams_PPO, "console_log_every_steps", update_timestep)
+    )
+    episode_log_every_steps = int(
+        getattr(hparams_PPO, "episode_log_every_steps", update_timestep)
+    )
+    wandb_log_every_updates = int(
+        getattr(hparams_PPO, "wandb_log_every_updates", 1)
+    )
+    if console_log_every_steps < 1 or episode_log_every_steps < 1:
+        raise ValueError("PPO console/episode log intervals must be at least 1")
+    if wandb_log_every_updates < 1:
+        raise ValueError("PPO.wandb_log_every_updates must be at least 1")
     entropy_coef = float(getattr(hparams_PPO, "entropy_coef", 0.01))
     normalize_advantages = bool(getattr(hparams_PPO, "normalize_advantages", True))
     normalize_returns = bool(getattr(hparams_PPO, "normalize_returns", False))
@@ -665,7 +663,7 @@ def run_ppo_wm(cfg):
                         max_steps=max_ep_len, render_mode=None))
     # 4. Initialize training
     i_episode = 0
-    print_freq = 1000
+    print_freq = console_log_every_steps
     print_running_reward = 0
     print_running_extrinsic_reward = 0
     print_running_shaping_reward = 0
@@ -673,6 +671,7 @@ def run_ppo_wm(cfg):
     print_running_steps = 0
     print_running_successes = 0
     next_print_timestep = print_freq
+    next_episode_log_timestep = episode_log_every_steps
     recent_rewards = deque(maxlen=rolling_window_episodes)
     recent_extrinsic_rewards = deque(maxlen=rolling_window_episodes)
     recent_shaping_rewards = deque(maxlen=rolling_window_episodes)
@@ -681,6 +680,10 @@ def run_ppo_wm(cfg):
     time_step = 0
     next_save_timestep = save_model_freq
     step_penalty = float(getattr(hparams_PPO, "step_penalty", 0.0))
+    use_main_dense_reward = bool(
+        getattr(hparams_PPO, "use_main_dense_reward", False)
+    )
+    main_reward = main_dense_reward_settings(hparams_PPO)
     reward_shaping_enabled = bool(
         getattr(hparams_PPO, "reward_shaping_enabled", False)
     )
@@ -747,6 +750,7 @@ def run_ppo_wm(cfg):
         normalize_returns=normalize_returns,
         max_grad_norm=max_grad_norm,
         freeze_actor_until_first_reward=freeze_actor_until_first_reward,
+        minibatch_size=int(getattr(hparams_PPO, "minibatch_size", 0)),
     )
     planner_warm_start_metrics = planner_behavior_cloning_warm_start(
         cfg, model, ppo_agent
@@ -769,17 +773,42 @@ def run_ppo_wm(cfg):
             step=0,
         )
     if compute_regret:
-        real_policy_agent = PPO(state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip,
-                        has_continuous_action_space, action_std)
+        real_policy_agent = PPO(
+            state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip,
+            has_continuous_action_space, action_std,
+            minibatch_size=int(getattr(hparams_PPO, "minibatch_size", 0)),
+        )
         real_policy_agent.load(real_policy_path)
 
     
 
+    # The target layout and spawn position are fixed; only MiniGrid's initial
+    # direction is random.  Materialize its four possible observations once
+    # and sample the same NumPy direction draw that CustomMiniGridEnv used on
+    # every reset.  This avoids rebuilding/parsing the map for every imagined
+    # episode without changing the initial-state distribution.
+    base_env = env.unwrapped
+    original_random_dir = base_env.rand_agent_start_dir
+    original_start_dir = base_env.agent_start_dir
+    initial_state_templates = []
+    try:
+        for direction in range(4):
+            base_env.rand_agent_start_dir = False
+            base_env.agent_start_dir = direction
+            observation = env.reset()[0]["image"]
+            initial_state_templates.append(
+                torch.as_tensor(
+                    utils.ColRowCanl_to_CanlRowCol(observation), device=device
+                )
+            )
+    finally:
+        base_env.rand_agent_start_dir = original_random_dir
+        base_env.agent_start_dir = original_start_dir
+    initial_state_templates = torch.stack(initial_state_templates, dim=0)
+
     def reset_imagined_state():
-        observation = env.reset()[0]["image"]
-        return torch.as_tensor(
-            utils.ColRowCanl_to_CanlRowCol(observation), device=device
-        )
+        direction = int(np.random.randint(0, 4))
+        return initial_state_templates[direction].clone()
 
     states = torch.stack(
         [reset_imagined_state() for _ in range(num_imagined_envs)], dim=0
@@ -794,6 +823,28 @@ def run_ppo_wm(cfg):
     goal_distance_map = build_optimistic_goal_distance_map(
         states[0], goal_position_yx
     )
+    if use_main_dense_reward:
+        goal_distance_map = build_main_goal_distance_map(states[0], goal_position_yx)
+    goal_region_mask = build_goal_region_mask(states[0], goal_position_yx)
+    door_topology = build_door_topology(states[0], goal_position_yx)
+    goal_region_seen = torch.zeros(
+        num_imagined_envs, device=device, dtype=torch.bool
+    )
+    progress_milestone_seen = torch.zeros(
+        num_imagined_envs, device=device, dtype=torch.bool
+    )
+    pending_door_ids = torch.full(
+        (num_imagined_envs,), -1, device=device, dtype=torch.long
+    )
+    pending_door_origins = torch.full_like(pending_door_ids, -1)
+    rewarded_door_crossings = torch.zeros(
+        (num_imagined_envs, door_topology.num_doors), device=device, dtype=torch.bool
+    )
+    initial_agent_positions = utils.get_agent_position_torch(states)
+    initial_goal_distances = goal_distance_map[
+        initial_agent_positions[:, 0].long(), initial_agent_positions[:, 1].long()
+    ].clone()
+    best_goal_distances = initial_goal_distances.clone()
     initial_object_map = states[0, 0].clone()
     carrying_key = torch.full(
         (num_imagined_envs,), -1, device=device, dtype=torch.long
@@ -817,6 +868,8 @@ def run_ppo_wm(cfg):
         device=device,
         dtype=torch.bool,
     )
+    rewarded_goal_region_key_positions = torch.zeros_like(visited_positions)
+    rewarded_goal_region_door_positions = torch.zeros_like(visited_positions)
     rewarded_door_positions = torch.zeros_like(visited_positions)
     key_rewarded = torch.zeros(
         num_imagined_envs, device=device, dtype=torch.bool
@@ -850,7 +903,7 @@ def run_ppo_wm(cfg):
     )
     print(
         "[WM PPO] Reward shaping: "
-        f"enabled={reward_shaping_enabled}; "
+        f"enabled={reward_shaping_enabled}; main_dense={use_main_dense_reward}; "
         f"global_count_beta={global_position_count_beta:g}; "
         f"manhattan_progress={manhattan_progress_reward_scale:g}; "
         f"episodic_position_novelty={position_novelty_reward:g}; "
@@ -875,6 +928,7 @@ def run_ppo_wm(cfg):
             "same_distance_steps": scalar(),
             "goal_progress": scalar(),
             "goal_distance_samples": scalar(),
+            "goal_distance_sum": scalar(),
             "start_goal_distance": None,
             "min_goal_distance": torch.full(
                 (), float("inf"), device=device, dtype=torch.float64
@@ -894,6 +948,7 @@ def run_ppo_wm(cfg):
             "pickup_at_key": scalar(),
             "pickup_events": scalar(),
             "goal_events": scalar(),
+            "agent_lost": scalar(),
             "nonzero_reward_events": scalar(),
             "novel_position_events": scalar(),
             "global_count_reward_events": scalar(),
@@ -907,8 +962,28 @@ def run_ppo_wm(cfg):
             "manhattan_progress_reward_sum": scalar(),
             "key_pickup_reward_sum": scalar(),
             "door_open_reward_sum": scalar(),
+            "main_progress_reward_sum": scalar(),
+            "new_best_progress_count": scalar(),
+            "new_best_reward_sum": scalar(),
+            "goal_region_action_progress_count": scalar(),
+            "goal_region_entry_events": scalar(),
+            "goal_region_reward_sum": scalar(),
+            "goal_region_key_pickup_count": scalar(),
+            "goal_region_key_pickup_reward_sum": scalar(),
+            "goal_region_door_open_count": scalar(),
+            "goal_region_door_open_reward_sum": scalar(),
+            "progress_milestone_count": scalar(),
+            "progress_milestone_reward_sum": scalar(),
+            "critical_door_crossing_count": scalar(),
+            "critical_door_crossing_reward_sum": scalar(),
             "shaping_reward_sum": scalar(),
             "reward_sum": scalar(),
+            "reward_min": torch.full(
+                (), float("inf"), device=device, dtype=torch.float64
+            ),
+            "reward_max": torch.full(
+                (), float("-inf"), device=device, dtype=torch.float64
+            ),
         }
 
     update_diagnostics = new_update_diagnostics()
@@ -921,6 +996,13 @@ def run_ppo_wm(cfg):
     def report_update_diagnostics(update_metrics, end_positions):
         nonlocal update_diagnostics
         update_index = int(update_metrics.get("update_count", 0))
+        should_log_update = (
+            (policy_diagnostics and update_index % diagnostics_every_updates == 0)
+            or (sub_run is not None and update_index % wandb_log_every_updates == 0)
+        )
+        if not should_log_update:
+            update_diagnostics = new_update_diagnostics()
+            return
         diag = update_diagnostics
         transitions = max(int(diag["transitions"]), 1)
 
@@ -928,7 +1010,7 @@ def run_ppo_wm(cfg):
             return float(diag[name].detach().cpu().item())
 
         end_distances = distance_at(end_positions)
-        valid_end = end_distances >= 0
+        valid_end = torch.isfinite(end_distances) & (end_distances >= 0)
         end_distance = (
             float(end_distances[valid_end].float().mean().detach().cpu().item())
             if bool(valid_end.any())
@@ -949,12 +1031,15 @@ def run_ppo_wm(cfg):
         reward_sum = number("reward_sum")
         extrinsic_reward_sum = number("extrinsic_reward_sum")
         shaping_reward_sum = number("shaping_reward_sum")
+        reward_min = number("reward_min")
+        reward_max = number("reward_max")
         move_rate = moved_steps / transitions
         path_per_env = number("path_distance") / float(num_imagined_envs)
         path_by_env = diag["path_distance_by_env"].detach().cpu().numpy()
         path_min = float(path_by_env.min())
         path_max = float(path_by_env.max())
         progress_samples = max(number("goal_distance_samples"), 1.0)
+        goal_distance_mean = number("goal_distance_sum") / progress_samples
         mean_progress = number("goal_progress") / progress_samples
         blocked_rate = forward_blocked / max(forward_attempts, 1.0)
         action_counts = diag["action_counts"].detach().cpu().tolist()
@@ -978,37 +1063,84 @@ def run_ppo_wm(cfg):
                 reasons.append("wm_forward_no_move_on_free_cell")
             if number("invalid_jumps") > 0:
                 reasons.append("wm_agent_jump_gt_1_cell")
-            if key_pickup_reward != 0.0 and number("rewarded_pickup_events") > 0:
-                reasons.append("key_pickup_reward_observed")
-            elif number("pickup_events") > 0 and key_pickup_reward == 0.0:
-                reasons.append("pickup_has_zero_reward")
-            if door_open_reward != 0.0 and number("rewarded_door_events") > 0:
-                reasons.append("door_open_reward_observed")
-            elif number("door_open_events") > 0 and door_open_reward == 0.0:
-                reasons.append("door_open_has_zero_reward")
-            if (
-                position_novelty_reward != 0.0
-                and number("novel_position_events") > 0
-            ):
-                reasons.append("position_novelty_reward_observed")
-            if (
-                global_position_count_beta != 0.0
-                and number("global_count_reward_events") > 0
-            ):
-                reasons.append("global_count_reward_observed")
-            if (
-                manhattan_progress_reward_scale != 0.0
-                and number("manhattan_closer_events") > 0
-            ):
-                reasons.append("manhattan_progress_reward_observed")
-            if reward_shaping_enabled:
-                reasons.append("auxiliary_reward_active")
+            if use_main_dense_reward:
+                if number("main_progress_reward_sum") != 0.0:
+                    reasons.append("main_bfs_progress_reward_observed")
+                if number("goal_region_entry_events") > 0:
+                    reasons.append("main_goal_region_reward_observed")
+                reasons.append("main_dense_reward_active")
             else:
-                reasons.append("sparse_goal_only_reward")
+                if key_pickup_reward != 0.0 and number("rewarded_pickup_events") > 0:
+                    reasons.append("key_pickup_reward_observed")
+                elif number("pickup_events") > 0 and key_pickup_reward == 0.0:
+                    reasons.append("pickup_has_zero_reward")
+                if door_open_reward != 0.0 and number("rewarded_door_events") > 0:
+                    reasons.append("door_open_reward_observed")
+                elif number("door_open_events") > 0 and door_open_reward == 0.0:
+                    reasons.append("door_open_has_zero_reward")
+                if (
+                    position_novelty_reward != 0.0
+                    and number("novel_position_events") > 0
+                ):
+                    reasons.append("position_novelty_reward_observed")
+                if (
+                    global_position_count_beta != 0.0
+                    and number("global_count_reward_events") > 0
+                ):
+                    reasons.append("global_count_reward_observed")
+                if (
+                    manhattan_progress_reward_scale != 0.0
+                    and number("manhattan_closer_events") > 0
+                ):
+                    reasons.append("manhattan_progress_reward_observed")
+                if reward_shaping_enabled:
+                    reasons.append("auxiliary_reward_active")
+                else:
+                    reasons.append("sparse_goal_only_reward")
         else:
             reasons.append("goal_reward_observed")
 
         metrics = {
+            # Main-workspace-compatible rollout schema.
+            "time_step": int(time_step),
+            "update": update_index,
+            "loss": float(update_metrics.get("loss", 0.0) or 0.0),
+            "grad_norm": float(update_metrics.get("grad_norm", 0.0) or 0.0),
+            "actor_delta": float(
+                update_metrics.get("actor_parameter_delta", 0.0) or 0.0
+            ),
+            "critic_delta": float(
+                update_metrics.get("critic_parameter_delta", 0.0) or 0.0
+            ),
+            "actor_loss": float(update_metrics.get("actor_loss", 0.0) or 0.0),
+            "critic_loss": float(update_metrics.get("critic_loss", 0.0) or 0.0),
+            "entropy": float(update_metrics.get("entropy", 0.0) or 0.0),
+            "train/reward_per_step": reward_sum / transitions,
+            "reward_min": reward_min if np.isfinite(reward_min) else None,
+            "reward_max": reward_max if np.isfinite(reward_max) else None,
+            "success": int(goal_events),
+            "agent_lost": int(number("agent_lost")),
+            "key_ach": number("pickup_events"),
+            "door_ach": number("door_open_events"),
+            "new_best_progress_count": number("new_best_progress_count"),
+            "new_best_reward_sum": number("new_best_reward_sum"),
+            "goal_region_entry_count": number("goal_region_entry_events"),
+            "goal_region_reward_sum": number("goal_region_reward_sum"),
+            "goal_region_key_pickup_count": number("goal_region_key_pickup_count"),
+            "goal_region_key_pickup_reward_sum": number("goal_region_key_pickup_reward_sum"),
+            "goal_region_door_open_count": number("goal_region_door_open_count"),
+            "goal_region_door_open_reward_sum": number("goal_region_door_open_reward_sum"),
+            "progress_milestone_count": number("progress_milestone_count"),
+            "progress_milestone_reward_sum": number("progress_milestone_reward_sum"),
+            "critical_door_crossing_count": number("critical_door_crossing_count"),
+            "critical_door_crossing_reward_sum": number("critical_door_crossing_reward_sum"),
+            "topology_subgoal_completion_count": 0,
+            "topology_subgoal_stage_mean": 0.0,
+            "distance_metric": "bfs" if use_main_dense_reward else "legacy",
+            "goal_dist_mean": goal_distance_mean,
+            "goal_dist_min": min_distance,
+            "subgoal_dist_mean": goal_distance_mean,
+            "subgoal_dist_min": min_distance,
             "diagnostic/path_distance_per_env": path_per_env,
             "diagnostic/path_distance_per_env_min": path_min,
             "diagnostic/path_distance_per_env_max": path_max,
@@ -1067,11 +1199,52 @@ def run_ppo_wm(cfg):
             ),
             "diagnostic/key_pickup_reward_sum": number("key_pickup_reward_sum"),
             "diagnostic/door_open_reward_sum": number("door_open_reward_sum"),
+            "diagnostic/main_progress_reward_sum": number(
+                "main_progress_reward_sum"
+            ),
+            "diagnostic/new_best_progress_count": number(
+                "new_best_progress_count"
+            ),
+            "diagnostic/new_best_reward_sum": number("new_best_reward_sum"),
+            "diagnostic/goal_region_action_progress_count": number(
+                "goal_region_action_progress_count"
+            ),
+            "diagnostic/goal_region_entry_count": number(
+                "goal_region_entry_events"
+            ),
+            "diagnostic/goal_region_reward_sum": number(
+                "goal_region_reward_sum"
+            ),
+            "diagnostic/goal_region_key_pickup_count": number(
+                "goal_region_key_pickup_count"
+            ),
+            "diagnostic/goal_region_key_pickup_reward_sum": number(
+                "goal_region_key_pickup_reward_sum"
+            ),
+            "diagnostic/goal_region_door_open_count": number(
+                "goal_region_door_open_count"
+            ),
+            "diagnostic/goal_region_door_open_reward_sum": number(
+                "goal_region_door_open_reward_sum"
+            ),
+            "diagnostic/progress_milestone_count": number(
+                "progress_milestone_count"
+            ),
+            "diagnostic/progress_milestone_reward_sum": number(
+                "progress_milestone_reward_sum"
+            ),
+            "diagnostic/critical_door_crossing_count": number(
+                "critical_door_crossing_count"
+            ),
+            "diagnostic/critical_door_crossing_reward_sum": number(
+                "critical_door_crossing_reward_sum"
+            ),
             "diagnostic/shaping_reward_sum": shaping_reward_sum,
             "diagnostic/reward_sum": reward_sum,
         }
         for name, count in zip(COMPACT_ACTION_NAMES, action_counts):
             metrics[f"diagnostic/action_fraction/{name}"] = int(count) / transitions
+            metrics[f"action_ratio/{name}"] = int(count) / transitions
 
         if policy_diagnostics and update_index % diagnostics_every_updates == 0:
             print(
@@ -1117,15 +1290,23 @@ def run_ppo_wm(cfg):
                 f"{number('manhattan_progress_reward_sum'):.4f}/"
                 f"{number('position_novelty_reward_sum'):.4f}/"
                 f"{number('key_pickup_reward_sum'):.4f}/"
-                f"{number('door_open_reward_sum'):.4f}"
+                f"{number('door_open_reward_sum'):.4f}; "
+                f"main_bfs/goal_region="
+                f"{number('main_progress_reward_sum'):.4f}/"
+                f"{number('goal_region_reward_sum'):.4f} "
+                f"(entries={int(number('goal_region_entry_events'))})"
             )
             print(f"[PolicyDiag][reward evidence] {', '.join(reasons)}")
-        if sub_run is not None:
+        if sub_run is not None and update_index % wandb_log_every_updates == 0:
             sub_run.log(metrics, step=time_step)
         update_diagnostics = new_update_diagnostics()
 
     def log_ppo_update(update_metrics):
-        if sub_run is not None and update_metrics.get("updated", False):
+        if (
+            sub_run is not None
+            and update_metrics.get("updated", False)
+            and int(update_metrics["update_count"]) % wandb_log_every_updates == 0
+        ):
             sub_run.log(
                 {
                     "ppo/loss": update_metrics["loss"],
@@ -1154,6 +1335,15 @@ def run_ppo_wm(cfg):
 
     # Each loop advances B independent trajectories by one imagined step.
     while time_step < max_training_timesteps:
+        next_update_index = ppo_agent.update_count + 1
+        collect_update_diagnostics = (
+            (policy_diagnostics and next_update_index % diagnostics_every_updates == 0)
+            or (
+                sub_run is not None
+                and next_update_index % wandb_log_every_updates == 0
+            )
+        )
+        previous_states = states
         previous_agent_positions = utils.get_agent_position_torch(states)
         previous_manhattan_distances = torch.abs(
             previous_agent_positions - goal_positions
@@ -1191,7 +1381,20 @@ def run_ppo_wm(cfg):
                 hparams_world_model.valid_values_obj,
                 hparams_world_model.valid_values_color,
                 hparams_world_model.valid_values_state,
+                agent_positions=previous_agent_positions,
             )
+
+        lava_terminated = (actions == 2) & valid_front & (front_objects == 9)
+        agent_present = (states[:, 0] == 10).flatten(1).any(dim=1)
+        agent_lost = ~agent_present
+        # A missing agent is an invalid WM transition, not an environment
+        # outcome. This unconditional tensor selection avoids synchronizing
+        # CUDA for a Python ``any`` on every imagined step.
+        states = torch.where(
+            agent_lost[:, None, None, None], previous_states, states
+        )
+        invalid_transitions = agent_lost & ~lava_terminated
+        valid_transitions = ~invalid_transitions
 
         episode_steps += 1
         agent_positions = utils.get_agent_position_torch(states)
@@ -1217,22 +1420,30 @@ def run_ppo_wm(cfg):
         )
         global_position_counts.scatter_add_(
             0,
-            flat_positions,
-            torch.ones_like(flat_positions, dtype=torch.float32),
+            flat_positions[valid_transitions],
+            torch.ones_like(
+                flat_positions[valid_transitions], dtype=torch.float32
+            ),
         )
         manhattan_progress_rewards = (
             manhattan_progress.float() * manhattan_progress_reward_scale
         )
         current_goal_distances = distance_at(agent_positions)
-        valid_goal_distance = (
-            (previous_goal_distances >= 0) & (current_goal_distances >= 0)
+        valid_goal_distance = valid_transitions & (
+            torch.isfinite(previous_goal_distances)
+            & torch.isfinite(current_goal_distances)
+            & (previous_goal_distances >= 0)
+            & (current_goal_distances >= 0)
         )
-        goal_progress = (
+        goal_progress = torch.zeros_like(previous_goal_distances)
+        goal_progress[valid_goal_distance] = (
             previous_goal_distances[valid_goal_distance]
             - current_goal_distances[valid_goal_distance]
         )
-        if update_diagnostics["transitions"] == 0:
-            valid_start = previous_goal_distances >= 0
+        if collect_update_diagnostics and update_diagnostics["transitions"] == 0:
+            valid_start = valid_transitions & torch.isfinite(previous_goal_distances) & (
+                previous_goal_distances >= 0
+            )
             if bool(valid_start.any()):
                 update_diagnostics["start_goal_distance"] = float(
                     previous_goal_distances[valid_start]
@@ -1242,94 +1453,93 @@ def run_ppo_wm(cfg):
                     .cpu()
                     .item()
                 )
-        update_diagnostics["transitions"] += num_imagined_envs
-        update_diagnostics["action_counts"] += torch.bincount(
-            actions.long(), minlength=action_dim
-        )
-        update_diagnostics["path_distance"] += step_distances.double().sum()
-        update_diagnostics["path_distance_by_env"] += step_distances.double()
-        update_diagnostics["moved_steps"] += (step_distances > 0).double().sum()
-        update_diagnostics["stationary_steps"] += (step_distances == 0).double().sum()
-        update_diagnostics["invalid_jumps"] += (step_distances > 1).double().sum()
-        update_diagnostics["closer_steps"] += (goal_progress > 0).double().sum()
-        update_diagnostics["farther_steps"] += (goal_progress < 0).double().sum()
-        update_diagnostics["same_distance_steps"] += (goal_progress == 0).double().sum()
-        update_diagnostics["goal_progress"] += goal_progress.double().sum()
-        update_diagnostics["goal_distance_samples"] += valid_goal_distance.double().sum()
-        valid_or_inf = torch.where(
-            current_goal_distances >= 0,
-            current_goal_distances.double(),
-            torch.full_like(current_goal_distances, float("inf"), dtype=torch.float64),
-        )
-        update_diagnostics["min_goal_distance"] = torch.minimum(
-            update_diagnostics["min_goal_distance"], valid_or_inf.min()
-        )
+        if collect_update_diagnostics:
+            update_diagnostics["transitions"] += int(valid_transitions.sum().item())
+            update_diagnostics["agent_lost"] += agent_lost.double().sum()
+            update_diagnostics["action_counts"] += torch.bincount(
+                actions[valid_transitions].long(), minlength=action_dim
+            )
+            update_diagnostics["path_distance"] += step_distances[valid_transitions].double().sum()
+            update_diagnostics["path_distance_by_env"] += step_distances.double() * valid_transitions.double()
+            update_diagnostics["moved_steps"] += ((step_distances > 0) & valid_transitions).double().sum()
+            update_diagnostics["stationary_steps"] += ((step_distances == 0) & valid_transitions).double().sum()
+            update_diagnostics["invalid_jumps"] += ((step_distances > 1) & valid_transitions).double().sum()
+            update_diagnostics["closer_steps"] += ((goal_progress > 0) & valid_transitions).double().sum()
+            update_diagnostics["farther_steps"] += ((goal_progress < 0) & valid_transitions).double().sum()
+            update_diagnostics["same_distance_steps"] += ((goal_progress == 0) & valid_transitions).double().sum()
+            update_diagnostics["goal_progress"] += goal_progress[valid_transitions].double().sum()
+            update_diagnostics["goal_distance_samples"] += valid_goal_distance.double().sum()
+            update_diagnostics["goal_distance_sum"] += (
+                current_goal_distances[valid_goal_distance].double().sum()
+            )
+            valid_or_inf = torch.where(
+                valid_transitions & torch.isfinite(current_goal_distances) & (current_goal_distances >= 0),
+                current_goal_distances.double(),
+                torch.full_like(current_goal_distances, float("inf"), dtype=torch.float64),
+            )
+            update_diagnostics["min_goal_distance"] = torch.minimum(
+                update_diagnostics["min_goal_distance"], valid_or_inf.min()
+            )
 
         forward = actions == 2
         blocked_forward = forward & (step_distances == 0)
         toggle = actions == 4
         pickup = actions == 3
         closed_door_ahead = (front_objects == 4) & (front_states != 0)
-        layout_front_objects = initial_object_map[front_y, front_x].long()
-        physically_blocked_ahead = (
-            (front_objects == 2)
-            | closed_door_ahead
-            | (front_objects == 5)
-            | (front_objects == 6)
-            | (front_objects == 7)
-            | ~valid_front
-        )
-        update_diagnostics["forward_attempts"] += forward.double().sum()
-        update_diagnostics["forward_blocked"] += blocked_forward.double().sum()
-        update_diagnostics["forward_into_wall"] += (
-            blocked_forward & (front_objects == 2)
-        ).double().sum()
-        update_diagnostics["forward_into_layout_wall"] += (
-            blocked_forward & (layout_front_objects == 2)
-        ).double().sum()
-        update_diagnostics["imagined_wall_not_in_layout"] += (
-            blocked_forward
-            & (front_objects == 2)
-            & (layout_front_objects != 2)
-        ).double().sum()
-        update_diagnostics["forward_into_door"] += (
-            blocked_forward & closed_door_ahead
-        ).double().sum()
-        update_diagnostics["forward_into_key"] += (
-            blocked_forward & (front_objects == 5)
-        ).double().sum()
-        update_diagnostics["forward_blocked_with_free_front"] += (
-            blocked_forward & ~physically_blocked_ahead
-        ).double().sum()
-        update_diagnostics["toggle_attempts"] += toggle.double().sum()
-        update_diagnostics["toggle_at_door"] += (
-            toggle & (front_objects == 4)
-        ).double().sum()
-        update_diagnostics["pickup_attempts"] += pickup.double().sum()
-        update_diagnostics["pickup_at_key"] += (
-            pickup & (front_objects == 5)
-        ).double().sum()
         next_front_states = states[batch_ids, 2, front_y, front_x].long()
         door_opened = (
             toggle
+            & valid_transitions
             & valid_front
             & (front_objects == 4)
             & (front_states != 0)
             & (next_front_states == 0)
         )
-        update_diagnostics["door_open_events"] += door_opened.double().sum()
+        if collect_update_diagnostics:
+            layout_front_objects = initial_object_map[front_y, front_x].long()
+            physically_blocked_ahead = (
+                (front_objects == 2) | closed_door_ahead | (front_objects == 5)
+                | (front_objects == 6) | (front_objects == 7) | ~valid_front
+            )
+            update_diagnostics["forward_attempts"] += (forward & valid_transitions).double().sum()
+            update_diagnostics["forward_blocked"] += (blocked_forward & valid_transitions).double().sum()
+            update_diagnostics["forward_into_wall"] += (
+                blocked_forward & valid_transitions & (front_objects == 2)
+            ).double().sum()
+            update_diagnostics["forward_into_layout_wall"] += (
+                blocked_forward & valid_transitions & (layout_front_objects == 2)
+            ).double().sum()
+            update_diagnostics["imagined_wall_not_in_layout"] += (
+                blocked_forward & valid_transitions & (front_objects == 2)
+                & (layout_front_objects != 2)
+            ).double().sum()
+            update_diagnostics["forward_into_door"] += (
+                blocked_forward & valid_transitions & closed_door_ahead
+            ).double().sum()
+            update_diagnostics["forward_into_key"] += (
+                blocked_forward & valid_transitions & (front_objects == 5)
+            ).double().sum()
+            update_diagnostics["forward_blocked_with_free_front"] += (
+                blocked_forward & valid_transitions & ~physically_blocked_ahead
+            ).double().sum()
+            update_diagnostics["toggle_attempts"] += (toggle & valid_transitions).double().sum()
+            update_diagnostics["toggle_at_door"] += (
+                toggle & valid_transitions & (front_objects == 4)
+            ).double().sum()
+            update_diagnostics["pickup_attempts"] += (pickup & valid_transitions).double().sum()
+            update_diagnostics["pickup_at_key"] += (
+                pickup & valid_transitions & (front_objects == 5)
+            ).double().sum()
+            update_diagnostics["door_open_events"] += door_opened.double().sum()
         newly_rewarded_doors = door_opened & ~rewarded_door_positions[
             batch_ids, front_y, front_x
         ]
         rewarded_door_positions[batch_ids, front_y, front_x] |= door_opened
         reached_goal = torch.all(agent_positions == goal_positions, dim=1)
-        goal_rewards = torch.where(
-            reached_goal,
-            1.0 - 0.9 * episode_steps.float() / float(max_ep_len),
-            torch.zeros_like(episode_rewards),
+        lava_terminated = forward & valid_front & (front_objects == 9)
+        just_picked_up = (
+            valid_transitions & (prev_carrying_key < 0) & (carrying_key >= 0)
         )
-        rewards = goal_rewards
-        just_picked_up = (prev_carrying_key < 0) & (carrying_key >= 0)
         newly_rewarded_pickups = just_picked_up & ~key_rewarded
         key_rewarded |= just_picked_up
         position_rewards = novel_positions.float() * position_novelty_reward
@@ -1342,43 +1552,178 @@ def run_ppo_wm(cfg):
             + pickup_rewards
             + door_rewards
         )
-        rewards = rewards + shaping_rewards
-        rewards = rewards + step_penalty
-        update_diagnostics["pickup_events"] += just_picked_up.double().sum()
-        update_diagnostics["goal_events"] += reached_goal.double().sum()
-        update_diagnostics["nonzero_reward_events"] += (rewards != 0).double().sum()
-        update_diagnostics["novel_position_events"] += novel_positions.double().sum()
-        update_diagnostics["global_count_reward_events"] += (
-            (global_count_rewards > 0).double().sum()
-        )
-        update_diagnostics["manhattan_closer_events"] += (
-            (manhattan_progress > 0).double().sum()
-        )
-        update_diagnostics["manhattan_farther_events"] += (
-            (manhattan_progress < 0).double().sum()
-        )
-        update_diagnostics["rewarded_pickup_events"] += (
-            newly_rewarded_pickups.double().sum()
-        )
-        update_diagnostics["rewarded_door_events"] += (
-            newly_rewarded_doors.double().sum()
-        )
-        update_diagnostics["extrinsic_reward_sum"] += goal_rewards.double().sum()
-        update_diagnostics["position_novelty_reward_sum"] += (
-            position_rewards.double().sum()
-        )
-        update_diagnostics["global_count_reward_sum"] += (
-            global_count_rewards.double().sum()
-        )
-        update_diagnostics["manhattan_progress_reward_sum"] += (
-            manhattan_progress_rewards.double().sum()
-        )
-        update_diagnostics["key_pickup_reward_sum"] += pickup_rewards.double().sum()
-        update_diagnostics["door_open_reward_sum"] += door_rewards.double().sum()
-        update_diagnostics["shaping_reward_sum"] += shaping_rewards.double().sum()
-        update_diagnostics["reward_sum"] += rewards.double().sum()
+        if use_main_dense_reward:
+            rewards, goal_region_seen, main_reward_events = main_dense_rewards(
+                previous_states,
+                states,
+                actions,
+                goal_distance_map,
+                goal_region_mask,
+                goal_region_seen,
+                reached_goal,
+                lava_terminated,
+                best_goal_distances=best_goal_distances,
+                initial_goal_distances=initial_goal_distances,
+                progress_milestone_seen=progress_milestone_seen,
+                previous_carrying_tokens=prev_carrying_key + 1,
+                current_carrying_tokens=carrying_key + 1,
+                door_topology=door_topology,
+                pending_door_ids=pending_door_ids,
+                pending_door_origins=pending_door_origins,
+                rewarded_door_crossings=rewarded_door_crossings,
+                rewarded_goal_region_key_positions=rewarded_goal_region_key_positions,
+                rewarded_goal_region_door_positions=rewarded_goal_region_door_positions,
+                transition_valid=valid_transitions,
+                **main_reward,
+            )
+            best_goal_distances = main_reward_events["new_best_goal_distance"]
+            progress_milestone_seen = main_reward_events["progress_milestone_seen"]
+            pending_door_ids = main_reward_events["pending_door_ids"]
+            pending_door_origins = main_reward_events["pending_door_origins"]
+            rewarded_door_crossings = main_reward_events["rewarded_door_crossings"]
+            rewarded_goal_region_key_positions = main_reward_events[
+                "rewarded_goal_region_key_positions"
+            ]
+            rewarded_goal_region_door_positions = main_reward_events[
+                "rewarded_goal_region_door_positions"
+            ]
+            goal_rewards = reached_goal.float() * float(
+                main_reward["success_reward"]
+            )
+            shaping_rewards = (
+                torch.full_like(rewards, float(main_reward["step_penalty"]))
+                + main_reward_events["progress_reward"]
+                + main_reward_events["goal_region_reward"]
+                + main_reward_events["goal_region_key_pickup_reward"]
+                + main_reward_events["goal_region_door_open_reward"]
+                + main_reward_events["progress_milestone_reward"]
+                + main_reward_events["critical_door_crossing_reward"]
+            )
+            shaping_rewards = torch.where(
+                reached_goal | lava_terminated,
+                torch.zeros_like(shaping_rewards),
+                shaping_rewards,
+            )
+            if collect_update_diagnostics: update_diagnostics["main_progress_reward_sum"] += (
+                main_reward_events["progress_reward"][valid_transitions].double().sum()
+            )
+            if collect_update_diagnostics: update_diagnostics["new_best_progress_count"] += (
+                (main_reward_events["new_best_reward"][valid_transitions] > 0)
+                .double()
+                .sum()
+            )
+            if collect_update_diagnostics: update_diagnostics["new_best_reward_sum"] += (
+                main_reward_events["new_best_reward"][valid_transitions].double().sum()
+            )
+            if collect_update_diagnostics: update_diagnostics["goal_region_action_progress_count"] += (
+                main_reward_events["goal_region_action_transition"][valid_transitions]
+                .double()
+                .sum()
+            )
+            if collect_update_diagnostics: update_diagnostics["goal_region_entry_events"] += (
+                main_reward_events["goal_region_entered"][valid_transitions].double().sum()
+            )
+            if collect_update_diagnostics: update_diagnostics["goal_region_reward_sum"] += (
+                main_reward_events["goal_region_reward"][valid_transitions].double().sum()
+            )
+            if collect_update_diagnostics: update_diagnostics["goal_region_key_pickup_count"] += (
+                main_reward_events["goal_region_key_picked_up"][valid_transitions]
+                .double().sum()
+            )
+            if collect_update_diagnostics: update_diagnostics["goal_region_key_pickup_reward_sum"] += (
+                main_reward_events["goal_region_key_pickup_reward"][valid_transitions]
+                .double().sum()
+            )
+            if collect_update_diagnostics: update_diagnostics["goal_region_door_open_count"] += (
+                main_reward_events["goal_region_door_opened"][valid_transitions]
+                .double().sum()
+            )
+            if collect_update_diagnostics: update_diagnostics["goal_region_door_open_reward_sum"] += (
+                main_reward_events["goal_region_door_open_reward"][valid_transitions]
+                .double().sum()
+            )
+            if collect_update_diagnostics: update_diagnostics["progress_milestone_count"] += (
+                main_reward_events["progress_milestone_crossed"][valid_transitions]
+                .double()
+                .sum()
+            )
+            if collect_update_diagnostics: update_diagnostics["progress_milestone_reward_sum"] += (
+                main_reward_events["progress_milestone_reward"][valid_transitions]
+                .double()
+                .sum()
+            )
+            if collect_update_diagnostics: update_diagnostics["critical_door_crossing_count"] += (
+                main_reward_events["critical_door_crossed"][valid_transitions]
+                .double().sum()
+            )
+            if collect_update_diagnostics: update_diagnostics["critical_door_crossing_reward_sum"] += (
+                main_reward_events["critical_door_crossing_reward"][valid_transitions]
+                .double().sum()
+            )
+        else:
+            goal_rewards = torch.where(
+                reached_goal,
+                1.0 - 0.9 * episode_steps.float() / float(max_ep_len),
+                torch.zeros_like(episode_rewards),
+            )
+            rewards = goal_rewards + shaping_rewards + step_penalty
+        rewards[invalid_transitions] = 0.0
+        goal_rewards[invalid_transitions] = 0.0
+        shaping_rewards[invalid_transitions] = 0.0
+        if collect_update_diagnostics: update_diagnostics["pickup_events"] += just_picked_up[valid_transitions].double().sum()
+        if collect_update_diagnostics: update_diagnostics["goal_events"] += reached_goal[valid_transitions].double().sum()
+        if collect_update_diagnostics: update_diagnostics["nonzero_reward_events"] += (rewards[valid_transitions] != 0).double().sum()
+        if collect_update_diagnostics and not use_main_dense_reward:
+            update_diagnostics["novel_position_events"] += (
+                novel_positions.double().sum()
+            )
+            update_diagnostics["global_count_reward_events"] += (
+                (global_count_rewards > 0).double().sum()
+            )
+            update_diagnostics["manhattan_closer_events"] += (
+                (manhattan_progress > 0).double().sum()
+            )
+            update_diagnostics["manhattan_farther_events"] += (
+                (manhattan_progress < 0).double().sum()
+            )
+            update_diagnostics["rewarded_pickup_events"] += (
+                newly_rewarded_pickups.double().sum()
+            )
+            update_diagnostics["rewarded_door_events"] += (
+                newly_rewarded_doors.double().sum()
+            )
+        if collect_update_diagnostics: update_diagnostics["extrinsic_reward_sum"] += goal_rewards[valid_transitions].double().sum()
+        if collect_update_diagnostics and not use_main_dense_reward:
+            update_diagnostics["position_novelty_reward_sum"] += (
+                position_rewards.double().sum()
+            )
+            update_diagnostics["global_count_reward_sum"] += (
+                global_count_rewards.double().sum()
+            )
+            update_diagnostics["manhattan_progress_reward_sum"] += (
+                manhattan_progress_rewards.double().sum()
+            )
+            update_diagnostics["key_pickup_reward_sum"] += (
+                pickup_rewards.double().sum()
+            )
+            update_diagnostics["door_open_reward_sum"] += door_rewards.double().sum()
+        if collect_update_diagnostics: update_diagnostics["shaping_reward_sum"] += shaping_rewards[valid_transitions].double().sum()
+        if collect_update_diagnostics: update_diagnostics["reward_sum"] += rewards[valid_transitions].double().sum()
+        if collect_update_diagnostics and bool(valid_transitions.any()):
+            valid_rewards = rewards[valid_transitions].double()
+            update_diagnostics["reward_min"] = torch.minimum(
+                update_diagnostics["reward_min"], valid_rewards.min()
+            )
+            update_diagnostics["reward_max"] = torch.maximum(
+                update_diagnostics["reward_max"], valid_rewards.max()
+            )
         truncated = episode_steps >= max_ep_len
-        dones = reached_goal | truncated
+        dones = (
+            reached_goal
+            | (lava_terminated & use_main_dense_reward)
+            | truncated
+            | agent_lost
+        )
         episode_rewards += rewards
         episode_extrinsic_rewards += goal_rewards
         episode_shaping_rewards += shaping_rewards
@@ -1390,11 +1735,12 @@ def run_ppo_wm(cfg):
             state_values,
             rewards,
             dones,
+            valid_mask=valid_transitions,
         )
         time_step += num_imagined_envs
         last_dones = dones.clone()
 
-        if time_step % update_timestep == 0:
+        if ppo_agent.buffer.has_at_least_transitions(update_timestep):
             next_state_norm = utils.normalize_obs(
                 states.clone(), hparams_world_model.obs_norm_values
             ).reshape(num_imagined_envs, -1)
@@ -1404,12 +1750,22 @@ def run_ppo_wm(cfg):
             bootstrap_values = ppo_agent.estimate_old_values_batch(next_state_norm)
             bootstrap_values[last_dones.detach().cpu()] = 0.0
             update_metrics = ppo_agent.update(
-                bootstrap_value=bootstrap_values
+                bootstrap_value=bootstrap_values,
+                collect_metrics=collect_update_diagnostics,
             )
             log_ppo_update(update_metrics)
             report_update_diagnostics(update_metrics, agent_positions)
 
-        completed = torch.nonzero(dones, as_tuple=False).reshape(-1)
+        completed = torch.nonzero(
+            (
+                reached_goal
+                | (lava_terminated & use_main_dense_reward)
+                | truncated
+            )
+            & valid_transitions,
+            as_tuple=False,
+        ).reshape(-1)
+        reset_slots = torch.nonzero(dones, as_tuple=False).reshape(-1)
         if completed.numel() > 0:
             completed_rewards = episode_rewards[completed].detach().cpu().tolist()
             completed_extrinsic_rewards = (
@@ -1449,7 +1805,10 @@ def run_ppo_wm(cfg):
             )
             rolling_avg_steps = sum(recent_steps) / len(recent_steps)
             rolling_success_rate = sum(recent_successes) / len(recent_successes)
-            if sub_run is not None:
+            if (
+                sub_run is not None
+                and time_step >= next_episode_log_timestep
+            ):
                 sub_run.log(
                     {
                         "episode/reward": sum(completed_rewards) / len(completed_rewards),
@@ -1469,33 +1828,53 @@ def run_ppo_wm(cfg):
                         "rolling/success_rate": rolling_success_rate,
                         "rolling/average_episode_steps": rolling_avg_steps,
                         "rolling/window_episode_count": len(recent_rewards),
+                        "train/episode_return_mean": rolling_avg_reward,
+                        "train/episode_length_mean": rolling_avg_steps,
+                        "train/episode_success_rate": rolling_success_rate,
+                        "train/rolling_success_rate": rolling_success_rate,
+                        "train/episodes_completed": i_episode,
                     },
                     step=time_step,
                 )
+                while next_episode_log_timestep <= time_step:
+                    next_episode_log_timestep += episode_log_every_steps
 
-            # Reset only completed slots; all other imagined trajectories keep
-            # their current states and episode statistics.
+        # Agent-lost slots are reset but are not counted as completed episodes.
+        # All other imagined trajectories keep their current state/statistics.
+        if reset_slots.numel() > 0:
             reset_states = torch.stack(
-                [reset_imagined_state() for _ in range(completed.numel())], dim=0
+                [reset_imagined_state() for _ in range(reset_slots.numel())], dim=0
             )
-            states[completed] = reset_states
-            carrying_key[completed] = -1
-            prev_carrying_key[completed] = -1
-            episode_rewards[completed] = 0.0
-            episode_extrinsic_rewards[completed] = 0.0
-            episode_shaping_rewards[completed] = 0.0
-            episode_steps[completed] = 0
-            visited_positions[completed] = False
+            states[reset_slots] = reset_states
+            carrying_key[reset_slots] = -1
+            prev_carrying_key[reset_slots] = -1
+            episode_rewards[reset_slots] = 0.0
+            episode_extrinsic_rewards[reset_slots] = 0.0
+            episode_shaping_rewards[reset_slots] = 0.0
+            episode_steps[reset_slots] = 0
+            visited_positions[reset_slots] = False
             reset_agent_positions = utils.get_agent_position_torch(
-                states[completed]
+                states[reset_slots]
             )
             visited_positions[
-                completed,
+                reset_slots,
                 reset_agent_positions[:, 0].long(),
                 reset_agent_positions[:, 1].long(),
             ] = True
-            rewarded_door_positions[completed] = False
-            key_rewarded[completed] = False
+            rewarded_door_positions[reset_slots] = False
+            rewarded_goal_region_key_positions[reset_slots] = False
+            rewarded_goal_region_door_positions[reset_slots] = False
+            key_rewarded[reset_slots] = False
+            goal_region_seen[reset_slots] = False
+            progress_milestone_seen[reset_slots] = False
+            pending_door_ids[reset_slots] = -1
+            pending_door_origins[reset_slots] = -1
+            rewarded_door_crossings[reset_slots] = False
+            reset_goal_distances = goal_distance_map[
+                reset_agent_positions[:, 0].long(), reset_agent_positions[:, 1].long()
+            ]
+            initial_goal_distances[reset_slots] = reset_goal_distances
+            best_goal_distances[reset_slots] = reset_goal_distances
 
         if time_step >= next_print_timestep and print_running_episodes > 0:
             rolling_avg_reward = sum(recent_rewards) / len(recent_rewards)
@@ -1555,7 +1934,10 @@ def run_ppo_wm(cfg):
         )
         bootstrap_values = ppo_agent.estimate_old_values_batch(next_state_norm)
         bootstrap_values[last_dones.detach().cpu()] = 0.0
-        update_metrics = ppo_agent.update(bootstrap_value=bootstrap_values)
+        update_metrics = ppo_agent.update(
+            bootstrap_value=bootstrap_values,
+            collect_metrics=True,
+        )
         log_ppo_update(update_metrics)
         report_update_diagnostics(
             update_metrics, utils.get_agent_position_torch(states)
@@ -1587,6 +1969,7 @@ def _init_policy_wandb_run(cfg, default_project):
     ).expanduser().resolve()
     wandb_dir.mkdir(parents=True, exist_ok=True)
     wandb.login()
+    resolved_ppo = OmegaConf.to_container(ppo_cfg, resolve=True)
     init_kwargs = {
         "dir": str(wandb_dir),
         "project": str(getattr(ppo_cfg, "wandb_project", default_project)),
@@ -1599,9 +1982,17 @@ def _init_policy_wandb_run(cfg, default_project):
             "domain": str(cfg.domain),
             "task_name": task_name,
             "layout_path": str(cfg.domains[str(cfg.domain)].layout_path),
+            "env_path": str(ppo_cfg.env_path),
             "training_source": training_source,
             "policy_checkpoint": str(policy_checkpoint_path(cfg)),
+            "wm_checkpoint": str(getattr(ppo_cfg, "checkpoint_path_wm", "")),
             "seed": int(getattr(ppo_cfg, "seed", 0)),
+            "baseline": getattr(ppo_cfg, "wandb_baseline", None),
+            "wm_seed": getattr(ppo_cfg, "wandb_wm_seed", None),
+            "target": getattr(ppo_cfg, "wandb_target_name", task_name),
+            "policy_seed": getattr(
+                ppo_cfg, "wandb_policy_seed", int(getattr(ppo_cfg, "seed", 0))
+            ),
             "train_in_real_env": bool(ppo_cfg.train_in_real_env),
             "max_ep_len": int(ppo_cfg.max_ep_len),
             "rollout_steps": int(getattr(ppo_cfg, "rollout_steps", 1024)),
@@ -1609,6 +2000,7 @@ def _init_policy_wandb_run(cfg, default_project):
                 getattr(ppo_cfg, "num_imagined_envs", 1)
             ),
             "max_training_timesteps": int(ppo_cfg.max_training_timesteps),
+            "PPO": resolved_ppo,
         },
     }
     entity = getattr(ppo_cfg, "wandb_entity", None)
@@ -1625,7 +2017,17 @@ def run_training_real_env(cfg):
     has_continuous_action_space = hparams_PPO.has_continuous_action_space
     max_ep_len = int(hparams_PPO.max_ep_len)
     max_training_timesteps = int(hparams_PPO.max_training_timesteps)
-    print_freq = 1000
+    print_freq = int(getattr(hparams_PPO, "console_log_every_steps", 1000))
+    episode_log_every_steps = int(
+        getattr(hparams_PPO, "episode_log_every_steps", print_freq)
+    )
+    wandb_log_every_updates = int(
+        getattr(hparams_PPO, "wandb_log_every_updates", 1)
+    )
+    if print_freq < 1 or episode_log_every_steps < 1:
+        raise ValueError("PPO console/episode log intervals must be at least 1")
+    if wandb_log_every_updates < 1:
+        raise ValueError("PPO.wandb_log_every_updates must be at least 1")
     save_model_freq = int(hparams_PPO.save_model_freq)
     update_timestep = int(getattr(hparams_PPO, "rollout_steps", 1024))
     if update_timestep < 2:
@@ -1635,6 +2037,7 @@ def run_training_real_env(cfg):
     print_running_steps = 0
     print_running_successes = 0
     next_print_timestep = print_freq
+    next_episode_log_timestep = episode_log_every_steps
     rolling_window_episodes = int(
         getattr(hparams_PPO, "rolling_window_episodes", 50)
     )
@@ -1664,6 +2067,10 @@ def run_training_real_env(cfg):
     env_path = hparams_PPO.env_path
     use_wandb = hparams_PPO.use_wandb
     step_penalty = float(getattr(hparams_PPO, "step_penalty", 0.0))
+    use_main_dense_reward = bool(
+        getattr(hparams_PPO, "use_main_dense_reward", False)
+    )
+    main_reward = main_dense_reward_settings(hparams_PPO)
     obs_norm_values = getattr(hparams.attention_model, "obs_norm_values", [10, 5, 3])
     entropy_coef = float(getattr(hparams_PPO, "entropy_coef", 0.01))
     normalize_advantages = bool(getattr(hparams_PPO, "normalize_advantages", True))
@@ -1708,16 +2115,61 @@ def run_training_real_env(cfg):
         normalize_returns=normalize_returns,
         max_grad_norm=max_grad_norm,
         freeze_actor_until_first_reward=freeze_actor_until_first_reward,
+        minibatch_size=int(getattr(hparams_PPO, "minibatch_size", 0)),
     )
 
 
     # training loop
     while time_step < max_training_timesteps:
-
-        state = env.reset()
+        observation, _ = env.reset()
         current_ep_reward = 0
+        current_ep_native_reward = 0.0
+        current_ep_shaping_reward = 0.0
+        current_ep_goal_region_entries = 0
+        current_ep_goal_region_reward = 0.0
+        current_ep_goal_region_key_pickups = 0
+        current_ep_goal_region_key_pickup_reward = 0.0
+        current_ep_goal_region_door_opens = 0
+        current_ep_goal_region_door_open_reward = 0.0
+        current_ep_progress_milestone_count = 0
+        current_ep_progress_milestone_reward = 0.0
+        current_ep_critical_door_crossing_count = 0
+        current_ep_critical_door_crossing_reward = 0.0
+        current_ep_goal_distance_sum = 0.0
+        current_ep_goal_distance_count = 0
+        current_ep_goal_distance_min = float("inf")
+        episode_succeeded = False
+        raw_state = torch.as_tensor(
+            utils.ColRowCanl_to_CanlRowCol(observation["image"]), device=device
+        )
+        goal_yx = find_position(raw_state.detach().cpu().numpy(), (8, 1, 0))
+        if goal_yx is None:
+            raise ValueError("The real MiniGrid layout does not contain a goal")
+        real_goal_distance_map = build_main_goal_distance_map(raw_state, goal_yx)
+        real_goal_region_mask = build_goal_region_mask(raw_state, goal_yx)
+        real_door_topology = build_door_topology(raw_state, goal_yx)
+        real_goal_region_seen = torch.zeros(1, device=device, dtype=torch.bool)
+        real_rewarded_goal_region_key_positions = torch.zeros(
+            (1, *raw_state.shape[-2:]), device=device, dtype=torch.bool
+        )
+        real_rewarded_goal_region_door_positions = torch.zeros_like(
+            real_rewarded_goal_region_key_positions
+        )
+        real_progress_milestone_seen = torch.zeros(
+            1, device=device, dtype=torch.bool
+        )
+        real_pending_door_ids = torch.full((1,), -1, device=device, dtype=torch.long)
+        real_pending_door_origins = torch.full_like(real_pending_door_ids, -1)
+        real_rewarded_door_crossings = torch.zeros(
+            (1, real_door_topology.num_doors), device=device, dtype=torch.bool
+        )
+        real_initial_position = (raw_state[0] == 10).nonzero(as_tuple=False)[0]
+        real_initial_goal_distance = real_goal_distance_map[
+            real_initial_position[0], real_initial_position[1]
+        ].reshape(1)
+        real_best_goal_distance = real_initial_goal_distance.clone()
         state = preprocess_observation(
-            state[0]['image'],
+            observation['image'],
             obs_norm_values,
             inventory_token=carrying_token_from_env(env),
             inventory_classes=INVENTORY_TOKEN_COUNT,
@@ -1727,11 +2179,104 @@ def run_training_real_env(cfg):
 
             # select action with policy
             action, state_buffer, action_buffer, action_logprob, state_val = ppo_agent.select_action(state)
-            state, reward, terminated, truncated, _ = env.step(compact_to_native(action))
-            reward += step_penalty
+            previous_raw_state = raw_state
+            previous_inventory_token = carrying_token_from_env(env)
+            observation, native_reward, terminated, truncated, _ = env.step(
+                compact_to_native(action)
+            )
+            raw_state = torch.as_tensor(
+                utils.ColRowCanl_to_CanlRowCol(observation["image"]), device=device
+            )
+            step_succeeded = bool(terminated and native_reward > 0.0)
+            lava_terminated = bool(terminated and not step_succeeded)
+            episode_succeeded |= step_succeeded
+            current_ep_native_reward += float(native_reward)
+            if use_main_dense_reward:
+                dense_reward, real_goal_region_seen, reward_events = main_dense_rewards(
+                    previous_raw_state.unsqueeze(0),
+                    raw_state.unsqueeze(0),
+                    torch.as_tensor([action], device=device),
+                    real_goal_distance_map,
+                    real_goal_region_mask,
+                    real_goal_region_seen,
+                    torch.as_tensor([step_succeeded], device=device),
+                    torch.as_tensor([lava_terminated], device=device),
+                    best_goal_distances=real_best_goal_distance,
+                    initial_goal_distances=real_initial_goal_distance,
+                    progress_milestone_seen=real_progress_milestone_seen,
+                    previous_carrying_tokens=torch.as_tensor(
+                        [previous_inventory_token], device=device
+                    ),
+                    current_carrying_tokens=torch.as_tensor(
+                        [carrying_token_from_env(env)], device=device
+                    ),
+                    door_topology=real_door_topology,
+                    pending_door_ids=real_pending_door_ids,
+                    pending_door_origins=real_pending_door_origins,
+                    rewarded_door_crossings=real_rewarded_door_crossings,
+                    rewarded_goal_region_key_positions=real_rewarded_goal_region_key_positions,
+                    rewarded_goal_region_door_positions=real_rewarded_goal_region_door_positions,
+                    **main_reward,
+                )
+                real_best_goal_distance = reward_events["new_best_goal_distance"]
+                real_progress_milestone_seen = reward_events[
+                    "progress_milestone_seen"
+                ]
+                real_pending_door_ids = reward_events["pending_door_ids"]
+                real_pending_door_origins = reward_events["pending_door_origins"]
+                real_rewarded_door_crossings = reward_events["rewarded_door_crossings"]
+                real_rewarded_goal_region_key_positions = reward_events[
+                    "rewarded_goal_region_key_positions"
+                ]
+                real_rewarded_goal_region_door_positions = reward_events[
+                    "rewarded_goal_region_door_positions"
+                ]
+                reward = float(dense_reward.item())
+                current_ep_shaping_reward += (
+                    0.0 if step_succeeded or lava_terminated else reward
+                )
+                current_ep_goal_region_entries += int(
+                    reward_events["goal_region_entered"].item()
+                )
+                current_ep_goal_region_reward += float(
+                    reward_events["goal_region_reward"].item()
+                )
+                current_ep_goal_region_key_pickups += int(
+                    reward_events["goal_region_key_picked_up"].item()
+                )
+                current_ep_goal_region_key_pickup_reward += float(
+                    reward_events["goal_region_key_pickup_reward"].item()
+                )
+                current_ep_goal_region_door_opens += int(
+                    reward_events["goal_region_door_opened"].item()
+                )
+                current_ep_goal_region_door_open_reward += float(
+                    reward_events["goal_region_door_open_reward"].item()
+                )
+                current_ep_progress_milestone_count += int(
+                    reward_events["progress_milestone_crossed"].item()
+                )
+                current_ep_progress_milestone_reward += float(
+                    reward_events["progress_milestone_reward"].item()
+                )
+                current_ep_critical_door_crossing_count += int(
+                    reward_events["critical_door_crossed"].item()
+                )
+                current_ep_critical_door_crossing_reward += float(
+                    reward_events["critical_door_crossing_reward"].item()
+                )
+                current_distance = float(reward_events["current_distance"].item())
+                if np.isfinite(current_distance):
+                    current_ep_goal_distance_sum += current_distance
+                    current_ep_goal_distance_count += 1
+                    current_ep_goal_distance_min = min(
+                        current_ep_goal_distance_min, current_distance
+                    )
+            else:
+                reward = float(native_reward) + step_penalty
             done = terminated or truncated
             state = preprocess_observation(
-                state['image'],
+                observation['image'],
                 obs_norm_values,
                 inventory_token=carrying_token_from_env(env),
                 inventory_classes=INVENTORY_TOKEN_COUNT,
@@ -1749,9 +2294,26 @@ def run_training_real_env(cfg):
                 if len(ppo_agent.buffer.rewards) > 1:
                     bootstrap_value = 0.0 if done else ppo_agent.estimate_old_value(state)
                     update_metrics = ppo_agent.update(bootstrap_value=bootstrap_value)
-                    if use_wandb and update_metrics.get("updated", False):
+                    if (
+                        use_wandb
+                        and update_metrics.get("updated", False)
+                        and int(update_metrics["update_count"]) % wandb_log_every_updates == 0
+                    ):
                         subrun.log(
                             {
+                                "time_step": int(time_step),
+                                "update": int(update_metrics["update_count"]),
+                                "loss": update_metrics["loss"],
+                                "grad_norm": update_metrics["grad_norm"],
+                                "actor_delta": update_metrics.get(
+                                    "actor_parameter_delta", 0.0
+                                ),
+                                "critic_delta": update_metrics.get(
+                                    "critic_parameter_delta", 0.0
+                                ),
+                                "actor_loss": update_metrics.get("actor_loss", 0.0),
+                                "critic_loss": update_metrics.get("critic_loss", 0.0),
+                                "entropy": update_metrics.get("entropy", 0.0),
                                 "ppo/loss": update_metrics["loss"],
                                 "ppo/grad_norm": update_metrics["grad_norm"],
                                 "ppo/parameter_delta": update_metrics["parameter_delta"],
@@ -1780,29 +2342,68 @@ def run_training_real_env(cfg):
         print_running_reward += current_ep_reward
         print_running_episodes += 1
         print_running_steps += t
-        print_running_successes += int(current_ep_reward > 0.0)
+        reported_success = (
+            episode_succeeded if use_main_dense_reward else current_ep_reward > 0.0
+        )
+        print_running_successes += int(reported_success)
         recent_rewards.append(float(current_ep_reward))
         recent_steps.append(int(t))
-        recent_successes.append(int(current_ep_reward > 0.0))
+        recent_successes.append(int(reported_success))
 
         rolling_avg_reward = sum(recent_rewards) / len(recent_rewards)
         rolling_avg_steps = sum(recent_steps) / len(recent_steps)
         rolling_success_rate = sum(recent_successes) / len(recent_successes)
 
-        if use_wandb:
+        if (
+            use_wandb
+            and (
+                time_step >= next_episode_log_timestep
+                or time_step >= max_training_timesteps
+            )
+        ):
             subrun.log(
                 {
                     "episode/reward": current_ep_reward,
-                    "episode/success": int(current_ep_reward > 0.0),
+                    "episode/native_reward": current_ep_native_reward,
+                    "episode/shaping_reward": current_ep_shaping_reward,
+                    "episode/success": int(reported_success),
                     "episode/steps": t,
                     "episode/index": i_episode,
                     "rolling/average_reward": rolling_avg_reward,
                     "rolling/success_rate": rolling_success_rate,
                     "rolling/average_episode_steps": rolling_avg_steps,
                     "rolling/window_episode_count": len(recent_rewards),
+                    "train/reward_per_step": current_ep_reward / max(t, 1),
+                    "goal_region_entry_count": current_ep_goal_region_entries,
+                    "goal_region_reward_sum": current_ep_goal_region_reward,
+                    "goal_region_key_pickup_count": current_ep_goal_region_key_pickups,
+                    "goal_region_key_pickup_reward_sum": current_ep_goal_region_key_pickup_reward,
+                    "goal_region_door_open_count": current_ep_goal_region_door_opens,
+                    "goal_region_door_open_reward_sum": current_ep_goal_region_door_open_reward,
+                    "progress_milestone_count": current_ep_progress_milestone_count,
+                    "progress_milestone_reward_sum": current_ep_progress_milestone_reward,
+                    "critical_door_crossing_count": current_ep_critical_door_crossing_count,
+                    "critical_door_crossing_reward_sum": current_ep_critical_door_crossing_reward,
+                    "goal_dist_mean": current_ep_goal_distance_sum
+                    / max(current_ep_goal_distance_count, 1),
+                    "goal_dist_min": current_ep_goal_distance_min
+                    if np.isfinite(current_ep_goal_distance_min)
+                    else None,
+                    "train/goal_dist_mean": current_ep_goal_distance_sum
+                    / max(current_ep_goal_distance_count, 1),
+                    "train/goal_dist_min": current_ep_goal_distance_min
+                    if np.isfinite(current_ep_goal_distance_min)
+                    else None,
+                    "train/episode_return_mean": rolling_avg_reward,
+                    "train/episode_length_mean": rolling_avg_steps,
+                    "train/episode_success_rate": rolling_success_rate,
+                    "train/rolling_success_rate": rolling_success_rate,
+                    "train/episodes_completed": i_episode + 1,
                 },
                 step=time_step,
             )
+            while next_episode_log_timestep <= time_step:
+                next_episode_log_timestep += episode_log_every_steps
 
         if time_step >= next_print_timestep and print_running_episodes > 0:
             print_avg_reward = print_running_reward / print_running_episodes
@@ -1830,9 +2431,26 @@ def run_training_real_env(cfg):
     if len(ppo_agent.buffer.rewards) >= 2:
         bootstrap_value = 0.0 if done else ppo_agent.estimate_old_value(state)
         update_metrics = ppo_agent.update(bootstrap_value=bootstrap_value)
-        if use_wandb and update_metrics.get("updated", False):
+        if (
+            use_wandb
+            and update_metrics.get("updated", False)
+            and int(update_metrics["update_count"]) % wandb_log_every_updates == 0
+        ):
             subrun.log(
                 {
+                    "time_step": int(time_step),
+                    "update": int(update_metrics["update_count"]),
+                    "loss": update_metrics["loss"],
+                    "grad_norm": update_metrics["grad_norm"],
+                    "actor_delta": update_metrics.get(
+                        "actor_parameter_delta", 0.0
+                    ),
+                    "critic_delta": update_metrics.get(
+                        "critic_parameter_delta", 0.0
+                    ),
+                    "actor_loss": update_metrics.get("actor_loss", 0.0),
+                    "critic_loss": update_metrics.get("critic_loss", 0.0),
+                    "entropy": update_metrics.get("entropy", 0.0),
                     "ppo/loss": update_metrics["loss"],
                     "ppo/grad_norm": update_metrics["grad_norm"],
                     "ppo/parameter_delta": update_metrics["parameter_delta"],
@@ -1854,43 +2472,11 @@ def run_training_real_env(cfg):
 
 
 def run_policy_evaluation(cfg: DictConfig):
-    hparams = cfg
-    # 1. World Model
-    hparams_world_model = hparams.attention_model
-    # 2. PPO
-    # hyperparameters
-    # compute regret
-    hparams_PPO = hparams.PPO
+    # Keep one authoritative MiniGrid evaluation path so direct callers and
+    # run_pipeline use the same dense/native reward and goal-region metrics.
+    from modelBased.policy_training.PPO_world_test import validate_policy
 
-    lr_actor = hparams_PPO.lr_actor
-    lr_critic = hparams_PPO.lr_critic
-    gamma = hparams_PPO.gamma
-    K_epochs = hparams_PPO.K_epochs
-    eps_clip = hparams_PPO.eps_clip
-    action_std = hparams_PPO.action_std
-    has_continuous_action_space = hparams_PPO.has_continuous_action_space
-    checkpoint_path = str(policy_checkpoint_path(cfg))
-    env_path = hparams_PPO.env_path
-    env_type =  hparams_PPO.env_type
-    episodes = hparams_PPO.get("episodes_eval")
-
-    # 3. Real environment
-    env = FullyObsWrapper(
-        CustomMiniGridEnv(txt_file_path=env_path, custom_mission="Find the key and open the door.",
-                        max_steps=4000, render_mode=None))
- 
-    # action space dimension
-    if has_continuous_action_space:
-        action_dim = int(np.prod(env.action_space.shape))
-    else:
-        action_dim = MODEL_ACTION_COUNT
-    state_dim = np.prod(env.observation_space['image'].shape) + INVENTORY_TOKEN_COUNT
-
-    policy_agent = PPO(state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip,
-                    has_continuous_action_space, action_std)
-    policy_agent.load(checkpoint_path)
-    Reward = evaluate_policy(policy_agent, env, episodes, hparams_world_model.obs_norm_values)
-    return Reward
+    return validate_policy(cfg)
 
 @hydra.main(version_base=None, config_path=str(SCRIPT_ROOT / "modelBased/config"), config_name="config")
 def main(cfg: DictConfig):

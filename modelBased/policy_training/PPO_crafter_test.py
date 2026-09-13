@@ -99,6 +99,7 @@ def validate_crafter_policy(cfg: DictConfig) -> float:
         ppo_cfg.eps_clip,
         ppo_cfg.has_continuous_action_space,
         ppo_cfg.action_std,
+        minibatch_size=int(getattr(ppo_cfg, "minibatch_size", 0)),
     )
     print(f"Loading policy: {checkpoint_path}")
     print(f"Training source: {training_source}")

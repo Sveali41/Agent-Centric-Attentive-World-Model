@@ -30,6 +30,9 @@ def rollout_minigrid_wm(
     actions: torch.Tensor,
     inventory_tokens: torch.Tensor,
     attention_mask_size: int,
+    *,
+    agent_positions: torch.Tensor | None = None,
+    collect_diagnostics: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     """Advance a batch of full MiniGrid states using only the learned WM.
 
@@ -47,7 +50,12 @@ def rollout_minigrid_wm(
     if len(actions) != batch_size or len(inventory_tokens) != batch_size:
         raise ValueError("actions and inventory_tokens must have one value per state")
 
-    agent_positions = utils.get_agent_position_torch(states)
+    if agent_positions is None:
+        agent_positions = utils.get_agent_position_torch(states)
+    else:
+        agent_positions = torch.as_tensor(
+            agent_positions, device=states.device, dtype=torch.long
+        ).reshape(batch_size, 2)
     masked = utils.extract_masked_state_torch(
         states, int(attention_mask_size), agent_positions
     )
@@ -59,12 +67,20 @@ def rollout_minigrid_wm(
         inventory_tokens,
         mode=getattr(model, "minigrid_transition_mode", "effect"),
         constrain_agent=True,
+        collect_diagnostics=collect_diagnostics,
     )
     if next_inventory is None:
         raise RuntimeError("MiniGrid WM planning requires inventory logits")
     next_states = utils.put_back_masked_state_torch(
         next_masked, states, int(attention_mask_size), agent_positions
     )
+
+    # PPO only consumes decoded state and inventory.  Entropy and the second
+    # full-grid agent search are planner/diagnostic outputs, so avoid them in
+    # its tight rollout loop while keeping the historical default for other
+    # consumers.
+    if not collect_diagnostics:
+        return next_states, next_inventory.long(), {}
 
     contract = minigrid_contract(getattr(model, "minigrid_transition_mode", "effect"))
     spatial_entropy = []

@@ -191,16 +191,20 @@ def _decode_object_with_single_agent(
     logits: torch.Tensor,
     current: torch.Tensor,
     constrain_agent: bool,
+    collect_diagnostics: bool = True,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     probs = _next_class_probabilities(logits, current, 11)
-    decoded = probs.argmax(dim=1)
-    raw_counts = (decoded == 10).flatten(1).sum(dim=1)
     if not constrain_agent:
+        decoded = probs.argmax(dim=1)
+        if not collect_diagnostics:
+            return decoded, {}
+        raw_counts = (decoded == 10).flatten(1).sum(dim=1)
         return decoded, {
             "raw_agent_count": raw_counts,
             "agent_correction": torch.zeros_like(raw_counts, dtype=torch.bool),
         }
 
+    decoded = probs.argmax(dim=1) if collect_diagnostics else None
     flat = probs.flatten(2)
     agent_score = flat[:, 10]
     nonagent = flat.clone()
@@ -214,7 +218,10 @@ def _decode_object_with_single_agent(
     chosen = choice_score.argmax(dim=1)
     decoded_flat = nonagent.argmax(dim=1)
     decoded_flat.scatter_(1, chosen.unsqueeze(1), torch.full_like(chosen.unsqueeze(1), 10))
-    constrained = decoded_flat.reshape_as(decoded)
+    constrained = decoded_flat.reshape_as(current)
+    if not collect_diagnostics:
+        return constrained, {}
+    raw_counts = (decoded == 10).flatten(1).sum(dim=1)
     return constrained, {
         "raw_agent_count": raw_counts,
         "agent_correction": constrained.ne(decoded).flatten(1).any(dim=1),
@@ -225,10 +232,10 @@ def _decode_object_with_single_agent(
 def _constrain_absolute_object(
     logits: torch.Tensor,
     decoded: torch.Tensor,
+    collect_diagnostics: bool = True,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Project absolute object probabilities onto the one-agent invariant."""
     probs = logits.softmax(dim=1)
-    raw_counts = (decoded == 10).flatten(1).sum(dim=1)
     flat = probs.flatten(2)
     agent_prob = flat[:, 10]
     nonagent = flat.clone()
@@ -241,6 +248,9 @@ def _constrain_absolute_object(
     decoded_flat = nonagent.argmax(dim=1)
     decoded_flat.scatter_(1, chosen.unsqueeze(1), torch.full_like(chosen.unsqueeze(1), 10))
     constrained = decoded_flat.reshape_as(decoded)
+    if not collect_diagnostics:
+        return constrained, {}
+    raw_counts = (decoded == 10).flatten(1).sum(dim=1)
     return constrained, {
         "raw_agent_count": raw_counts,
         "agent_correction": constrained.ne(decoded).flatten(1).any(dim=1),
@@ -255,6 +265,7 @@ def decode_minigrid_transition(
     current_inventory: torch.Tensor | None,
     mode: str = "effect",
     constrain_agent: bool = True,
+    collect_diagnostics: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, torch.Tensor]]:
     """Decode a MiniGrid model output into absolute next state values."""
     contract = minigrid_contract(mode)
@@ -274,18 +285,26 @@ def decode_minigrid_transition(
         current = current_state[:, target_index].long()
         if contract.mode == "effect":
             if name == "object":
-                decoded, object_diag = _decode_object_with_single_agent(logits, current, constrain_agent)
-                diagnostics.update(object_diag)
+                decoded, object_diag = _decode_object_with_single_agent(
+                    logits, current, constrain_agent, collect_diagnostics
+                )
+                if collect_diagnostics:
+                    diagnostics.update(object_diag)
             else:
                 decoded = _next_class_probabilities(logits, current, classes).argmax(dim=1)
         else:
             decoded = logits.argmax(dim=1)
             if name == "object":
-                raw_counts = (decoded == 10).flatten(1).sum(dim=1)
-                diagnostics["raw_agent_count"] = raw_counts
+                if collect_diagnostics:
+                    diagnostics["raw_agent_count"] = (
+                        (decoded == 10).flatten(1).sum(dim=1)
+                    )
                 if constrain_agent:
-                    decoded, object_diag = _constrain_absolute_object(logits, decoded)
-                    diagnostics.update(object_diag)
+                    decoded, object_diag = _constrain_absolute_object(
+                        logits, decoded, collect_diagnostics
+                    )
+                    if collect_diagnostics:
+                        diagnostics.update(object_diag)
         decoded_fields.append(decoded)
 
     next_state = torch.stack(decoded_fields, dim=1).to(dtype=current_state.dtype)

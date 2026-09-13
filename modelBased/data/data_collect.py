@@ -41,7 +41,7 @@ except Exception as e:
     TERRAIN_GRASS = TERRAIN_LENGTH = TERRAIN_STARTPAD = TERRAIN_STEP = None
     _BIPEDAL_IMPORT_ERROR = e
 import hydra
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 import time
 from tqdm import tqdm
 import torch
@@ -772,6 +772,8 @@ def run_env(
         while episodes < target_episodes or (mini_dataset_size > 0 and len(obs_list) < mini_dataset_size):
             step_in_episode += 1
             current_carrying_token = _minigrid_carrying_token()
+            if is_minigrid and policy is not None and hasattr(policy, "set_carrying_token"):
+                policy.set_carrying_token(current_carrying_token)
 
             # --- 1. CORE RANDOMIZATION (Every Step in Uniform Mode) ---
             if randomize_inventory and is_crafter:
@@ -868,6 +870,11 @@ def run_env(
             )
             obs_next, reward, done, trunc, info = env.step(env_action)
             env_reward_for_metrics = float(reward)
+            next_carrying_token = _minigrid_carrying_token() if is_minigrid else 0
+            if is_minigrid and policy is not None and hasattr(
+                policy, "set_next_carrying_token"
+            ):
+                policy.set_next_carrying_token(next_carrying_token)
 
             # --- BipedalWalker Odometry Update ---
             if is_bipedal:
@@ -890,6 +897,8 @@ def run_env(
                     policy.record_transition(
                         float(intrinsic_reward),
                         bool(done or trunc),
+                        terminated=bool(done),
+                        truncated=bool(trunc),
                         env_reward=env_reward_for_metrics,
                         obs=obs_image,
                         obs_next=obs_next_image,
@@ -945,7 +954,6 @@ def run_env(
             info["uniform_reset"] = bool(periodic_uniform_reset)
 
             if is_minigrid:
-                next_carrying_token = _minigrid_carrying_token()
                 # Store both sides on the record belonging to this exact
                 # transition. Do not mutate a previous record or use a reset
                 # placeholder: terminal transitions also need their true
@@ -1063,6 +1071,9 @@ def run_env(
                 reset_kwargs = _maybe_add_bipedal_spawn(reset_kwargs)
 
                 obs = env.reset(**reset_kwargs)[0]
+
+                if policy is not None and hasattr(policy, "reset_episode"):
+                    policy.reset_episode()
                 
                 # Reset heuristic internal state on done
                 if is_bipedal and policy is None:
@@ -1101,7 +1112,7 @@ def run_env(
     obs_next_np = np.concatenate(obs_next_list)
     act_np = np.concatenate(act_list)
     # Only for MiniGrid convention.
-    if is_minigrid:
+    if is_minigrid and policy is None:
         act_np = native_to_compact(act_np)
     rew_np = np.concatenate(rew_list)
     done_np = np.concatenate(done_list)
@@ -1672,6 +1683,218 @@ def downsample_moves_only(
     return obs_out, obsn_out, act_out, rew_out, done_out, info_out
 
 
+MINIGRID_INTERACTION_TYPES = (
+    "key_pickup",
+    "key_drop",
+    "normal_door",
+    "locked_success",
+    "locked_wrong_key",
+    "locked_no_key",
+)
+
+
+def _minigrid_wrapped_observation(env):
+    """Return the current state through the same observation wrapper as step()."""
+    observation = env.unwrapped.gen_obs()
+    if hasattr(env, "observation"):
+        observation = env.observation(observation)
+    return observation
+
+
+def _minigrid_facing_setups(base_env, target_x, target_y):
+    """Find empty adjacent cells from which the agent faces a target cell."""
+    direction_vectors = ((1, 0), (0, 1), (-1, 0), (0, -1))
+    setups = []
+    for direction, (dx, dy) in enumerate(direction_vectors):
+        agent_x, agent_y = target_x - dx, target_y - dy
+        if not (0 <= agent_x < base_env.width and 0 <= agent_y < base_env.height):
+            continue
+        if base_env.grid.get(agent_x, agent_y) is None:
+            setups.append((target_x, target_y, agent_x, agent_y, direction))
+    return setups
+
+
+def _minigrid_interaction_catalog(env):
+    """Enumerate real key/door/drop interactions supported by this layout."""
+    env.reset()
+    base_env = env.unwrapped
+    catalog = {name: [] for name in MINIGRID_INTERACTION_TYPES}
+    key_colors = []
+
+    for x in range(base_env.width):
+        for y in range(base_env.height):
+            obj = base_env.grid.get(x, y)
+            setups = _minigrid_facing_setups(base_env, x, y)
+            if isinstance(obj, Key):
+                key_colors.append(obj.color)
+                catalog["key_pickup"].extend((setup, obj.color) for setup in setups)
+            elif isinstance(obj, Door):
+                interaction = "locked_success" if obj.is_locked else "normal_door"
+                catalog[interaction].extend((setup, obj.color) for setup in setups)
+                if obj.is_locked:
+                    catalog["locked_wrong_key"].extend((setup, obj.color) for setup in setups)
+                    catalog["locked_no_key"].extend((setup, obj.color) for setup in setups)
+
+    # A drop requires both the destination and the cell behind it to be empty.
+    drop_colors = tuple(dict.fromkeys(key_colors)) or ("yellow", "red", "green", "blue")
+    for x in range(base_env.width):
+        for y in range(base_env.height):
+            if base_env.grid.get(x, y) is not None:
+                continue
+            for setup in _minigrid_facing_setups(base_env, x, y):
+                catalog["key_drop"].extend((setup, color) for color in drop_colors)
+
+    return catalog
+
+
+def collect_minigrid_interaction_transitions(env, cfg, sample_count):
+    """Collect stratified key/door transitions through real MiniGrid steps."""
+    sample_count = int(sample_count)
+    if sample_count <= 0:
+        raise ValueError("MiniGrid interaction sample_count must be positive")
+
+    catalog = _minigrid_interaction_catalog(env)
+    available = [name for name in MINIGRID_INTERACTION_TYPES if catalog[name]]
+    if not available:
+        raise ValueError(
+            "MiniGrid interaction collection found no reachable key, door, or drop setup"
+        )
+
+    missing = [name for name in MINIGRID_INTERACTION_TYPES if not catalog[name]]
+    if missing:
+        print(
+            "[MiniGrid Interaction] Layout does not support: "
+            + ", ".join(missing)
+            + "; redistributing their samples across available interactions."
+        )
+
+    layout_path = str(getattr(cfg.env, "env_path", ""))
+    seed = int(getattr(cfg, "seed", 0)) + sum(layout_path.encode("utf-8"))
+    rng = np.random.default_rng(seed)
+    interaction_types = np.resize(np.asarray(available, dtype="<U32"), sample_count)
+    rng.shuffle(interaction_types)
+
+    obs_list, obs_next_list = [], []
+    act_list, rew_list, done_list, info_list = [], [], [], []
+    layout_key_colors = tuple(
+        dict.fromkeys(color for _, color in catalog["key_pickup"])
+    )
+    canonical_key_colors = ("yellow", "red", "green", "blue")
+    scenario_counts = {name: 0 for name in available}
+    entries_by_color = {
+        name: {
+            color: [entry for entry in catalog[name] if entry[1] == color]
+            for color in dict.fromkeys(entry[1] for entry in catalog[name])
+        }
+        for name in available
+    }
+
+    for interaction_type in interaction_types.tolist():
+        env.reset()
+        base_env = env.unwrapped
+        color_entries = entries_by_color[interaction_type]
+        colors = tuple(color_entries)
+        object_color = colors[scenario_counts[interaction_type] % len(colors)]
+        scenario_counts[interaction_type] += 1
+        entries = color_entries[object_color]
+        setup, object_color = entries[int(rng.integers(len(entries)))]
+        target_x, target_y, agent_x, agent_y, direction = setup
+        base_env.agent_pos = np.asarray((agent_x, agent_y), dtype=np.int64)
+        base_env.agent_dir = int(direction)
+        base_env.carrying = None
+
+        if interaction_type == "key_drop":
+            base_env.carrying = Key(object_color)
+            native_action = base_env.actions.drop
+        elif interaction_type == "locked_success":
+            base_env.carrying = Key(object_color)
+            native_action = base_env.actions.toggle
+        elif interaction_type == "locked_wrong_key":
+            wrong_colors = [color for color in layout_key_colors if color != object_color]
+            if not wrong_colors:
+                wrong_colors = [color for color in canonical_key_colors if color != object_color]
+            base_env.carrying = Key(wrong_colors[int(rng.integers(len(wrong_colors)))])
+            native_action = base_env.actions.toggle
+        elif interaction_type in ("normal_door", "locked_no_key"):
+            native_action = base_env.actions.toggle
+        else:
+            native_action = base_env.actions.pickup
+
+        current_token = carrying_token_from_env(env)
+        obs = _minigrid_wrapped_observation(env)
+        obs_next, reward, terminated, truncated, info = env.step(native_action)
+        next_token = carrying_token_from_env(env)
+
+        target_obj = base_env.grid.get(target_x, target_y)
+        valid = True
+        if interaction_type == "key_pickup":
+            valid = isinstance(base_env.carrying, Key) and target_obj is None
+        elif interaction_type == "key_drop":
+            valid = base_env.carrying is None and isinstance(target_obj, Key)
+        elif interaction_type == "normal_door":
+            valid = isinstance(target_obj, Door) and target_obj.is_open and not target_obj.is_locked
+        elif interaction_type == "locked_success":
+            valid = isinstance(target_obj, Door) and target_obj.is_open and not target_obj.is_locked
+        elif interaction_type in ("locked_wrong_key", "locked_no_key"):
+            valid = isinstance(target_obj, Door) and target_obj.is_locked and not target_obj.is_open
+        if not valid:
+            raise RuntimeError(
+                f"MiniGrid interaction {interaction_type!r} did not produce its expected state"
+            )
+
+        info = dict(info) if isinstance(info, dict) else {}
+        info.update(
+            interaction_type=interaction_type,
+            interaction_reset=True,
+            uniform_reset=True,
+            current_carrying_key=current_token > 0,
+            current_carrying_token=current_token,
+            carrying_key=next_token > 0,
+            carrying_token=next_token,
+            next_carrying_key=next_token > 0,
+            next_carrying_token=next_token,
+        )
+        obs_list.append(obs["image"].copy())
+        obs_next_list.append(obs_next["image"].copy())
+        act_list.append(int(native_action))
+        rew_list.append(float(reward))
+        # Each targeted sample starts from a newly staged state, so it is a
+        # sequence boundary even when the underlying task did not terminate.
+        done_list.append(True)
+        info_list.append(info)
+
+    actions = native_to_compact(np.asarray(act_list, dtype=np.int64))
+    print(
+        f"[MiniGrid Interaction] Collected {sample_count} transitions across "
+        f"{len(available)} types: "
+        + ", ".join(
+            f"{name}={int(np.sum(interaction_types == name))}" for name in available
+        )
+    )
+    return (
+        np.asarray(obs_list),
+        np.asarray(obs_next_list),
+        actions,
+        np.asarray(rew_list),
+        np.asarray(done_list),
+        np.asarray(info_list, dtype=object),
+        interaction_types,
+    )
+
+
+def _mix_minigrid_uniform_transitions(spatial, interactions, interaction_types, rng):
+    """Combine spatial and targeted samples while preserving row alignment."""
+    combined = [np.concatenate((left, right), axis=0) for left, right in zip(spatial, interactions)]
+    labels = np.concatenate(
+        (
+            np.full(len(spatial[0]), "spatial", dtype="<U32"),
+            np.asarray(interaction_types, dtype="<U32"),
+        )
+    )
+    order = rng.permutation(len(labels))
+    return tuple(array[order] for array in combined), labels[order]
+
+
 
 @hydra.main(version_base=None, config_path = str(WORLD_MODEL_PATH / "config"), config_name="config")
 def data_collect(cfg: DictConfig):
@@ -1732,10 +1955,76 @@ def data_collect(cfg: DictConfig):
     randomize = (data_type == "uniform" and env_type == "crafter")
     log_name = getattr(collect_cfg, "visualize_filename", "train.png").split('.')[0]
 
-    obs, obs_next, act, rew, done, info, inv, inv_next = run_env(
-        env, cfg, log_name=log_name, wandb_run=None, save_img=False, randomize_inventory=randomize
+    interaction_fraction = float(
+        getattr(collect_cfg, "minigrid_interaction_fraction", 0.0)
     )
-    save_experiments(cfg, obs, obs_next, act, rew, done, info, inv=inv, inv_next=inv_next)
+    use_interaction_mix = (
+        env_type == "minigrid" and data_type == "uniform" and interaction_fraction > 0
+    )
+    extra_arrays = None
+    if use_interaction_mix:
+        if not 0.0 < interaction_fraction <= 1.0:
+            raise ValueError("minigrid_interaction_fraction must be in (0, 1]")
+        total_samples = getattr(collect_cfg, "maximum_dataset_size", None)
+        if total_samples is None:
+            total_samples = getattr(collect_cfg, "mini_dataset_size", None)
+        if total_samples is None or int(total_samples) <= 1:
+            raise ValueError(
+                "Mixed MiniGrid uniform collection requires a dataset size greater than 1"
+            )
+        total_samples = int(total_samples)
+        interaction_samples = max(1, int(round(total_samples * interaction_fraction)))
+        spatial_samples = total_samples - interaction_samples
+
+        interaction_data = collect_minigrid_interaction_transitions(
+            env, cfg, interaction_samples
+        )
+        if spatial_samples > 0:
+            spatial_cfg = copy.deepcopy(cfg)
+            with open_dict(spatial_cfg):
+                spatial_cfg.env.collect.maximum_dataset_size = spatial_samples
+                spatial_cfg.env.collect.mini_dataset_size = spatial_samples
+            obs, obs_next, act, rew, done, info, inv, inv_next = run_env(
+                env,
+                spatial_cfg,
+                log_name=log_name,
+                wandb_run=None,
+                save_img=False,
+                randomize_inventory=False,
+            )
+            mixed, labels = _mix_minigrid_uniform_transitions(
+                (obs, obs_next, act, rew, done, info),
+                interaction_data[:6],
+                interaction_data[6],
+                np.random.default_rng(int(getattr(cfg, "seed", 0))),
+            )
+            obs, obs_next, act, rew, done, info = mixed
+        else:
+            obs, obs_next, act, rew, done, info = interaction_data[:6]
+            labels = interaction_data[6]
+            inv, inv_next = None, None
+        extra_arrays = {"interaction_type": labels}
+        print(
+            f"[MiniGrid Uniform Mix] spatial={spatial_samples}, "
+            f"interaction={interaction_samples} ({interaction_fraction:.1%})"
+        )
+    else:
+        obs, obs_next, act, rew, done, info, inv, inv_next = run_env(
+            env, cfg, log_name=log_name, wandb_run=None, save_img=False,
+            randomize_inventory=randomize
+        )
+    save_experiments(
+        cfg,
+        obs,
+        obs_next,
+        act,
+        rew,
+        done,
+        info,
+        inv=inv,
+        inv_next=inv_next,
+        extra_arrays=extra_arrays,
+    )
 
     save_dataset_coverage(cfg)
 
@@ -1773,6 +2062,41 @@ def data_collect_api(
         print(f"[Single-run mode] Collecting {hparam.env.collect.episodes} episodes...")
 
         collect_cfg = cfg.env.collect if hasattr(cfg.env, "collect") else cfg.env
+        extra_arrays = None
+        interaction_data = None
+        is_minigrid_rmax = (
+            str(hparam.env.env_type).lower() == "minigrid"
+            and str(collect_cfg.data_type).lower() == "rmax"
+            and policy is not None
+        )
+        if is_minigrid_rmax:
+            interaction_fraction = float(
+                getattr(collect_cfg, "minigrid_interaction_fraction", 0.0)
+            )
+            if not 0.0 <= interaction_fraction < 1.0:
+                raise ValueError(
+                    "MiniGrid RMax interaction fraction must be in [0, 1)"
+                )
+            if interaction_fraction > 0.0:
+                total_samples = getattr(
+                    collect_cfg, "maximum_dataset_size", None
+                )
+                if total_samples is None or int(total_samples) <= 1:
+                    raise ValueError(
+                        "MiniGrid RMax interaction mix requires a dataset size greater than 1"
+                    )
+                total_samples = int(total_samples)
+                interaction_samples = min(
+                    total_samples - 1,
+                    max(1, int(round(total_samples * interaction_fraction))),
+                )
+                rmax_samples = total_samples - interaction_samples
+                interaction_data = collect_minigrid_interaction_transitions(
+                    env, hparam, interaction_samples
+                )
+                hparam.env.collect.maximum_dataset_size = rmax_samples
+                hparam.env.collect.mini_dataset_size = rmax_samples
+
         if collect_cfg.data_type.lower() == 'uniform':
             if str(hparam.env.env_type).lower() == 'crafter':
                 obs, obs_next, act, rew, done, info, inv, inv_next = run_env(
@@ -1792,6 +2116,20 @@ def data_collect_api(
                 env, hparam, wandb_run, log_name, save_img=save_img,
                 policy=policy, intrinsic_reward_fn=intrinsic_reward_fn,
                 store_intrinsic_reward=store_intrinsic_reward,
+            )
+
+        if interaction_data is not None:
+            mixed, labels = _mix_minigrid_uniform_transitions(
+                (obs, obs_next, act, rew, done, info),
+                interaction_data[:6],
+                interaction_data[6],
+                np.random.default_rng(int(getattr(cfg, "seed", 0))),
+            )
+            obs, obs_next, act, rew, done, info = mixed
+            extra_arrays = {"interaction_type": labels}
+            print(
+                f"[MiniGrid RMax Mix] rmax={len(obs) - len(interaction_data[0])}, "
+                f"interaction={len(interaction_data[0])}"
             )
 
         # store results
@@ -1819,6 +2157,7 @@ def data_collect_api(
             inv_all,
             invn_all,
             layout_source=runtime_bipedal_layout_source,
+            extra_arrays=extra_arrays,
         )
     
 
@@ -1901,6 +2240,7 @@ def _finalize_and_save(
     inv_all=None,
     invn_all=None,
     layout_source=None,
+    extra_arrays=None,
 ):
 
     # merge
@@ -1922,7 +2262,18 @@ def _finalize_and_save(
 
     print(f"Final data shape: {obs_all.shape}")
 
-    save_experiments(cfg, obs_all, obsn_all, act_all, rew_all, done_all, info_all, inv=inv_final, inv_next=invn_final)
+    save_experiments(
+        cfg,
+        obs_all,
+        obsn_all,
+        act_all,
+        rew_all,
+        done_all,
+        info_all,
+        inv=inv_final,
+        inv_next=invn_final,
+        extra_arrays=extra_arrays,
+    )
 
     layout_source = layout_source or (
         _resolve_runtime_bipedal_layout_source(cfg, env)
@@ -1936,7 +2287,15 @@ def _finalize_and_save(
 
 
 
-def visualize_agent_coverage(data, save_path=None, title="Agent Position Coverage"):
+def visualize_agent_coverage(
+    data,
+    save_path=None,
+    title="Agent Position Coverage",
+    *,
+    annotate_counts=True,
+    crop_outer_wall=False,
+    transition_count=None,
+):
     """
     Visualize agent-position coverage as a heatmap over the dataset.
     - Automatically extracts agent coordinates with `get_agent_position()`
@@ -2054,10 +2413,50 @@ def visualize_agent_coverage(data, save_path=None, title="Agent Position Coverag
         plt.tight_layout(rect=(0, 0, 1, 0.95))
     else:
         fig, ax = plt.subplots(figsize=(6,6))
-        im = ax.imshow(heatmap, cmap="viridis", origin="upper")
-        ax.set_title(title)
+        plot_heatmap = heatmap
+        coordinate_offset = 0
+        if crop_outer_wall:
+            if Height <= 2 or Width <= 2:
+                raise ValueError(
+                    "Cannot crop the outer wall from a coverage map smaller than 3x3"
+                )
+            plot_heatmap = heatmap[1:-1, 1:-1]
+            coordinate_offset = 1
+        plot_height, plot_width = plot_heatmap.shape
+        im = ax.imshow(plot_heatmap, cmap="viridis", origin="upper")
+        visited_cells = int(np.count_nonzero(heatmap))
+        plotted_transitions = (
+            len(positions) if transition_count is None else int(transition_count)
+        )
+        ax.set_title(
+            f"{title}\nvisited cells={visited_cells}, transitions={plotted_transitions}"
+        )
         ax.set_xlabel("X axis")
         ax.set_ylabel("Y axis")
+        if plot_height <= 16 and plot_width <= 16:
+            ax.set_xticks(np.arange(plot_width))
+            ax.set_yticks(np.arange(plot_height))
+            ax.set_xticklabels(np.arange(plot_width) + coordinate_offset)
+            ax.set_yticklabels(np.arange(plot_height) + coordinate_offset)
+            ax.set_xticks(np.arange(-0.5, plot_width, 1), minor=True)
+            ax.set_yticks(np.arange(-0.5, plot_height, 1), minor=True)
+            ax.grid(which="minor", color="white", linewidth=0.5, alpha=0.35)
+            ax.tick_params(which="minor", bottom=False, left=False)
+            if annotate_counts:
+                peak = float(plot_heatmap.max())
+                for y, x in np.argwhere(plot_heatmap > 0):
+                    value = int(plot_heatmap[y, x])
+                    text_color = (
+                        "black" if peak > 0 and value > peak * 0.55 else "white"
+                    )
+                    ax.text(
+                        x,
+                        y,
+                        str(value),
+                        ha="center",
+                        va="center",
+                        color=text_color,
+                    )
         plt.colorbar(im, ax=ax, label="Occurrences", fraction=0.046, pad=0.04)
         plt.tight_layout()
 
@@ -2469,10 +2868,42 @@ def save_dataset_coverage(cfg, data_path=None, layout_source=None):
                     title=f"Crafter Inventory Coverage ({dataset_type})",
                 )
             else:
+                coverage_data = data
+                coverage_title = f"Agent Position Coverage ({dataset_type})"
+                coverage_transition_count = None
+                if (
+                    env_type == "minigrid"
+                    and dataset_type.lower() == "rmax"
+                    and "interaction_type" in data.files
+                ):
+                    interaction_types = np.asarray(data["interaction_type"]).astype(str)
+                    spatial_mask = interaction_types == "spatial"
+                    if np.any(spatial_mask):
+                        # Use both endpoints so terminal goal/lava cells are
+                        # visible while keeping the title's transition count
+                        # equal to the number of spatial transitions.
+                        spatial_a = data["a"][spatial_mask]
+                        spatial_b = (
+                            data["b"][spatial_mask]
+                            if "b" in data.files
+                            else spatial_a
+                        )
+                        coverage_data = {
+                            "a": np.concatenate((spatial_a, spatial_b), axis=0)
+                        }
+                        coverage_transition_count = int(np.sum(spatial_mask))
+                        coverage_title = "MiniGrid RMax Position Coverage (explorer only)"
+                coverage_kwargs = {
+                    "annotate_counts": env_type != "minigrid",
+                    "crop_outer_wall": env_type == "minigrid",
+                }
+                if coverage_transition_count is not None:
+                    coverage_kwargs["transition_count"] = coverage_transition_count
                 visualize_agent_coverage(
-                    data,
+                    coverage_data,
                     save_path=save_path,
-                    title=f"Agent Position Coverage ({dataset_type})",
+                    title=coverage_title,
+                    **coverage_kwargs,
                 )
 
     return save_path
