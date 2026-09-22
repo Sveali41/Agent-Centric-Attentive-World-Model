@@ -1383,6 +1383,415 @@ def run_env_uniform(env, cfg, wandb_run, log_name, policy=None, rmax_exploration
     env.close()
     return obs_np, obs_next_np, act_np, rew_np, done_np, info_np
 
+
+# Validation-only Crafter benchmark.  This deliberately does not share the
+# ``uniform`` collector: that collector is a behaviour policy for training,
+# whereas this constructs reproducible one-step preconditions and always lets
+# the native environment produce the transition.
+_CRAFTER_COVERAGE_V2_QUOTAS = {
+    0: 600, 1: 600, 2: 600, 3: 600, 4: 600, 5: 900, 6: 600,
+    7: 800, 8: 800, 9: 800, 10: 800, 11: 800, 12: 800, 13: 800,
+    14: 800, 15: 800, 16: 800,
+}
+
+_CRAFTER_PROGRESS_STAGE_ITEMS = (
+    (),
+    ("wood", "sapling"),
+    ("wood", "sapling", "stone", "coal"),
+    ("wood", "sapling", "stone", "coal", "iron"),
+    ("wood", "sapling", "stone", "coal", "iron", "diamond"),
+)
+_CRAFTER_PROGRESS_STAGE_TOOLS = (
+    (),
+    (),
+    ("wood_pickaxe",),
+    ("wood_pickaxe", "stone_pickaxe"),
+    ("wood_pickaxe", "stone_pickaxe", "iron_pickaxe"),
+)
+_CRAFTER_COLLECT_MIN_STAGE = {
+    "tree": 0, "stone": 2, "coal": 2, "iron": 3, "diamond": 4,
+}
+_CRAFTER_PLACE_MIN_STAGE = {"stone": 2, "table": 1, "furnace": 2, "plant": 1}
+_CRAFTER_MAKE_MIN_STAGE = {
+    "wood_pickaxe": 1, "stone_pickaxe": 2, "iron_pickaxe": 3,
+    "wood_sword": 1, "stone_sword": 2, "iron_sword": 3,
+}
+_CRAFTER_RESOURCE_OUTPUT = {
+    "tree": "wood", "stone": "stone", "coal": "coal", "iron": "iron", "diamond": "diamond",
+}
+
+
+def _crafter_coverage_v2_stage(action: int, index: int, rng: np.random.Generator) -> int:
+    """Sample a causally valid pre-action technology stage for one scenario."""
+    if action == 5:
+        if index < 400:
+            resource = ("tree", "stone", "coal", "iron", "diamond")[index // 80]
+            minimum = _CRAFTER_COLLECT_MIN_STAGE[resource]
+            return int(rng.integers(minimum, 5))
+        if index < 820:
+            resource = ("stone", "coal", "iron", "diamond")[(index - 500) // 80]
+            # Missing-tool controls must be genuinely pre-tool states.
+            return int(rng.integers(_CRAFTER_COLLECT_MIN_STAGE[resource]))
+    elif 7 <= action <= 10:
+        name = ("stone", "table", "furnace", "plant")[action - 7]
+        minimum = _CRAFTER_PLACE_MIN_STAGE[name]
+        # Successful, invalid-terrain, and occupied placement all carry the
+        # required material context. Missing-material cases use the same
+        # causal stage range; otherwise a stage-0 background could be patched
+        # with a later recipe's inputs and mislabeled as an early state.
+        return int(rng.integers(minimum, 5))
+    elif 11 <= action <= 16:
+        name = (
+            "wood_pickaxe", "stone_pickaxe", "iron_pickaxe",
+            "wood_sword", "stone_sword", "iron_sword",
+        )[action - 11]
+        minimum = _CRAFTER_MAKE_MIN_STAGE[name]
+        # A successful craft (or its missing-station counterpart) represents
+        # the next unlock, so do not inject the output tool in advance. The
+        # missing-material control may use a richer already-unlocked context,
+        # but must still start at this recipe's minimum causal stage.
+        if 400 <= index < 600:
+            return int(rng.integers(minimum, 5))
+        return minimum
+    return int(rng.integers(5))
+
+
+def _crafter_coverage_v2_set_progression_background(
+    player, stage: int, rng: np.random.Generator
+) -> None:
+    """Create a seeded, causally consistent inventory background for a stage."""
+    if not 0 <= int(stage) < len(_CRAFTER_PROGRESS_STAGE_ITEMS):
+        raise ValueError(f"Unknown Crafter progression stage: {stage}")
+    for name in player.inventory:
+        player.inventory[name] = 0
+    # Health shares Crafter's inventory mapping in this pinned environment;
+    # set it after clearing the map. Survival remains legal but is not part of
+    # the neural inventory target when predict_survival=false.
+    player.health = 9
+    for name in ("food", "drink", "energy"):
+        player.inventory[name] = 9
+    for name in _CRAFTER_PROGRESS_STAGE_ITEMS[stage]:
+        player.inventory[name] = int(rng.integers(0, 6))
+    for name in _CRAFTER_PROGRESS_STAGE_TOOLS[stage]:
+        player.inventory[name] = 1
+    # Weapons are optional; they never imply a future pickaxe or raw resource.
+    for minimum, name in ((1, "wood_sword"), (2, "stone_sword"), (3, "iron_sword")):
+        if stage >= minimum:
+            player.inventory[name] = int(rng.integers(0, 2))
+
+
+def _crafter_coverage_v2_set_missing_material(player, uses, rng: np.random.Generator) -> None:
+    """Inject exactly one missing recipe input while satisfying all others."""
+    required = sorted((str(name), int(amount)) for name, amount in uses.items())
+    if not required:
+        raise ValueError("coverage_v2 missing-material scenario requires a nonempty recipe")
+    missing_index = int(rng.integers(len(required)))
+    for item, amount in required:
+        player.inventory[item] = amount
+    missing_item, missing_amount = required[missing_index]
+    player.inventory[missing_item] = max(0, missing_amount - 1)
+
+
+def _crafter_coverage_v2_queue(seed: int, samples_per_target: int):
+    """Return the exact action-balanced scenario queue for one target map."""
+    expected = sum(_CRAFTER_COVERAGE_V2_QUOTAS.values())
+    if int(samples_per_target) != expected:
+        raise ValueError(
+            "coverage_v2 requires samples_per_target=12500 so its published "
+            f"action quotas remain exact; got {samples_per_target}."
+        )
+    queue = []
+    for action, count in _CRAFTER_COVERAGE_V2_QUOTAS.items():
+        # Scenario labels are deterministic functions of the queue position.
+        for index in range(count):
+            queue.append((action, index))
+    np.random.default_rng(int(seed)).shuffle(queue)
+    return queue
+
+
+def _crafter_coverage_v3_queue(seed: int, samples_per_target: int):
+    """v3 retains the published v2 action quotas and seeded queue order."""
+    return _crafter_coverage_v2_queue(seed, samples_per_target)
+
+
+def _crafter_coverage_v2_setup(
+    env, action: int, index: int, rng: np.random.Generator, *, movement_tail: str = "lava"
+):
+    """Reset one native Crafter state with a controlled local precondition.
+
+    The scenario is only an initial-state injection.  The target transition is
+    always the result of ``env.step(action)``.  It uses the smallest local
+    setup needed to exercise the action, so layouts outside the local patch
+    remain genuine target-map context.
+    """
+    from crafter import constants, objects
+
+    world = env.unwrapped.env._world
+    player = env.unwrapped.env._player
+    width, height = world.area
+    if movement_tail not in {"lava", "path"}:
+        raise ValueError(f"Unsupported Crafter coverage movement tail: {movement_tail!r}")
+    if width < 5 or height < 5:
+        raise ValueError("coverage_v2 requires Crafter layouts at least 5x5")
+    # Sample a safe interior teleport location from the unmodified target map.
+    # Keeping a two-cell margin makes the subsequent 5x5 local setup patch
+    # safe without special boundary cases.
+    candidates = []
+    for y in range(2, height - 2):
+        for x in range(2, width - 2):
+            material, obj = world[(x, y)]
+            if material in constants.walkable and obj is None:
+                candidates.append((x, y))
+    if not candidates:
+        raise ValueError(
+            "coverage_v2 could not find a safe interior tile for its 5x5 setup patch"
+        )
+    pos = np.asarray(candidates[int(rng.integers(len(candidates)))], dtype=np.int32)
+    world.move(player, pos)
+    sampled_facing = tuple(((-1, 0), (1, 0), (0, -1), (0, 1))[int(rng.integers(4))])
+    player.facing = sampled_facing
+    player.sleeping = False
+    player._hunger = player._thirst = player._fatigue = player._recover = 0
+    progression_stage = _crafter_coverage_v2_stage(action, index, rng)
+    _crafter_coverage_v2_set_progression_background(player, progression_stage, rng)
+
+    # Clear a 5x5 local patch of entities and use grass as the default terrain.
+    for dx in range(-2, 3):
+        for dy in range(-2, 3):
+            point = tuple((pos + (dx, dy)).tolist())
+            material, obj = world[point]
+            if obj is not None and obj is not player:
+                world.remove(obj)
+            world[point] = "grass"
+
+    dirs = {1: (-1, 0), 2: (1, 0), 3: (0, -1), 4: (0, 1)}
+    # Movement actions define their own direction.  Other actions must use
+    # the seeded facing direction so the injected precondition is truly in
+    # front of the player.
+    facing = dirs.get(action, sampled_facing)
+    if action not in dirs:
+        player.facing = facing
+    front = tuple((pos + np.asarray(facing)).tolist())
+    if action in dirs:
+        # Published quota: 240 regular, 300 blocked, and 60 tail cases per
+        # movement. v2 uses lava for historical reproducibility; v3 replaces
+        # it with target-reachable path terrain.
+        if index < 240:
+            event = "move_success"
+        elif index < 540:
+            world[front] = "tree"
+            event = "move_blocked"
+        else:
+            world[front] = movement_tail
+            # Keep v2's published label byte-for-byte stable for old archives
+            # and reproducibility. v3 uses an explicit successful path label.
+            event = "move_lava" if movement_tail == "lava" else "move_path_success"
+    elif action == 5:
+        # Deterministic material interactions and explicit negative controls.
+        resources = ("tree", "stone", "coal", "iron", "diamond")
+        if index < 400:
+            resource = resources[index // 80]
+            world[front] = resource
+            requirements = constants.collect[resource]["require"]
+            for item, amount in requirements.items():
+                player.inventory[item] = amount
+            # A positive collection transition must retain capacity for its
+            # native output despite a rich stage background.
+            player.inventory[_CRAFTER_RESOURCE_OUTPUT[resource]] = 0
+            event = f"do_{resource}_success"
+        elif index < 450:
+            world[front] = "water"
+            player.inventory["drink"] = 5
+            event = "do_water_tracker"
+        elif index < 500:
+            cow = objects.Cow(world, front)
+            cow.health = 1
+            world.add(cow)
+            player.inventory["food"] = 3
+            event = "do_cow_tracker"
+        else:
+            if index < 820:
+                resource = ("stone", "coal", "iron", "diamond")[(index - 500) // 80]
+                world[front] = resource
+                event = f"do_{resource}_missing_requirement"
+            else:
+                world[front] = "grass"
+                # Crafter's native grass interaction has a stochastic 10%
+                # sapling outcome.  The final event label is assigned from
+                # the actual post-step inventory below.
+                event = "do_grass_stochastic"
+    elif action == 6:
+        player.inventory["energy"] = 5 if index % 2 == 0 else 9
+        event = "sleep_recover" if player.inventory["energy"] < 9 else "sleep_full"
+    elif 7 <= action <= 10:
+        name = ("stone", "table", "furnace", "plant")[action - 7]
+        info = constants.place[name]
+        if index < 400:
+            world[front] = next(iter(info["where"]))
+            for item, amount in info["uses"].items():
+                player.inventory[item] = amount
+            event = f"place_{name}_success"
+        elif index < 600:
+            world[front] = next(iter(info["where"]))
+            _crafter_coverage_v2_set_missing_material(player, info["uses"], rng)
+            event = f"place_{name}_missing_material"
+        elif index < 700:
+            world[front] = "tree"
+            for item, amount in info["uses"].items():
+                player.inventory[item] = amount
+            event = f"place_{name}_invalid_terrain"
+        else:
+            for item, amount in info["uses"].items():
+                player.inventory[item] = amount
+            world.add(objects.Cow(world, front))
+            event = f"place_{name}_occupied"
+    elif 11 <= action <= 16:
+        name = ("wood_pickaxe", "stone_pickaxe", "iron_pickaxe", "wood_sword", "stone_sword", "iron_sword")[action - 11]
+        info = constants.make[name]
+        if index < 400:
+            for item, amount in info["uses"].items():
+                player.inventory[item] = amount
+            player.inventory[name] = 0
+            for utility_index, utility in enumerate(info["nearby"]):
+                offset = (facing, (-facing[1], facing[0]))[utility_index]
+                world[tuple((pos + offset).tolist())] = utility
+            event = f"make_{name}_success"
+        elif index < 600:
+            _crafter_coverage_v2_set_missing_material(player, info["uses"], rng)
+            for utility_index, utility in enumerate(info["nearby"]):
+                offset = (facing, (-facing[1], facing[0]))[utility_index]
+                world[tuple((pos + offset).tolist())] = utility
+            event = f"make_{name}_missing_material"
+        else:
+            for item, amount in info["uses"].items():
+                player.inventory[item] = amount
+            event = f"make_{name}_missing_station"
+    else:
+        event = "noop"
+    # State injection is not a transition and must not leak into native reward
+    # bookkeeping (notably _last_health from reset()).
+    env.unwrapped._reset_native_bookkeeping()
+    return event, progression_stage
+
+
+def _crafter_coverage_v2_observed_event(event: str, obs, obs_next: dict) -> str:
+    """Resolve stochastic scenario labels from the native post-step state."""
+    if event == "do_grass_stochastic":
+        sapling_gained = bool(obs_next["inventory"][9] > obs["inventory"][9])
+        return "do_grass_sapling_gain" if sapling_gained else "do_grass_no_effect"
+    return event
+
+
+def _crafter_coverage_v3_setup(env, action: int, index: int, rng: np.random.Generator):
+    """Target-reachable v3 setup: replace the legacy lava tail with path."""
+    return _crafter_coverage_v2_setup(
+        env, action, index, rng, movement_tail="path"
+    )
+
+
+def _collect_crafter_coverage(env, cfg, *, version: str):
+    """Collect an explicit, action-balanced Crafter validation dataset."""
+    if version not in {"v2", "v3"}:
+        raise ValueError(f"Unsupported Crafter coverage version: {version!r}")
+    coverage_name = f"coverage_{version}"
+    collect_cfg = cfg.env.collect
+    domain_cfg = getattr(getattr(cfg, "domains", None), "crafter", None)
+    target_cfg = getattr(domain_cfg, "target_collection", {})
+    samples = int(getattr(target_cfg, "samples_per_target", 12500))
+    seed = int(getattr(target_cfg, "seed", getattr(cfg, "seed", 0)))
+    target_id = int(getattr(target_cfg, "target_id", -1))
+    if target_id < 0:
+        task_name = str(getattr(domain_cfg, "task_name", ""))
+        trailing_digits = "".join(ch for ch in task_name if ch.isdigit())
+        target_id = int(trailing_digits) if trailing_digits else -1
+    output_dir = getattr(target_cfg, "output_dir", None)
+    if output_dir is not None:
+        if target_id < 0:
+            raise ValueError(
+                f"{coverage_name} requires target_collection.target_id or a task_name "
+                "ending in digits so the target output filename is unambiguous."
+            )
+        with open_dict(cfg):
+            cfg.env.collect.data_save_path = str(
+                Path(str(output_dir)).expanduser()
+                / f"crafter_target_task_{target_id}_{coverage_name}.npz"
+            )
+    if bool(getattr(env.unwrapped, "ai_enabled", False)):
+        raise ValueError(f"{coverage_name} is deterministic-only and requires ai_enabled=false")
+    queue = (
+        _crafter_coverage_v2_queue(seed, samples)
+        if version == "v2" else _crafter_coverage_v3_queue(seed, samples)
+    )
+    # This generator exclusively controls the setup teleport/facing sequence;
+    # it never touches global NumPy RNG state and therefore replays by seed.
+    setup_rng = np.random.default_rng(seed)
+    rows = [[] for _ in range(8)]
+    labels = {key: [] for key in (
+        "scenario_id", "event_type", "event_success", "failure_reason", "target_id",
+        "tracker_owned_survival", "progression_stage",
+    )}
+    movement_tail = "lava" if version == "v2" else "path"
+    for scenario_id, (action, index) in enumerate(tqdm(queue, desc=f"Crafter {coverage_name}")):
+        env.reset()
+        if version == "v2":
+            event, progression_stage = _crafter_coverage_v2_setup(
+                env, action, index, setup_rng, movement_tail=movement_tail
+            )
+        else:
+            event, progression_stage = _crafter_coverage_v3_setup(
+                env, action, index, setup_rng
+            )
+        obs = env.unwrapped._extract_obs()
+        obs_next, reward, terminated, truncated, info = env.step(action)
+        event = _crafter_coverage_v2_observed_event(event, obs, obs_next)
+        core_changed = bool(
+            np.any(obs["image"] != obs_next["image"])
+            or np.any(obs["inventory"][4:] != obs_next["inventory"][4:])
+        )
+        is_tracker = event in {"do_water_tracker", "do_cow_tracker", "sleep_recover", "sleep_full"}
+        rows[0].append(obs["image"]); rows[1].append(obs_next["image"]); rows[2].append(action)
+        rows[3].append(reward); rows[4].append(bool(terminated or truncated)); rows[5].append(dict(info))
+        rows[6].append(obs["inventory"]); rows[7].append(obs_next["inventory"])
+        labels["scenario_id"].append(scenario_id)
+        labels["event_type"].append(event)
+        success = (
+            event.endswith("_success")
+            or event in {"do_water_tracker", "do_cow_tracker", "sleep_recover", "noop"}
+            or event == "do_grass_sapling_gain"
+        )
+        labels["event_success"].append(success)
+        labels["failure_reason"].append("" if labels["event_success"][-1] else event)
+        labels["target_id"].append(target_id)
+        labels["tracker_owned_survival"].append(is_tracker)
+        labels["progression_stage"].append(progression_stage)
+    arrays = [np.asarray(x) for x in rows]
+    extras = {
+        **{key: np.asarray(value) for key, value in labels.items()},
+        "collector_version": np.full(
+            samples,
+            "coverage_v2_progression_v4" if version == "v2" else "coverage_v3_target_reachable_v1",
+            dtype="<U32",
+        ),
+        "collection_policy": np.full(
+            samples,
+            "crafter_coverage_v2_progression_v3" if version == "v2"
+            else "crafter_coverage_v3_target_reachable_v1",
+            dtype="<U48",
+        ),
+        "predict_survival": np.full(samples, bool(getattr(cfg.attention_model, "predict_survival", False))),
+    }
+    return (*arrays, extras)
+
+
+def collect_crafter_coverage_v2(env, cfg):
+    """Collect the legacy v2 benchmark, including its historical lava tail."""
+    return _collect_crafter_coverage(env, cfg, version="v2")
+
+
+def collect_crafter_coverage_v3(env, cfg):
+    """Collect target-reachable controlled coverage without lava or sand."""
+    return _collect_crafter_coverage(env, cfg, version="v3")
+
 def uniformize_dataset_by_position(obs, obs_next, act, rew, done, info):
     """
     Post-process a randomly collected dataset into a position-balanced one.
@@ -1901,6 +2310,8 @@ def _mix_minigrid_uniform_transitions(spatial, interactions, interaction_types, 
 def data_collect(cfg: DictConfig):
     env_type = str(getattr(cfg.env, "env_type", "")).lower()
     mode = 'human' if getattr(cfg.env, "visualize", False) else 'rgb_array'
+    collect_cfg = getattr(cfg.env, "collect", cfg.env)
+    data_type = str(getattr(collect_cfg, "data_type", "random")).lower()
 
     if env_type == "crafter":
         # Workaround for numba cache issues seen in some environments when importing crafter.
@@ -1911,6 +2322,12 @@ def data_collect(cfg: DictConfig):
         slippery_prob = getattr(crafter_cfg, "slippery_prob", 0.0) if hasattr(crafter_cfg, "slippery_prob") else crafter_cfg.get("slippery_prob", 0.0) if isinstance(crafter_cfg, dict) else 0.0
         max_steps = getattr(cfg.env, "max_steps", 10000)
         from domain.crafter.crafter_custom_env import CustomCrafterEnv
+        if data_type in {"coverage_v2", "coverage_v3"} and (not env_path or not os.path.isfile(env_path)):
+            raise FileNotFoundError(
+                f"{data_type} requires an existing Crafter layout file; "
+                f"resolved env_path={env_path!r}. Override "
+                "domains.crafter.layout_path with a Crafter layout containing 'A'."
+            )
         if env_path and os.path.exists(env_path):
             env = CustomCrafterEnv(txt_file_path=env_path, max_steps=max_steps,
                                    ai_enabled=stochastic, slippery_prob=slippery_prob)
@@ -1952,8 +2369,17 @@ def data_collect(cfg: DictConfig):
                 "MiniGrid starts from a random empty position."
             )
 
-    collect_cfg = getattr(cfg.env, "collect", cfg.env)
-    data_type = str(getattr(collect_cfg, "data_type", "random")).lower()
+    if env_type == "crafter" and data_type in {"coverage_v2", "coverage_v3"}:
+        obs, obs_next, act, rew, done, info, inv, inv_next, extra_arrays = (
+            collect_crafter_coverage_v2(env, cfg)
+            if data_type == "coverage_v2" else collect_crafter_coverage_v3(env, cfg)
+        )
+        save_experiments(
+            cfg, obs, obs_next, act, rew, done, info,
+            inv=inv, inv_next=inv_next, extra_arrays=extra_arrays,
+        )
+        env.close()
+        return
     randomize = (data_type == "uniform" and env_type == "crafter")
     log_name = getattr(collect_cfg, "visualize_filename", "train.png").split('.')[0]
 
@@ -2372,28 +2798,67 @@ def visualize_agent_coverage(
                      'Wood_Sword', 'Stone_Sword', 'Iron_Sword']
                      
         inv_stats = np.mean(inv_data > 0, axis=0) * 100
+
+        # ``h`` is the inventory after the transition.  A positive inventory
+        # transition is a concrete acquisition/crafting event, unlike the
+        # presence bars above which can also be caused by the reset state.
+        # Keep physiology (slots 0:4) out of this measure: their changes are
+        # survival dynamics rather than resource acquisition or crafting.
+        has_inventory_next = 'h' in data and data['h'] is not None and len(data['h']) > 0
+        if has_inventory_next:
+            inv_next_data = np.asarray(data['h']).reshape(np.asarray(data['h']).shape[0], -1)
+            if inv_next_data.shape[1] != 16:
+                raise ValueError(
+                    "Crafter successful-gain coverage expects 16 next-inventory slots, "
+                    f"got shape {inv_next_data.shape}"
+                )
+            gain_rows = min(inv_data.shape[0], inv_next_data.shape[0])
+            gain_counts = np.sum(
+                inv_next_data[:gain_rows] > inv_data[:gain_rows], axis=0
+            ).astype(np.int64)
+        else:
+            # Older datasets may only contain the current inventory ``g``.
+            # Render the presence-only result explicitly instead of guessing
+            # successful transitions from inventory state.
+            gain_counts = np.zeros(16, dtype=np.int64)
+
+        progression_indices = np.arange(4, 16)
+        material_indices = np.arange(4, 10)
+        crafted_indices = np.arange(10, 16)
+        progression_gain_counts = gain_counts[progression_indices]
+        progression_gain_coverage = int(np.count_nonzero(progression_gain_counts > 0))
+        gain_data_note = (
+            "h > g available"
+            if has_inventory_next
+            else "h missing: successful gains unavailable (presence only)"
+        )
         
-        # Create a figure with two subplots: Heatmap and Bar chart
-        fig = plt.figure(figsize=(14, 6))
-        
+        # Create three compact panels: the heatmap occupies the full left
+        # column, while the two right-hand panels share one x-axis.
+        fig = plt.figure(figsize=(14, 6.5))
+        outer = fig.add_gridspec(1, 2, width_ratios=(1.0, 1.7), wspace=0.24)
+        right = outer[0, 1].subgridspec(2, 1, hspace=0.20)
+
         # 1. Heatmap
-        ax1 = plt.subplot(1, 2, 1)
+        ax1 = fig.add_subplot(outer[0, 0])
         im = ax1.imshow(heatmap, cmap="viridis", origin="upper")
-        # ax1.set_title(title, fontsize=12, fontweight='bold')
         ax1.set_xlabel("X axis")
         ax1.set_ylabel("Y axis")
-        plt.colorbar(im, ax=ax1, label="Occurrences", fraction=0.046, pad=0.04)
+        fig.colorbar(im, ax=ax1, label="Occurrences", fraction=0.046, pad=0.04)
         
-        # 2. Inventory Stats
-        ax2 = plt.subplot(1, 2, 2)
+        # 2. Inventory presence (the upper right panel).
+        ax2 = fig.add_subplot(right[0, 0])
         colors = ['#3498db']*4 + ['#2ecc71']*6 + ['#e74c3c']*3 + ['#f39c12']*3
         ax2.bar(range(len(inv_labels)), inv_stats, color=colors, alpha=0.8, edgecolor='black')
         
-        ax2.set_title("Agent Inventory Acquisition Rate", fontsize=12, fontweight='bold')
+        presence_title = "Inventory Presence (%)"
+        if not has_inventory_next:
+            presence_title += "\nh missing: successful gains unavailable"
+        ax2.set_title(presence_title, fontsize=11, fontweight='bold', pad=5)
         ax2.set_ylabel("Presence Rate (%)")
         ax2.set_ylim(0, 115) # Leave space for text
         ax2.set_xticks(range(len(inv_labels)))
-        ax2.set_xticklabels(inv_labels, rotation=45, ha='right', fontsize=9)
+        ax2.tick_params(axis='x', labelbottom=False)
         ax2.grid(axis='y', linestyle='--', alpha=0.3)
         
         # Add values on top of bars with better formatting
@@ -2401,7 +2866,55 @@ def visualize_agent_coverage(
             color = 'black' if v < 95 else 'darkred'
             ax2.text(i, v + 2, f"{v:.1f}", ha='center', fontsize=8, fontweight='bold', color=color)
             
-        # Add a small legend for groups
+        # 3. Successful positive transitions (the lower right panel).  Only
+        # progression slots are plotted: physiological slots are intentionally
+        # left empty because their changes are survival dynamics.
+        ax_gain = fig.add_subplot(right[1, 0], sharex=ax2)
+        gain_colors = ['#1b9e77'] * len(material_indices) + ['#d95f02'] * len(crafted_indices)
+        gain_bars = ax_gain.bar(
+            progression_indices,
+            gain_counts[progression_indices],
+            color=gain_colors,
+            alpha=0.85,
+            edgecolor='black',
+            width=0.78,
+        )
+        max_gain = int(progression_gain_counts.max()) if len(progression_gain_counts) else 0
+        gain_ylim = max(1, int(np.ceil(max_gain * 1.2)))
+        ax_gain.set_ylim(0, gain_ylim)
+        if has_inventory_next:
+            ax_gain.set_title(
+                "Successful Positive Transitions (h > g)\n"
+                f"Progression coverage: {progression_gain_coverage}/12 slots",
+                fontsize=11,
+                fontweight='bold',
+                pad=6,
+            )
+        else:
+            ax_gain.set_title(
+                "Successful Gains Unavailable (h missing)\nPresence-only dataset",
+                fontsize=11,
+                fontweight='bold',
+                color='#666666',
+                pad=6,
+            )
+        ax_gain.set_ylabel("Positive transitions (count)")
+        ax_gain.set_xticks(range(len(inv_labels)))
+        ax_gain.set_xticklabels(inv_labels, rotation=45, ha='right', fontsize=9)
+        ax_gain.grid(axis='y', linestyle='--', alpha=0.3)
+        for index in progression_indices:
+            count = int(gain_counts[index])
+            ax_gain.text(
+                index,
+                count + max(gain_ylim * 0.015, 0.02),
+                str(count),
+                ha='center',
+                va='bottom',
+                fontsize=8,
+                color='#333333',
+            )
+
+        # Add legends for presence groups and the two meanings of successful gain.
         from matplotlib.lines import Line2D
         legend_elements = [
             Line2D([0], [0], color='#3498db', lw=4, label='Physiological Stats'),
@@ -2409,10 +2922,30 @@ def visualize_agent_coverage(
             Line2D([0], [0], color='#e74c3c', lw=4, label='Pickaxes'),
             Line2D([0], [0], color='#f39c12', lw=4, label='Swords')
         ]
-        ax2.legend(handles=legend_elements, loc='upper right', fontsize=8, framealpha=0.5)
+        ax2.legend(
+            handles=legend_elements,
+            loc='upper center',
+            ncol=2,
+            fontsize=7,
+            framealpha=0.65,
+            borderpad=0.3,
+            handlelength=1.5,
+            columnspacing=0.8,
+        )
+        gain_legend_elements = [
+            plt.Rectangle((0, 0), 1, 1, color='#1b9e77', label='Materials: successful acquisition'),
+            plt.Rectangle((0, 0), 1, 1, color='#d95f02', label='Tools/swords: successful crafting'),
+        ]
+        ax_gain.legend(
+            handles=gain_legend_elements,
+            loc='upper right',
+            fontsize=7,
+            framealpha=0.65,
+            borderpad=0.3,
+            handlelength=1.5,
+        )
         
         fig.suptitle(title, fontsize=13, fontweight='bold')
-        plt.tight_layout(rect=(0, 0, 1, 0.95))
     else:
         fig, ax = plt.subplots(figsize=(6,6))
         plot_heatmap = heatmap
@@ -2476,86 +3009,8 @@ def visualize_agent_coverage(
 def visualize_crafter_inventory_coverage(
     data, save_path=None, title="Crafter Inventory Coverage"
 ):
-    """Visualize Crafter coverage by inventory states and acquisitions.
-
-    Crafter is an open-ended survival/crafting task, so spatial visitation is
-    only a proxy.  The primary coverage signal is the number of distinct
-    discretized inventory configurations encountered over the dataset, with
-    per-slot presence and acquisition counts shown for diagnosis.  No recipe
-    or achievement labels are used here.
-    """
-    if "g" not in data or len(data["g"]) == 0:
-        raise ValueError("Crafter inventory coverage requires dataset key 'g'")
-    inventory = np.asarray(data["g"], dtype=np.float32).reshape(len(data["g"]), -1)
-    if inventory.shape[1] != 16:
-        raise ValueError(
-            f"Crafter inventory coverage expects 16 slots, got {inventory.shape}"
-        )
-    inventory_next = np.asarray(
-        data.get("h", np.zeros_like(inventory)), dtype=np.float32
-    ).reshape(len(inventory), -1)
-    # Crafter inventory is integer-valued; rounding avoids treating tiny
-    # serialization noise as a new state.
-    # Coverage measures progression inventory only.  Health/food/drink/energy
-    # are survival variables and must not inflate exploration coverage through
-    # routine decay or regeneration.
-    discrete = np.rint(inventory[:, 4:]).astype(np.int16)
-    _, first_indices = np.unique(discrete, axis=0, return_index=True)
-    unique_count = int(len(first_indices))
-    cumulative_unique = np.zeros(len(discrete), dtype=np.int64)
-    seen = set()
-    for index, row in enumerate(discrete):
-        seen.add(row.tobytes())
-        cumulative_unique[index] = len(seen)
-
-    labels = [
-        "Wood", "Stone", "Coal", "Iron", "Diamond", "Sapling",
-        "Wood_Pickaxe", "Stone_Pickaxe", "Iron_Pickaxe", "Wood_Sword",
-        "Stone_Sword", "Iron_Sword",
-    ]
-    presence = np.mean(discrete > 0, axis=0) * 100.0
-    gains = np.sum(inventory_next[:, 4:] > inventory[:, 4:], axis=0)
-    if save_path:
-        import matplotlib
-        matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, (ax_states, ax_slots) = plt.subplots(
-        1, 2, figsize=(14, 6), gridspec_kw={"width_ratios": [1.05, 1.45]}
-    )
-    ax_states.plot(np.arange(1, len(cumulative_unique) + 1), cumulative_unique,
-                   color="#2c7fb8", linewidth=2)
-    ax_states.set_title(f"Unique inventory states: {unique_count}")
-    ax_states.set_xlabel("Collected transitions")
-    ax_states.set_ylabel("Cumulative unique states")
-    ax_states.grid(axis="both", linestyle="--", alpha=0.3)
-
-    x = np.arange(len(labels))
-    width = 0.42
-    ax_slots.bar(x - width / 2, presence, width, label="Presence (%)", color="#2ecc71")
-    ax_slots2 = ax_slots.twinx()
-    ax_slots2.bar(x + width / 2, gains, width, label="Positive gains", color="#e67e22")
-    ax_slots.set_title("Inventory slot coverage")
-    ax_slots.set_ylabel("Presence in observations (%)")
-    ax_slots2.set_ylabel("Positive transitions")
-    ax_slots.set_ylim(0, 115)
-    ax_slots.set_xticks(x)
-    ax_slots.set_xticklabels(labels, rotation=55, ha="right", fontsize=8)
-    ax_slots.grid(axis="y", linestyle="--", alpha=0.3)
-    handles1, labels1 = ax_slots.get_legend_handles_labels()
-    handles2, labels2 = ax_slots2.get_legend_handles_labels()
-    ax_slots.legend(handles1 + handles2, labels1 + labels2, loc="upper right", fontsize=8)
-    fig.suptitle(title, fontsize=13, fontweight="bold")
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
-    if save_path:
-        save_dir = os.path.dirname(save_path)
-        if save_dir:
-            os.makedirs(save_dir, exist_ok=True)
-        plt.savefig(save_path, dpi=300, bbox_inches="tight")
-        print(f"Crafter inventory coverage saved to {save_path}")
-    else:
-        plt.show()
-    plt.close(fig)
+    """Save the canonical Crafter position-heatmap/inventory-bar figure."""
+    return visualize_agent_coverage(data, save_path=save_path, title=title)
 
 
 def _extract_bipedal_x_positions_and_episode_max(data):

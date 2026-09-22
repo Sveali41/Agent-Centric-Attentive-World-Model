@@ -22,6 +22,7 @@ from modelBased.common.artifacts import (
     validate_acquisition_flags,
     world_model_checkpoint_path,
 )
+from domain.crafter.crafter_support import inspect_crafter_planning_checkpoint
 
 ROOT = Path(__file__).resolve().parent
 MODEL_DIR = ROOT / "modelBased" / "models"
@@ -257,6 +258,14 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
         continual_cfg is not None and getattr(continual_cfg, "enabled", False)
     )
     world_model_path = world_model_checkpoint_path(cfg, domain)
+    configured_policy_wm = getattr(cfg.PPO, "checkpoint_path_wm", None)
+    policy_world_model_path = (
+        Path(str(configured_policy_wm)).expanduser().resolve()
+        if configured_policy_wm is not None
+        and str(configured_policy_wm).strip()
+        and str(configured_policy_wm).lower() != "null"
+        else world_model_path
+    )
     if continual_enabled and train_in_real_env:
         raise ValueError(
             f"[{domain}] continual WM training cannot be combined with "
@@ -269,14 +278,14 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
         )
 
     if skip_world_model:
-        if not world_model_path.is_file():
+        if not policy_world_model_path.is_file():
             raise FileNotFoundError(
                 f"[{domain}] pipeline.skip_world_model=true but the configured "
-                f"WM checkpoint does not exist: {world_model_path}"
+                f"WM checkpoint does not exist: {policy_world_model_path}"
             )
         print(
             f"[{domain}] Reusing existing world-model checkpoint and skipping "
-            f"all data/WM stages: {world_model_path}"
+            f"all data/WM stages: {policy_world_model_path}"
         )
         data_recollected = False
     elif continual_enabled:
@@ -554,7 +563,7 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
                     else f"modelBased.policy_training.{control_mode}_planner"
                 ),
                 "domain=minigrid",
-                f"PPO.checkpoint_path_wm={world_model_path}",
+                f"PPO.checkpoint_path_wm={policy_world_model_path}",
                 *policy_overrides,
                 *control_overrides,
             ],
@@ -586,7 +595,7 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
                     "modelBased.policy_training.PPO_world_training",
                     "domain=minigrid",
                     f"PPO.checkpoint_path={policy_path}",
-                    f"PPO.checkpoint_path_wm={world_model_path}",
+                    f"PPO.checkpoint_path_wm={policy_world_model_path}",
                     *policy_overrides,
                 ],
                 f"{domain} / train policy",
@@ -608,6 +617,12 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
                 cfg,
             )
     elif domain == "crafter":
+        # A Crafter imagined-policy run must consume the exact WM semantics
+        # saved with this checkpoint, rather than the pipeline's training cfg.
+        # Real-environment PPO intentionally has no WM dependency.
+        if not bool(getattr(cfg.PPO, "train_in_real_env", False)):
+            crafter_spec = inspect_crafter_planning_checkpoint(policy_world_model_path)
+            print(f"[crafter] Planning WM contract: {crafter_spec}")
         policy_path = policy_checkpoint_path(cfg, domain=domain)
         policy_compatible = policy_checkpoint_is_compatible(
             policy_path, cfg, domain=domain
@@ -632,7 +647,7 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
                     "modelBased.policy_training.PPO_crafter_training",
                     "domain=crafter",
                     f"PPO.checkpoint_path={policy_path}",
-                    f"PPO.checkpoint_path_wm={world_model_path}",
+                    f"PPO.checkpoint_path_wm={policy_world_model_path}",
                     *policy_overrides,
                 ],
                 f"{domain} / train policy",

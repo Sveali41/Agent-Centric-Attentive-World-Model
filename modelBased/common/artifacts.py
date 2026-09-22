@@ -342,16 +342,17 @@ def identity_from_config(cfg: Any, domain: str | None = None) -> dict[str, Any]:
         identity["observation_pair_encoding"] = "absolute_state_pair_v1"
         identity["action_encoding"] = "compact6_v1"
         stochastic_cfg = getattr(domain_cfg, "stochastic", None)
-        identity["stochastic"] = {
-            "enabled": bool(getattr(stochastic_cfg, "enabled", False))
-            if stochastic_cfg is not None
-            else False,
-            "move_failure_prob": float(
-                getattr(stochastic_cfg, "move_failure_prob", 0.2)
-            )
-            if stochastic_cfg is not None
-            else 0.2,
-        }
+        # Deterministic branches predate the stochastic config block.  Do not
+        # manufacture a stochastic identity field when the branch does not
+        # declare one; otherwise deterministic archives become spuriously
+        # incompatible with the deterministic config.
+        if stochastic_cfg is not None:
+            identity["stochastic"] = {
+                "enabled": bool(getattr(stochastic_cfg, "enabled", False)),
+                "move_failure_prob": float(
+                    getattr(stochastic_cfg, "move_failure_prob", 0.2)
+                ),
+            }
         collect_cfg = getattr(getattr(cfg, "env", None), "collect", None)
         identity["collection_replace_start_with_empty"] = bool(
             getattr(collect_cfg, "replace_start_with_empty", False)
@@ -422,7 +423,23 @@ def identity_from_config(cfg: Any, domain: str | None = None) -> dict[str, Any]:
         )
         if uses_p2e and uses_rmax:
             raise ValueError("p2e.enabled and rmax_like.enabled are mutually exclusive")
-        if uses_rmax:
+        collect_cfg = getattr(getattr(cfg, "env", None), "collect", None)
+        collection_type = str(getattr(collect_cfg, "data_type", "random")).lower()
+        if collection_type == "coverage_v2":
+            # Validation-only, action-balanced one-step benchmark.  Keep this
+            # distinct from RMax/random collection so dataset compatibility
+            # cannot silently mix transition protocols.
+            identity["collection_policy"] = "crafter_coverage_v2_progression_v3"
+            identity["collection_strategy"] = "controlled_native_one_step_progression_v3"
+            identity["coverage_context_protocol"] = "causal_tech_stage_inventory_v2"
+        elif collection_type == "coverage_v3":
+            # Target-reachable controlled one-step benchmark. Unlike v2 it
+            # never injects terrain absent from the target transition closure
+            # (notably lava or sand).
+            identity["collection_policy"] = "crafter_coverage_v3_target_reachable_v1"
+            identity["collection_strategy"] = "controlled_native_one_step_target_reachable_v1"
+            identity["coverage_context_protocol"] = "causal_tech_stage_inventory_v3"
+        elif uses_rmax:
             identity["collection_policy"] = "crafter_rmax_count_local5_inv12_v1"
             identity["rmax_like"] = {
                 "count_key_version": "local5_inv12_sa_v1",
@@ -491,7 +508,30 @@ def dataset_matches(path: str | Path, cfg: Any, domain: str | None = None) -> bo
     for field in ("env_path", "layout_path"):
         metadata_without_paths.pop(field, None)
         identity_without_paths.pop(field, None)
-    return metadata_without_paths == identity_without_paths
+    if metadata_without_paths == identity_without_paths:
+        return True
+
+    # Older target archives predate optional collection-provenance fields.  Do
+    # not require recollection when all semantic identity fields (including the
+    # layout content hash) agree and the only differences are fields absent
+    # from the archive.  A field that is present but has a different value is
+    # still rejected above this compatibility path.
+    optional_provenance = {"stochastic", "collection_strategy", "interaction_fraction"}
+    missing_optional = {
+        key for key in optional_provenance
+        if key not in metadata_without_paths and key in identity_without_paths
+    }
+    if not missing_optional:
+        return False
+    metadata_core = {
+        key: value for key, value in metadata_without_paths.items()
+        if key not in missing_optional
+    }
+    identity_core = {
+        key: value for key, value in identity_without_paths.items()
+        if key not in missing_optional
+    }
+    return metadata_core == identity_core
 
 
 def metadata_array(cfg: Any, domain: str | None = None) -> np.ndarray:

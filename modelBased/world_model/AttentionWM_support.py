@@ -3,6 +3,9 @@ from torch import nn
 from torch import nn
 import torch.nn.functional as F
 from domain.minigrid.transition_codec import minigrid_contract
+from modelBased.world_model.crafter_dynamics import (
+    crafter_event_codebook, crafter_event_scores_from_slot_logits,
+)
 
 class ResidualMLP(nn.Module):
     def __init__(self, dim, hidden_dim, dropout=0.1):
@@ -176,11 +179,18 @@ class AttentionModule(nn.Module):
         crafter_output_mode="effect",
         crafter_inventory_classes=10,
         crafter_inventory_output_mode="categorical_gate",
+        crafter_inventory_value_mode="categorical_absolute",
         minigrid_transition_mode="effect",
         stochastic_outcome=False,
         stochastic_model="none",
         latent_num_factors=1,
         latent_num_classes=2,
+        crafter_pose_enabled=False,
+        crafter_inventory_architecture="shared_pool_v1",
+        crafter_inventory_event_residual_enabled=False,
+        crafter_inventory_event_residual_hidden_dims=(64,),
+        crafter_inventory_event_residual_action_embed_dim=8,
+        crafter_inventory_event_residual_change_bias=1.875,
     ):
         super().__init__()
         self.data_type = data_type
@@ -189,6 +199,7 @@ class AttentionModule(nn.Module):
         self.crafter_output_mode = str(crafter_output_mode)
         self.crafter_inventory_classes = int(crafter_inventory_classes)
         self.crafter_inventory_output_mode = str(crafter_inventory_output_mode)
+        self.crafter_inventory_value_mode = str(crafter_inventory_value_mode).strip().lower()
         self.minigrid_transition_mode = str(minigrid_transition_mode)
         self.stochastic_model = str(stochastic_model).lower()
         # ``stochastic_outcome`` is the v1 ablation flag.  Keep accepting it
@@ -197,6 +208,39 @@ class AttentionModule(nn.Module):
         self.stochastic_latent_v2 = self.stochastic_model == "latent_v2"
         self.latent_num_factors = int(latent_num_factors)
         self.latent_num_classes = int(latent_num_classes)
+        self.crafter_pose_enabled = bool(crafter_pose_enabled)
+        self.crafter_inventory_architecture = str(
+            crafter_inventory_architecture
+        ).strip().lower()
+        self.crafter_inventory_event_residual_enabled = bool(crafter_inventory_event_residual_enabled)
+        self.crafter_inventory_event_residual_hidden_dims = tuple(
+            int(width) for width in crafter_inventory_event_residual_hidden_dims
+        )
+        self.crafter_inventory_event_residual_action_embed_dim = int(
+            crafter_inventory_event_residual_action_embed_dim
+        )
+        self.crafter_inventory_event_residual_change_bias = float(
+            crafter_inventory_event_residual_change_bias
+        )
+        if self.crafter_inventory_architecture not in {
+            "shared_pool_v1", "isolated_global_v1", "slot_attention_v1"
+        }:
+            raise ValueError(
+                "crafter_inventory_architecture must be shared_pool_v1, "
+                "isolated_global_v1, or slot_attention_v1"
+            )
+        if self.crafter_inventory_event_residual_enabled and (
+            env_type != "crafter" or self.crafter_inventory_output_mode != "categorical_effect"
+        ):
+            raise ValueError("Crafter event residual requires categorical_effect Crafter inventory")
+        if self.crafter_inventory_event_residual_enabled and (
+            not self.crafter_inventory_event_residual_hidden_dims
+            or any(width <= 0 for width in self.crafter_inventory_event_residual_hidden_dims)
+            or self.crafter_inventory_event_residual_action_embed_dim <= 0
+        ):
+            raise ValueError("Crafter event residual hidden dimensions and action embedding must be positive")
+        if self.crafter_pose_enabled and env_type != "crafter":
+            raise ValueError("crafter_pose is only supported for env_type='crafter'")
         if self.stochastic_outcome and env_type != "minigrid":
             raise ValueError("stochastic_outcome is currently supported only for MiniGrid")
         if self.stochastic_latent_v2 and env_type != "minigrid":
@@ -211,23 +255,103 @@ class AttentionModule(nn.Module):
                 self.input_channel = (20 + 5) * frame_stack
                 self.action_embedding = nn.Embedding(17, embed_dim) # 17 actions in crafter
                 self.inv_fc = nn.Linear(16, embed_dim)
-                if self.crafter_inventory_output_mode != "categorical_gate":
+                if self.crafter_inventory_output_mode not in {
+                    "categorical_gate", "categorical_effect"
+                }:
                     raise ValueError(
-                        "Crafter inventory must use categorical_gate output, got "
+                        "Crafter inventory must use categorical_gate or "
+                        "categorical_effect output, got "
                         f"{self.crafter_inventory_output_mode!r}"
                     )
-                # Survival: 4 x (KEEP + SET_TO_0..9).
-                # Items: 12 x KEEP/CHANGE gate + 12 x next value 0..9.
-                inventory_output_width = (
-                    4 * (self.crafter_inventory_classes + 1)
-                    + 12 * 2
-                    + 12 * self.crafter_inventory_classes
-                )
-                self.inv_head = nn.Sequential(
-                    nn.Linear(embed_dim, embed_dim),
-                    nn.ReLU(),
-                    nn.Linear(embed_dim, inventory_output_width)
-                )
+                if self.crafter_inventory_value_mode not in {
+                    "categorical_absolute", "categorical_delta"
+                }:
+                    raise ValueError(
+                        "Crafter inventory value mode must be "
+                        "'categorical_absolute' or 'categorical_delta', got "
+                        f"{self.crafter_inventory_value_mode!r}"
+                    )
+                if self.crafter_inventory_output_mode == "categorical_gate":
+                    item_value_classes = (
+                        self.crafter_inventory_classes
+                        if self.crafter_inventory_value_mode == "categorical_absolute"
+                        else 4
+                    )
+                    # Survival: 4 x (KEEP + SET_TO_0..9). Items: 12 x
+                    # KEEP/CHANGE plus conditional absolute/delta values.
+                    inventory_output_width = (
+                        4 * (self.crafter_inventory_classes + 1)
+                        + 12 * 2
+                        + 12 * item_value_classes
+                    )
+                else:
+                    # Unified item effects: KEEP, -4, -2, -1, +1.
+                    inventory_output_width = 4 * (self.crafter_inventory_classes + 1) + 12 * 5
+                if self.crafter_inventory_architecture == "shared_pool_v1":
+                    self.inv_head = nn.Sequential(
+                        nn.Linear(embed_dim, embed_dim),
+                        nn.ReLU(),
+                        nn.Linear(embed_dim, inventory_output_width)
+                    )
+                else:
+                    if self.crafter_inventory_output_mode != "categorical_effect":
+                        raise ValueError(
+                            "isolated Crafter inventory architectures require "
+                            "crafter_inventory_output_mode='categorical_effect'"
+                        )
+                    # This action embedding and every downstream module are
+                    # private to the inventory readout. Map/action WM losses
+                    # therefore remain architecturally isolated from it.
+                    self.crafter_inventory_action_embedding = nn.Embedding(17, embed_dim)
+                    if self.crafter_inventory_architecture == "isolated_global_v1":
+                        self.crafter_inventory_head = nn.Sequential(
+                            nn.Linear(embed_dim * 2 + 16, embed_dim),
+                            nn.ReLU(),
+                            nn.Linear(embed_dim, 12 * 5),
+                        )
+                    else:
+                        self.crafter_inventory_value_embedding = nn.Embedding(10, embed_dim)
+                        self.crafter_inventory_slot_embedding = nn.Parameter(
+                            torch.empty(16, embed_dim)
+                        )
+                        nn.init.trunc_normal_(self.crafter_inventory_slot_embedding, std=0.02)
+                        self.crafter_inventory_self_attention = nn.MultiheadAttention(
+                            embed_dim, num_heads, batch_first=True
+                        )
+                        self.crafter_inventory_cross_attention = nn.MultiheadAttention(
+                            embed_dim, num_heads, batch_first=True
+                        )
+                        self.crafter_inventory_slot_head = nn.Sequential(
+                            nn.Linear(embed_dim, embed_dim), nn.ReLU(), nn.Linear(embed_dim, 5)
+                        )
+                if self.crafter_pose_enabled:
+                    # The pose head consumes detached action-conditioned
+                    # tokens, so its loss cannot alter the existing WM.
+                    self.crafter_pose_head = nn.Sequential(
+                        nn.Linear(embed_dim * 5, embed_dim),
+                        nn.ReLU(),
+                        nn.Linear(embed_dim, 20),  # 5 deltas x 4 directions
+                    )
+                if self.crafter_inventory_event_residual_enabled:
+                    self.register_buffer(
+                        "crafter_inventory_event_codebook", crafter_event_codebook(), persistent=True
+                    )
+                    self.crafter_inventory_event_action_embedding = nn.Embedding(
+                        17, self.crafter_inventory_event_residual_action_embed_dim
+                    )
+                    widths = (
+                        embed_dim + 12 + self.crafter_inventory_event_residual_action_embed_dim,
+                        *self.crafter_inventory_event_residual_hidden_dims,
+                    )
+                    layers = []
+                    for input_width, output_width in zip(widths[:-1], widths[1:]):
+                        layers.extend((nn.Linear(input_width, output_width), nn.ReLU()))
+                    layers.append(nn.Linear(widths[-1], len(self.crafter_inventory_event_codebook)))
+                    self.crafter_inventory_event_residual = nn.Sequential(*layers)
+                    # The opt-in module starts as the original factorised
+                    # decoder. Only observed hard rows move it from zero.
+                    nn.init.zeros_(self.crafter_inventory_event_residual[-1].weight)
+                    nn.init.zeros_(self.crafter_inventory_event_residual[-1].bias)
             else:
                 contract = minigrid_contract(self.minigrid_transition_mode)
                 self.input_channel = (11 + 6 + 4) * frame_stack
@@ -402,6 +526,42 @@ class AttentionModule(nn.Module):
                     "num_factors": self.latent_num_factors,
                     "num_classes": self.latent_num_classes,
                 }
+        elif self.env_type == "crafter":
+            # AttentionWorldModel adds survival ownership and observation
+            # normalisation when saving.  The module owns the architecture
+            # portion of the contract.
+            self.checkpoint_contract = {
+                "version": "crafter_planning_v1",
+                "domain": "crafter",
+                "data_type": str(data_type),
+                "grid_shape": [int(v) for v in grid_shape],
+                "frame_stack": int(frame_stack),
+                "attention_mask_size": int(mask_size),
+                "embed_dim": int(embed_dim),
+                "num_heads": int(num_heads),
+                "output_mode": self.crafter_output_mode,
+                "inventory": {
+                    "output_mode": self.crafter_inventory_output_mode,
+                    "classes": self.crafter_inventory_classes,
+                    "value_mode": self.crafter_inventory_value_mode,
+                    "architecture": self.crafter_inventory_architecture,
+                    "effect_values": list((-4, -2, -1, 1))
+                    if self.crafter_inventory_output_mode == "categorical_effect" else None,
+                    "event_residual": {
+                        "enabled": self.crafter_inventory_event_residual_enabled,
+                        "hidden_dims": list(self.crafter_inventory_event_residual_hidden_dims),
+                        "action_embed_dim": self.crafter_inventory_event_residual_action_embed_dim,
+                        "change_bias": self.crafter_inventory_event_residual_change_bias,
+                        "codebook": self.crafter_inventory_event_codebook.tolist()
+                        if self.crafter_inventory_event_residual_enabled else None,
+                    },
+                },
+                "pose": {
+                    "enabled": self.crafter_pose_enabled,
+                    "mode": "learned_detached",
+                },
+                "action_count": 17,
+            }
         
         self.dropout_conv = nn.Dropout(p=0.1)
 
@@ -508,6 +668,89 @@ class AttentionModule(nn.Module):
         x = self.dropout_conv(x)
         return self.flatten(x).transpose(1, 2) + self.pos_embedding
 
+    def _crafter_isolated_inventory_prediction(self, state, action, inv):
+        """Return effect logits without exposing shared WM representations.
+
+        The map tokens are state-only and detached before the private decoder.
+        This deliberately keeps inventory supervision from updating the map
+        encoder or the transition action embedding.
+        """
+        B = state.shape[0]
+        map_tokens = self._encode_discrete_tokens(state).detach()
+        action_ids = torch.as_tensor(action, device=state.device).long().reshape(-1)
+        if action_ids.numel() == 1 and B > 1:
+            action_ids = action_ids.expand(B)
+        if action_ids.numel() != B:
+            raise ValueError("Crafter inventory action batch size must match state")
+        if inv is None:
+            inventory = torch.zeros(B, 16, device=state.device, dtype=map_tokens.dtype)
+        else:
+            inventory = torch.as_tensor(inv, device=state.device, dtype=map_tokens.dtype)
+            inventory = inventory.reshape(B, -1)
+            if inventory.shape[1] != 16:
+                raise ValueError("Crafter inventory decoder requires [B,16] inventory")
+        # All Crafter inventory values are discrete 0..9 in this contract.
+        inventory = inventory.clamp(0, 9)
+        if self.crafter_inventory_architecture == "isolated_global_v1":
+            features = torch.cat((map_tokens.mean(dim=1), inventory / 9.0,
+                                  self.crafter_inventory_action_embedding(action_ids)), dim=1)
+            item_logits = self.crafter_inventory_head(features).reshape(B, 12, 5)
+        else:
+            value_tokens = self.crafter_inventory_value_embedding(inventory.long())
+            value_tokens = value_tokens + self.crafter_inventory_slot_embedding.unsqueeze(0)
+            action_token = self.crafter_inventory_action_embedding(action_ids).unsqueeze(1)
+            tokens = torch.cat((value_tokens, action_token), dim=1)
+            tokens, _ = self.crafter_inventory_self_attention(tokens, tokens, tokens, need_weights=False)
+            queries = tokens[:, 4:16]
+            slots, _ = self.crafter_inventory_cross_attention(
+                queries, map_tokens, map_tokens, need_weights=False
+            )
+            item_logits = self.crafter_inventory_slot_head(slots)
+        # Native rules own survival during planning for every new architecture.
+        survival_logits = item_logits.new_zeros(B, self.crafter_inventory_classes + 1, 4)
+        survival_logits[:, 0] = 1.0
+        return {
+            "survival_effect_logits": survival_logits,
+            "item_effect_logits": item_logits.transpose(1, 2).contiguous(),
+        }
+
+    def _crafter_attach_event_residual(self, inv_pred, pooled_tokens, action, inv):
+        """Attach detached factorised event scores plus a trainable residual."""
+        if not self.crafter_inventory_event_residual_enabled:
+            return inv_pred
+        B = pooled_tokens.shape[0]
+        if inv is None:
+            inventory = pooled_tokens.new_zeros(B, 16)
+        else:
+            inventory = torch.as_tensor(inv, device=pooled_tokens.device).reshape(B, -1)
+            if inventory.shape[1] != 16:
+                raise ValueError("Crafter event residual requires [B,16] inventory")
+        action_ids = torch.as_tensor(action, device=pooled_tokens.device).long().reshape(-1)
+        if action_ids.numel() == 1 and B > 1:
+            action_ids = action_ids.expand(B)
+        if action_ids.numel() != B:
+            raise ValueError("Crafter event residual action batch size must match state")
+        # Both pooled WM feature and factorised slot scores are detached. The
+        # residual objective cannot alter the pre-existing WM heads.
+        base_scores, _ = crafter_event_scores_from_slot_logits(
+            inv_pred["item_effect_logits"].detach(), inventory[:, 4:],
+            codebook=self.crafter_inventory_event_codebook,
+        )
+        inputs = torch.cat((
+            pooled_tokens.detach(), inventory[:, 4:].float() / 9.0,
+            self.crafter_inventory_event_action_embedding(action_ids),
+        ), dim=1)
+        residual_logits = self.crafter_inventory_event_residual(inputs)
+        result = dict(inv_pred)
+        result.update({
+            "item_event_base_scores": base_scores,
+            "item_event_residual_logits": residual_logits,
+            "item_event_scores": base_scores + residual_logits,
+            "item_event_codebook": self.crafter_inventory_event_codebook,
+            "item_event_change_bias": self.crafter_inventory_event_residual_change_bias,
+        })
+        return result
+
     def _sample_latent(self, logits, sample_mode="sample", generator=None):
         if sample_mode not in {"sample", "mode"}:
             raise ValueError("sample_mode must be 'sample' or 'mode'")
@@ -518,10 +761,38 @@ class AttentionModule(nn.Module):
             probs.reshape(-1, probs.shape[-1]), 1, generator=generator
         ).reshape(logits.shape[:-1])
 
+    def _crafter_pose_logits(self, tokens, state):
+        """Return a learned 5-by-4 pose distribution from local tokens.
+
+        The readout has no action-to-motion rules. Its only supervision comes
+        from consecutive observed states, and detached inputs isolate existing
+        map/inventory parameters from pose gradients.
+        """
+        B, _, H, W = state.shape
+        obj = state[:, (self.frame_stack - 1) * 2]
+        player = obj.eq(13).reshape(B, -1)
+        if not bool(player.sum(dim=1).eq(1).all()):
+            raise ValueError("Crafter pose head requires exactly one current player per local state")
+        index = player.float().argmax(dim=1)
+        y = torch.div(index, W, rounding_mode="floor")
+        x = index.remainder(W)
+        token_grid = tokens.reshape(B, H, W, self.embed_dim)
+        zero = token_grid.new_zeros(B, self.embed_dim)
+        features = []
+        for dy, dx in ((0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)):
+            yy, xx = y + dy, x + dx
+            valid = (yy >= 0) & (yy < H) & (xx >= 0) & (xx < W)
+            selected = token_grid[
+                torch.arange(B, device=token_grid.device),
+                yy.clamp(0, H - 1), xx.clamp(0, W - 1),
+            ]
+            features.append(torch.where(valid.unsqueeze(1), selected, zero))
+        return self.crafter_pose_head(torch.cat(features, dim=1).detach())
+
     def forward(self, state, action, info, inv=None, return_outcome=False,
                 return_distribution=False, next_state=None, next_inventory=None,
                 latent_labels=None,
-                sample_mode="sample", generator=None):
+                sample_mode="sample", generator=None, return_pose=False):
         orginal_dim = state.ndim
         if self.is_bipedal:
             if orginal_dim == 1:
@@ -670,29 +941,67 @@ class AttentionModule(nn.Module):
             x = x + latent_context.unsqueeze(1)
 
         # ==== Output head ====
+        pose_logits = (
+            self._crafter_pose_logits(x, state)
+            if return_pose and self.crafter_pose_enabled else None
+        )
         x_out = self.fc(x)
         x_out = x_out.transpose(1, 2).reshape(B, self.out_channel, H, W)
 
         if self.env_type in ('crafter', 'minigrid'):
             # Mean pool over spatial patches to predict the inventory effect.
             x_pooled = x.mean(dim=1)  # (B, D)
-            inv_pred = self.inv_head(x_pooled)
+            # Crafter's inventory objective may be evaluated as an isolated
+            # readout.  Detaching only this input prevents inventory loss
+            # gradients from changing the shared spatial encoder; the
+            # inventory head itself remains trainable.
             if self.env_type == 'crafter':
                 effect_width = 4 * (self.crafter_inventory_classes + 1)
                 gate_width = 12 * 2
-                survival_raw = inv_pred[:, :effect_width]
-                gate_raw = inv_pred[:, effect_width:effect_width + gate_width]
-                value_raw = inv_pred[:, effect_width + gate_width:]
-                inv_pred = {
-                    "survival_effect_logits": survival_raw.reshape(
-                        B, 4, self.crafter_inventory_classes + 1
-                    ).transpose(1, 2).contiguous(),
-                    "item_gate_logits": gate_raw.reshape(B, 12, 2)
-                    .transpose(1, 2).contiguous(),
-                    "item_value_logits": value_raw.reshape(
-                        B, 12, self.crafter_inventory_classes
-                    ).transpose(1, 2).contiguous(),
-                }
+                if self.crafter_inventory_output_mode == "categorical_effect":
+                    if self.crafter_inventory_architecture == "shared_pool_v1":
+                        shared_raw = self.inv_head(x_pooled)
+                        survival_raw = shared_raw[:, :effect_width]
+                        item_effect_raw = shared_raw[:, effect_width:]
+                        inv_pred = {
+                            "survival_effect_logits": survival_raw.reshape(
+                                B, 4, self.crafter_inventory_classes + 1
+                            ).transpose(1, 2).contiguous(),
+                            "item_effect_logits": item_effect_raw.reshape(B, 12, 5)
+                            .transpose(1, 2).contiguous(),
+                        }
+                    else:
+                        inv_pred = self._crafter_isolated_inventory_prediction(state, action, inv)
+                    inv_pred = self._crafter_attach_event_residual(inv_pred, x_pooled, action, inv)
+                elif self.crafter_inventory_value_mode == "categorical_delta":
+                    # Keep gate/survival connected to the spatial encoder.
+                    # Value loss sees detached spatial features, so it cannot
+                    # change map representations, while both tasks may still
+                    # shape the small inventory-specific hidden layer.
+                    shared_raw = self.inv_head(x_pooled)
+                    detached_raw = self.inv_head(x_pooled.detach())
+                    value_raw = detached_raw[:, effect_width + gate_width:]
+                else:
+                    shared_raw = self.inv_head(x_pooled)
+                    value_raw = shared_raw[:, effect_width + gate_width:]
+                if self.crafter_inventory_output_mode == "categorical_gate":
+                    survival_raw = shared_raw[:, :effect_width]
+                    gate_raw = shared_raw[:, effect_width:effect_width + gate_width]
+                    inv_pred = {
+                        "survival_effect_logits": survival_raw.reshape(
+                            B, 4, self.crafter_inventory_classes + 1
+                        ).transpose(1, 2).contiguous(),
+                        "item_gate_logits": gate_raw.reshape(B, 12, 2)
+                        .transpose(1, 2).contiguous(),
+                        "item_value_logits": value_raw.reshape(
+                            B, 12,
+                            (self.crafter_inventory_classes
+                             if self.crafter_inventory_value_mode == "categorical_absolute"
+                             else 4)
+                        ).transpose(1, 2).contiguous(),
+                    }
+            else:
+                inv_pred = self.inv_head(x_pooled)
             outcome_logits = (
                 self.outcome_head(x_pooled)
                 if return_outcome and self.stochastic_outcome
@@ -712,11 +1021,16 @@ class AttentionModule(nn.Module):
             x_out = x_out.squeeze(0)
             if inv_pred is not None:
                 if isinstance(inv_pred, dict):
-                    inv_pred = {key: value.squeeze(0) for key, value in inv_pred.items()}
+                    inv_pred = {
+                        key: value.squeeze(0) if torch.is_tensor(value) and value.ndim > 0 else value
+                        for key, value in inv_pred.items()
+                    }
                 else:
                     inv_pred = inv_pred.squeeze(0)
             if outcome_logits is not None:
                 outcome_logits = outcome_logits.squeeze(0)
+            if pose_logits is not None:
+                pose_logits = pose_logits.squeeze(0)
         if return_outcome:
             return x_out, attn_weights, inv_pred, outcome_logits
         if return_distribution:
@@ -728,4 +1042,14 @@ class AttentionModule(nn.Module):
                 "posterior_logits": posterior_logits,
                 "latent_sample": latent_sample,
             }
+        if return_pose:
+            if pose_logits is None:
+                raise ValueError("Crafter pose logits were requested but crafter_pose.enabled=false")
+            return x_out, attn_weights, inv_pred, pose_logits
         return x_out, attn_weights, inv_pred
+
+    def forward_pose(self, state, action, info=None, inv=None):
+        """Expose the same pose-aware transition interface as AttentionWorldModel."""
+        if not self.crafter_pose_enabled:
+            raise ValueError("forward_pose requires crafter_pose_enabled=true")
+        return self(state, action, info, inv=inv, return_pose=True)

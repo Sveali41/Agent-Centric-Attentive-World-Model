@@ -13,9 +13,18 @@ from modelBased.common import utils
 from modelBased.world_model.crafter_dynamics import (
     balanced_categorical_effect_loss,
     categorical_effect_target,
+    categorical_inventory_effect_target,
+    categorical_crafter_inventory_event_target,
+    crafter_inventory_effect_loss,
+    crafter_inventory_event_residual_loss,
     crafter_inventory_gate_loss,
     decode_crafter_inventory,
+    decode_crafter_item_effects,
+    decode_crafter_item_values,
+    INVENTORY_VALUES,
+    SURVIVAL_SLOTS,
     validate_discrete_inventory,
+    crafter_pose_target,
 )
 from domain.minigrid import minigrid_support as minigrid_utils
 from domain.crafter.crafter_support import (
@@ -30,6 +39,11 @@ from domain.minigrid.transition_codec import (
     validate_schema as validate_minigrid_schema,
 )
 from . import AttentionWM_support
+
+
+def crafter_selection_loss(object_nll, direction_nll, slot_gate_nll, changed_value_nll):
+    """Fixed non-target checkpoint-selection objective."""
+    return torch.stack((object_nll, direction_nll, slot_gate_nll, changed_value_nll)).mean()
 from . import Embedding_support
 from . import MLP_support
 import pandas as pd
@@ -99,10 +113,99 @@ class AttentionWorldModel(pl.LightningModule):
         self._val_minigrid_diagnostics = []
         self._val_minigrid_effect_diagnostics = []
         self._val_stochastic_outcomes = []
+        # Crafter's changed-only diagnostic is accumulated as a sum/count,
+        # rather than as a mean of batch means, so validation reports one
+        # value over every changed unit in the full epoch.
+        self._val_crafter_changed_loss_sum = None
+        self._val_crafter_changed_count = None
+        self._val_crafter_inventory_diagnostics = None
 
         self.fisher = 0
         self.old_params = None
         self.env_type = hparams.env_type
+        # Crafter's native rule tracker owns health/food/drink/energy during
+        # imagined planning.  Keep the default true so old configs and
+        # checkpoints retain their original training/decoding behavior.
+        self.predict_survival = bool(getattr(hparams, "predict_survival", True))
+        pose_cfg = getattr(hparams, "crafter_pose", None)
+        if isinstance(pose_cfg, dict):
+            self.crafter_pose_enabled = bool(pose_cfg.get("enabled", False))
+            self.crafter_pose_mode = str(pose_cfg.get("mode", "learned_detached")).lower()
+        else:
+            self.crafter_pose_enabled = bool(getattr(pose_cfg, "enabled", False)) if pose_cfg is not None else False
+            self.crafter_pose_mode = str(getattr(pose_cfg, "mode", "learned_detached")).lower() if pose_cfg is not None else "learned_detached"
+        if self.crafter_pose_enabled and self.env_type != "crafter":
+            raise ValueError("crafter_pose.enabled is only valid for the Crafter domain")
+        if self.crafter_pose_mode != "learned_detached":
+            raise ValueError("crafter_pose.mode must be 'learned_detached'")
+        self._val_crafter_pose_diagnostics = []
+        self.crafter_inventory_output_mode = str(
+            getattr(hparams, "crafter_inventory_output_mode", "categorical_gate")
+        ).strip().lower()
+        if self.crafter_inventory_output_mode not in {
+            "categorical_gate", "categorical_effect"
+        }:
+            raise ValueError(
+                "crafter_inventory_output_mode must be 'categorical_gate' or "
+                f"'categorical_effect', got {self.crafter_inventory_output_mode!r}"
+            )
+        # The legacy gate head predicts KEEP/CHANGE plus a conditional value.
+        # The unified effect head instead emits KEEP/-4/-2/-1/+1 directly.
+        self.crafter_inventory_value_mode = str(
+            getattr(hparams, "crafter_inventory_value_mode", "categorical_absolute")
+        ).strip().lower()
+        if self.crafter_inventory_value_mode not in {
+            "categorical_absolute", "categorical_delta"
+        }:
+            raise ValueError(
+                "crafter_inventory_value_mode must be 'categorical_absolute' "
+                "or 'categorical_delta', got "
+                f"{self.crafter_inventory_value_mode!r}"
+            )
+        self.crafter_inventory_effect_reduction = str(
+            getattr(hparams, "crafter_inventory_effect_reduction", "balanced_mean")
+        ).strip().lower()
+        if self.crafter_inventory_effect_reduction not in {
+            "balanced_mean", "sqrt_balanced", "mean"
+        }:
+            raise ValueError(
+                "crafter_inventory_effect_reduction must be 'balanced_mean', "
+                "'sqrt_balanced', or 'mean', got "
+                f"{self.crafter_inventory_effect_reduction!r}"
+            )
+        self.crafter_inventory_architecture = str(
+            getattr(hparams, "crafter_inventory_architecture", "shared_pool_v1")
+        ).strip().lower()
+        if self.crafter_inventory_architecture not in {
+            "shared_pool_v1", "isolated_global_v1", "slot_attention_v1"
+        }:
+            raise ValueError(
+                "crafter_inventory_architecture must be shared_pool_v1, "
+                "isolated_global_v1, or slot_attention_v1"
+            )
+        if (self.env_type == "crafter"
+                and self.crafter_inventory_architecture != "shared_pool_v1"
+                and self.predict_survival):
+            raise ValueError(
+                "isolated Crafter inventory architectures require predict_survival=false"
+            )
+        event_residual_cfg = getattr(hparams, "crafter_inventory_event_residual", None)
+        if isinstance(event_residual_cfg, dict):
+            self.crafter_inventory_event_residual_enabled = bool(event_residual_cfg.get("enabled", False))
+            self.crafter_inventory_event_residual_hidden_dims = tuple(event_residual_cfg.get("hidden_dims", (64,)))
+            self.crafter_inventory_event_residual_action_embed_dim = int(event_residual_cfg.get("action_embed_dim", 8))
+            self.crafter_inventory_event_residual_change_bias = float(event_residual_cfg.get("change_bias", 1.875))
+            self.crafter_inventory_event_residual_loss_weight = float(event_residual_cfg.get("loss_weight", 1.0))
+        else:
+            self.crafter_inventory_event_residual_enabled = bool(getattr(event_residual_cfg, "enabled", False)) if event_residual_cfg is not None else False
+            self.crafter_inventory_event_residual_hidden_dims = tuple(getattr(event_residual_cfg, "hidden_dims", (64,))) if event_residual_cfg is not None else (64,)
+            self.crafter_inventory_event_residual_action_embed_dim = int(getattr(event_residual_cfg, "action_embed_dim", 8)) if event_residual_cfg is not None else 8
+            self.crafter_inventory_event_residual_change_bias = float(getattr(event_residual_cfg, "change_bias", 1.875)) if event_residual_cfg is not None else 1.875
+            self.crafter_inventory_event_residual_loss_weight = float(getattr(event_residual_cfg, "loss_weight", 1.0)) if event_residual_cfg is not None else 1.0
+        if self.crafter_inventory_event_residual_enabled and (
+            self.env_type != "crafter" or self.crafter_inventory_output_mode != "categorical_effect"
+        ):
+            raise ValueError("Crafter event residual requires crafter categorical_effect output")
         # ``stochastic_enabled`` is the single domain-level switch exposed by
         # the MiniGrid configs.  Keep the model-specific fields below as
         # backwards-compatible internal/ablation controls, but do not require
@@ -153,6 +256,10 @@ class AttentionWorldModel(pl.LightningModule):
             raise ValueError("MiniGrid stochastic models are currently supported only for MiniGrid")
         self.frame_stack = getattr(hparams, "frame_stack", 1)
         self.observation_schema = list(getattr(hparams, "observation_schema", []) or [])
+        # Categorical-effect fields are shared by MiniGrid and Crafter.  Keep
+        # the loss parameter available for every schema, while domain configs
+        # decide whether focal modulation is enabled.
+        self.focal_gamma = float(getattr(hparams, "focal_gamma", 0.0))
         if self.env_type == "minigrid":
             self.minigrid_transition_mode = str(
                 getattr(hparams, "minigrid_transition_mode", "effect")
@@ -160,7 +267,6 @@ class AttentionWorldModel(pl.LightningModule):
             self.effect_reduction = str(
                 getattr(hparams, "effect_reduction", "balanced_mean")
             ).strip().lower()
-            self.focal_gamma = float(getattr(hparams, "focal_gamma", 0.0))
             if not self.observation_schema:
                 self.observation_schema = canonical_minigrid_schema(
                     self.minigrid_transition_mode,
@@ -198,6 +304,16 @@ class AttentionWorldModel(pl.LightningModule):
                 else ""
             )
         )
+        self.crafter_inventory_gate_reduction = str(
+            getattr(hparams, "crafter_inventory_gate_reduction", "global_balanced")
+        ).strip().lower()
+        if self.crafter_inventory_gate_reduction not in {
+            "global_balanced", "slot_macro_changed"
+        }:
+            raise ValueError(
+                "crafter_inventory_gate_reduction must be 'global_balanced' or "
+                "'slot_macro_changed'"
+            )
         
         MODEL_MAPPING = {
             'attention': AttentionWM_support.AttentionModule,
@@ -243,18 +359,58 @@ class AttentionWorldModel(pl.LightningModule):
                 inventory_target_mode = str(
                     inventory_spec.get("target_mode", "")
                 )
-                if (
-                    inventory_distribution != "categorical_inventory_gate"
-                    or inventory_target_mode != "categorical_gate"
-                ):
-                    raise ValueError(
-                        "Crafter inventory must use categorical_inventory_gate "
-                        "distribution and categorical_gate target_mode"
-                    )
-                module_kwargs["crafter_inventory_classes"] = int(
-                    inventory_spec.get("classes", 10)
+                expected_distribution = (
+                    "categorical_inventory_gate" if self.crafter_inventory_output_mode == "categorical_gate"
+                    else "categorical_inventory_effect"
                 )
+                expected_target_mode = self.crafter_inventory_output_mode
+                if (inventory_distribution != expected_distribution
+                    or inventory_target_mode != expected_target_mode):
+                    raise ValueError(
+                        "Crafter inventory schema does not match configured output mode: "
+                        f"expected {expected_distribution}/{expected_target_mode}, got "
+                        f"{inventory_distribution}/{inventory_target_mode}"
+                    )
+                schema_classes = int(inventory_spec.get("classes", 10))
+                if self.crafter_inventory_output_mode == "categorical_effect":
+                    effect_classes = int(inventory_spec.get("effect_classes", 5))
+                    if schema_classes != INVENTORY_VALUES or effect_classes != 5:
+                        raise ValueError(
+                            "Crafter categorical_inventory_effect schema must define "
+                            f"classes={INVENTORY_VALUES} and effect_classes=5, got "
+                            f"classes={schema_classes}, effect_classes={effect_classes}"
+                        )
+                    # ``crafter_inventory_classes`` describes the 0..9 value
+                    # range used by the retained survival-effect rows.  The
+                    # item-effect class count is fixed separately at five.
+                    module_kwargs["crafter_inventory_classes"] = INVENTORY_VALUES
+                else:
+                    if schema_classes != INVENTORY_VALUES:
+                        raise ValueError(
+                            "Crafter categorical_inventory_gate schema must define "
+                            f"{INVENTORY_VALUES} inventory values, got {schema_classes}"
+                        )
+                    module_kwargs["crafter_inventory_classes"] = schema_classes
                 module_kwargs["crafter_inventory_output_mode"] = inventory_target_mode
+                module_kwargs["crafter_inventory_value_mode"] = (
+                    self.crafter_inventory_value_mode
+                )
+                module_kwargs["crafter_pose_enabled"] = self.crafter_pose_enabled
+                module_kwargs["crafter_inventory_architecture"] = (
+                    self.crafter_inventory_architecture
+                )
+                module_kwargs["crafter_inventory_event_residual_enabled"] = (
+                    self.crafter_inventory_event_residual_enabled
+                )
+                module_kwargs["crafter_inventory_event_residual_hidden_dims"] = (
+                    self.crafter_inventory_event_residual_hidden_dims
+                )
+                module_kwargs["crafter_inventory_event_residual_action_embed_dim"] = (
+                    self.crafter_inventory_event_residual_action_embed_dim
+                )
+                module_kwargs["crafter_inventory_event_residual_change_bias"] = (
+                    self.crafter_inventory_event_residual_change_bias
+                )
             if module_class is AttentionWM_support.AttentionModule and self.env_type == "minigrid":
                 module_kwargs["minigrid_transition_mode"] = self.minigrid_transition_mode
                 module_kwargs["stochastic_outcome"] = self.stochastic_latent_enabled
@@ -269,6 +425,18 @@ class AttentionWorldModel(pl.LightningModule):
                 hparams.num_heads,
                 **module_kwargs,
             )
+            if (
+                self.env_type == "crafter"
+                and module_class is AttentionWM_support.AttentionModule
+            ):
+                # The model module records its architecture; these two fields
+                # are rollout semantics owned by the Lightning wrapper.
+                self.model.checkpoint_contract.update({
+                    "predict_survival": self.predict_survival,
+                    "obs_norm_values": [
+                        float(value) for value in getattr(hparams, "obs_norm_values", ())
+                    ],
+                })
         else:
             print(f"Model type: {hparams.model_type} not supported")
             exit()
@@ -368,8 +536,11 @@ class AttentionWorldModel(pl.LightningModule):
         self.eval() 
         device = next(self.parameters()).device
 
-        fisher = {n: torch.zeros_like(p, dtype=torch.float32, device=device)
-                for n, p in self.named_parameters() if p.requires_grad}
+        fisher = {
+            n: torch.zeros_like(p, dtype=torch.float32, device=device)
+            for n, p in self.named_parameters()
+            if p.requires_grad and not n.startswith("model.crafter_pose_head.")
+        }
 
         count = 0
         total_samples_target = int(samples)
@@ -381,7 +552,11 @@ class AttentionWorldModel(pl.LightningModule):
                 break
             
             # 1. Preprocess batch
-            obs, act, obs_next, info, obs_masked, _, inv, inv_next = self.preprocess_batch(batch)
+            # ``preprocess_batch`` already returns the agent-centred current
+            # and next observations as its first and third values.  Its fifth
+            # value is only an (B, H, W) elements mask for diagnostics, not an
+            # observation tensor.
+            obs, act, obs_next, info, _, _, inv, inv_next = self.preprocess_batch(batch)
             # 2. Iterate over samples in the batch
             batch_size = obs.shape[0]
             for b in range(batch_size):
@@ -398,7 +573,6 @@ class AttentionWorldModel(pl.LightningModule):
                     for k, v in info.items()
                 } if info is not None else None
                 s_obs_next = obs_next[b:b+1].to(device, dtype=torch.float32)
-                s_obs_masked = obs_masked[b:b+1].to(device) if obs_masked is not None else None
                 s_inv = inv[b:b+1].to(device) if inv is not None else None
                 s_inv_next = inv_next[b:b+1].to(device) if inv_next is not None else None
 
@@ -409,11 +583,11 @@ class AttentionWorldModel(pl.LightningModule):
                     # Feeding the full map here silently changed the token
                     # layout and made the continual-learning importance
                     # estimate unrelated to the training objective.
-                    pred, _, s_inv_pred = self(s_obs_masked, s_act, s_info, inv=s_inv)
+                    pred, _, s_inv_pred = self(s_obs, s_act, s_info, inv=s_inv)
                     loss_sample, _ = self.observation_loss(
                         pred,
                         s_obs_next,
-                        obs_prev=s_obs_masked,
+                        obs_prev=s_obs,
                         aux_pred=s_inv_pred,
                         inv=s_inv,
                         inv_next=s_inv_next,
@@ -545,6 +719,8 @@ class AttentionWorldModel(pl.LightningModule):
         # Disable autocast so the EWC term is always evaluated in fp32.
         with torch.amp.autocast("cuda", enabled=False):
             for n, p in self.named_parameters():
+                if n.startswith("model.crafter_pose_head."):
+                    continue
                 if not p.requires_grad:
                     continue
                 if n not in self.fisher or n not in self.old_params:
@@ -559,7 +735,10 @@ class AttentionWorldModel(pl.LightningModule):
                 # Use a moderate normalization factor: dividing by all parameters
                 # makes the term too small, while not normalizing at all makes it
                 # too large. Averaging over trainable layers keeps the scale usable.
-                num_layers = len([n for n, p in self.named_parameters() if p.requires_grad])
+                num_layers = len([
+                    n for n, p in self.named_parameters()
+                    if p.requires_grad and not n.startswith("model.crafter_pose_head.")
+                ])
                 total = total / (num_layers * 2.0)
 
         return total  # Intentionally return the raw term without multiplying by lambda.
@@ -705,6 +884,50 @@ class AttentionWorldModel(pl.LightningModule):
             next_state_pred, attentionWeight = out
             return next_state_pred, attentionWeight, None
 
+    def forward_pose(self, state, action, info=None, inv=None):
+        """Ordinary Crafter transition plus opt-in detached pose logits."""
+        if not self.crafter_pose_enabled:
+            raise ValueError("forward_pose requires crafter_pose.enabled=true")
+        return self.model(state, action, info, inv=inv, return_pose=True)
+
+    @staticmethod
+    def _crafter_pose_loss_and_metrics(pose_logits, current, following):
+        target = crafter_pose_target(current, following)
+        prediction = pose_logits.argmax(dim=1)
+        return (
+            F.cross_entropy(pose_logits, target),
+            {
+                "joint_accuracy": prediction.eq(target).float().mean(),
+                "position_accuracy": prediction.div(4, rounding_mode="floor").eq(
+                    target.div(4, rounding_mode="floor")
+                ).float().mean(),
+                "direction_accuracy": prediction.remainder(4).eq(target.remainder(4)).float().mean(),
+            },
+        )
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        """Permit an old Crafter checkpoint to initialize an opt-in pose head.
+
+        All other missing/unexpected keys retain PyTorch's strict semantics.
+        """
+        if self.crafter_pose_enabled:
+            result = super().load_state_dict(state_dict, strict=False)
+            allowed = lambda names: all(name.startswith("model.crafter_pose_head.") for name in names)
+            if strict and (not allowed(result.missing_keys) or result.unexpected_keys):
+                raise RuntimeError(
+                    "Incompatible checkpoint outside optional Crafter pose head; "
+                    f"missing={result.missing_keys}, unexpected={result.unexpected_keys}"
+                )
+            return result
+        # A pose-enabled artifact may be inspected by a legacy/disabled
+        # evaluator.  Ignore only its optional readout keys; the historical
+        # transition model remains strict.
+        pose_keys = [key for key in state_dict if key.startswith("model.crafter_pose_head.")]
+        if pose_keys:
+            filtered = {key: value for key, value in state_dict.items() if key not in pose_keys}
+            return super().load_state_dict(filtered, strict=strict)
+        return super().load_state_dict(state_dict, strict=strict)
+
     def forward_stochastic(self, state, action, info, inv=None):
         """Predict the MiniGrid success branch and its two-way outcome prior.
 
@@ -716,7 +939,7 @@ class AttentionWorldModel(pl.LightningModule):
         state_logits, attention, inventory_logits, outcome_logits = self.model(
             state, action, info, inv=inv, return_outcome=True
         )
-        return {
+        diagnostics = {
             "state_logits": state_logits,
             "attention_weights": attention,
             "inventory_logits": inventory_logits,
@@ -916,8 +1139,30 @@ class AttentionWorldModel(pl.LightningModule):
                         "categorical_inventory_gate requires current and next inventory"
                     )
                 fields[name], _ = crafter_inventory_gate_loss(
-                    prediction, inv, inv_next
+                    prediction, inv, inv_next,
+                    predict_survival=self.predict_survival,
+                    value_mode=self.crafter_inventory_value_mode,
+                    gate_reduction=self.crafter_inventory_gate_reduction,
                 )
+            elif distribution == "categorical_inventory_effect":
+                if target_source != "inventory" or inv is None or inv_next is None:
+                    raise ValueError(
+                        "categorical_inventory_effect requires current and next inventory"
+                    )
+                fields[name], _ = crafter_inventory_effect_loss(
+                    prediction, inv, inv_next,
+                    predict_survival=self.predict_survival,
+                    effect_reduction=str(getattr(
+                        self, "crafter_inventory_effect_reduction", "balanced_mean"
+                    )),
+                )
+                if self.crafter_inventory_event_residual_enabled:
+                    residual_loss, _ = crafter_inventory_event_residual_loss(
+                        prediction, inv, inv_next,
+                    )
+                    fields[name] = fields[name] + (
+                        self.crafter_inventory_event_residual_loss_weight * residual_loss
+                    )
             elif distribution == "mse":
                 fields[name] = F.mse_loss(prediction, target)
             elif distribution == "symlog_mse":
@@ -965,6 +1210,227 @@ class AttentionWorldModel(pl.LightningModule):
         false_set = torch.stack(false_set_rates).mean() if false_set_rates else obs_pred.new_zeros(())
         return changed_loss, false_set, changed_count
 
+    def _crafter_changed_diagnostics(
+        self, obs_pred, obs_next, obs, inv, inv_next, inv_pred
+    ):
+        """Return natural-CE sum/count over Crafter units that actually change.
+
+        This is validation-only.  Object and direction effects contribute one
+        term per changed cell.  Each changed inventory slot contributes one
+        term: survival uses its effect CE; items average their gate and value
+        CEs so the two prediction heads do not double-count one slot.
+        """
+        loss_sum = obs_pred.new_zeros(())
+        changed_count = obs_pred.new_zeros(())
+        if self.env_type != "crafter":
+            return loss_sum, changed_count
+
+        for spec in self.observation_schema:
+            if str(spec.get("distribution")) != "categorical_effect":
+                continue
+            if str(spec.get("target_source", "observation")) == "inventory":
+                # Crafter inventory uses the explicit gate distribution below.
+                continue
+            index = int(spec["target_index"])
+            start, stop = map(int, spec["prediction_slice"])
+            effects = categorical_effect_target(obs[:, index], obs_next[:, index])
+            changed = effects.ne(0)
+            if changed.any():
+                per_cell = balanced_categorical_effect_loss(
+                    obs_pred[:, start:stop], effects, reduction="none",
+                    label_smoothing=float(spec.get("label_smoothing", 0.0)),
+                    focal_gamma=0.0,
+                )
+                loss_sum = loss_sum + per_cell[changed].sum()
+                changed_count = changed_count + changed.sum().to(dtype=changed_count.dtype)
+
+        if inv is None or inv_next is None or not isinstance(inv_pred, dict):
+            return loss_sum, changed_count
+        validate_discrete_inventory(inv, "current")
+        validate_discrete_inventory(inv_next, "next")
+        current, following = inv.long(), inv_next.long()
+
+        if self.predict_survival:
+            survival_effect = categorical_effect_target(
+                current[:, :SURVIVAL_SLOTS], following[:, :SURVIVAL_SLOTS]
+            )
+            survival_changed = survival_effect.ne(0)
+            if survival_changed.any():
+                survival_nll = balanced_categorical_effect_loss(
+                    inv_pred["survival_effect_logits"], survival_effect, reduction="none",
+                    focal_gamma=0.0,
+                )
+                loss_sum = loss_sum + survival_nll[survival_changed].sum()
+                changed_count = changed_count + survival_changed.sum().to(dtype=changed_count.dtype)
+
+        item_current = current[:, SURVIVAL_SLOTS:]
+        item_following = following[:, SURVIVAL_SLOTS:]
+        item_changed = item_following.ne(item_current)
+        if item_changed.any():
+            if getattr(self, "crafter_inventory_output_mode", "categorical_gate") == "categorical_effect":
+                item_target = categorical_inventory_effect_target(item_current, item_following)
+                item_nll = F.cross_entropy(
+                    inv_pred["item_effect_logits"], item_target, reduction="none"
+                ) / math.log(5.0)
+            else:
+                gate_nll = F.cross_entropy(
+                    inv_pred["item_gate_logits"], item_changed.long(), reduction="none"
+                ) / math.log(2.0)
+                if self.crafter_inventory_value_mode == "categorical_absolute":
+                    value_target = item_following
+                    value_normalizer = math.log(INVENTORY_VALUES)
+                else:
+                    from modelBased.world_model.crafter_dynamics import (
+                        categorical_inventory_delta_target, ITEM_DELTA_CLASSES,
+                    )
+                    value_target = categorical_inventory_delta_target(
+                        item_current, item_following
+                    )
+                    value_normalizer = math.log(ITEM_DELTA_CLASSES)
+                value_nll = F.cross_entropy(
+                    inv_pred["item_value_logits"], value_target, reduction="none"
+                ) / value_normalizer
+                item_nll = (gate_nll + value_nll) * 0.5
+            loss_sum = loss_sum + item_nll[item_changed].sum()
+            changed_count = changed_count + item_changed.sum().to(dtype=changed_count.dtype)
+        return loss_sum, changed_count
+
+    def _crafter_inventory_diagnostics(self, inv, inv_next, inv_pred):
+        """Return count-based, natural-distribution Crafter inventory diagnostics.
+
+        These are validation diagnostics only.  In particular, they do not use
+        the balanced training reduction, so recall and false-positive rates
+        describe the unchanged target transition distribution.
+        """
+        if (
+            self.env_type != "crafter" or inv is None or inv_next is None
+            or not isinstance(inv_pred, dict)
+        ):
+            return None
+        validate_discrete_inventory(inv, "current")
+        validate_discrete_inventory(inv_next, "next")
+        current, following = inv.long(), inv_next.long()
+        inventory_output_mode = getattr(
+            self, "crafter_inventory_output_mode", "categorical_gate"
+        )
+        decoded = decode_crafter_inventory(
+            current, inv_pred, predict_survival=self.predict_survival,
+            output_mode=inventory_output_mode,
+            value_mode=getattr(
+                self, "crafter_inventory_value_mode", "categorical_absolute"
+            ),
+        )
+        slot_changed = current.ne(following)
+        item_changed = slot_changed[:, SURVIVAL_SLOTS:]
+        if inventory_output_mode == "categorical_effect":
+            item_effect = inv_pred["item_effect_logits"].argmax(dim=1)
+            # Residual-enabled diagnostics must report the final projected
+            # event outcome, not the raw independent slot argmax.
+            item_value = decoded[:, SURVIVAL_SLOTS:] if "item_event_scores" in inv_pred else decode_crafter_item_effects(
+                current[:, SURVIVAL_SLOTS:], inv_pred["item_effect_logits"]
+            )
+            gate_changed = item_value.ne(current[:, SURVIVAL_SLOTS:])
+            item_target = categorical_inventory_effect_target(
+                current[:, SURVIVAL_SLOTS:], following[:, SURVIVAL_SLOTS:]
+            )
+            effect_nll = F.cross_entropy(
+                inv_pred["item_effect_logits"], item_target, reduction="none"
+            ) / math.log(5.0)
+            gate_nll = effect_nll
+            value_nll = effect_nll
+        else:
+            gate_changed = inv_pred["item_gate_logits"].argmax(dim=1).bool()
+            item_value = decode_crafter_item_values(
+                current[:, SURVIVAL_SLOTS:], inv_pred["item_value_logits"],
+                value_mode=getattr(
+                    self, "crafter_inventory_value_mode", "categorical_absolute"
+                ),
+            )
+            gate_nll = F.cross_entropy(
+                inv_pred["item_gate_logits"], item_changed.long(), reduction="none"
+            ) / math.log(2.0)
+            if getattr(self, "crafter_inventory_value_mode", "categorical_absolute") == "categorical_delta":
+                from modelBased.world_model.crafter_dynamics import categorical_inventory_delta_target, ITEM_DELTA_CLASSES
+                value_target = categorical_inventory_delta_target(
+                    current[:, SURVIVAL_SLOTS:], following[:, SURVIVAL_SLOTS:]
+                )
+                value_norm = math.log(ITEM_DELTA_CLASSES)
+            else:
+                value_target, value_norm = following[:, SURVIVAL_SLOTS:], math.log(INVENTORY_VALUES)
+            value_nll = F.cross_entropy(
+                inv_pred["item_value_logits"], value_target, reduction="none"
+            ) / value_norm
+        zero = current.new_zeros((), dtype=torch.float32)
+
+        core_decoded = decoded if self.predict_survival else decoded[:, SURVIVAL_SLOTS:]
+        core_following = following if self.predict_survival else following[:, SURVIVAL_SLOTS:]
+        core_changed = slot_changed if self.predict_survival else item_changed
+        diagnostics = {
+            # With survival enabled this is exactly the legacy all-16-slot
+            # metric. With it disabled, the same stable metric name denotes
+            # the 12 WM-owned item slots; the explicit flag below disambiguates
+            # CSV rows from the two modes.
+            "inventory_correct": core_decoded.eq(core_following).sum().float(),
+            "inventory_total": core_following.new_tensor(
+                float(core_following.numel()), dtype=torch.float32
+            ),
+            "inventory_changed_correct": (
+                core_decoded.eq(core_following) & core_changed
+            ).sum().float(),
+            "inventory_changed_count": core_changed.sum().float(),
+            "survival_changed_correct": (
+                (decoded[:, :SURVIVAL_SLOTS].eq(following[:, :SURVIVAL_SLOTS])
+                 & slot_changed[:, :SURVIVAL_SLOTS]).sum().float()
+                if self.predict_survival else zero
+            ),
+            "survival_changed_count": (
+                slot_changed[:, :SURVIVAL_SLOTS].sum().float()
+                if self.predict_survival else zero
+            ),
+            "survival_prediction_enabled": following.new_tensor(
+                float(self.predict_survival), dtype=torch.float32
+            ),
+            "item_value_changed_correct": (
+                item_value.eq(following[:, SURVIVAL_SLOTS:]) & item_changed
+            ).sum().float(),
+            "item_value_changed_count": item_changed.sum().float(),
+            "inventory_slot_changed_counts": slot_changed.sum(dim=0).float(),
+            "_zero": zero,
+        }
+        metric_prefix = "inventory_effect" if inventory_output_mode == "categorical_effect" else "inventory_gate"
+        diagnostics.update({
+            f"{metric_prefix}_true_positive": (gate_changed & item_changed).sum().float(),
+            f"{metric_prefix}_change_count": item_changed.sum().float(),
+            f"{metric_prefix}_false_positive": (gate_changed & ~item_changed).sum().float(),
+            f"{metric_prefix}_keep_count": (~item_changed).sum().float(),
+            f"item_slot_{metric_prefix}_true_positive": (gate_changed & item_changed).sum(dim=0).float(),
+            f"item_slot_{metric_prefix}_change_count": item_changed.sum(dim=0).float(),
+            f"item_slot_{metric_prefix}_false_positive": (gate_changed & ~item_changed).sum(dim=0).float(),
+            f"item_slot_{metric_prefix}_keep_count": (~item_changed).sum(dim=0).float(),
+            f"item_slot_{metric_prefix}_nll_sum": (gate_nll * item_changed).sum(dim=0),
+            f"item_slot_{metric_prefix}_nll_count": item_changed.sum(dim=0).float(),
+            f"item_{metric_prefix}_changed_nll_sum": value_nll[item_changed].sum(),
+            f"item_{metric_prefix}_changed_nll_count": item_changed.sum().float(),
+            f"{metric_prefix}_row_exact_correct": item_value.eq(following[:, SURVIVAL_SLOTS:]).all(dim=1).sum().float(),
+            f"{metric_prefix}_row_exact_total": zero.new_tensor(float(following.shape[0])),
+        })
+        if "item_event_scores" in inv_pred:
+            event_target = categorical_crafter_inventory_event_target(
+                current[:, SURVIVAL_SLOTS:], following[:, SURVIVAL_SLOTS:],
+                codebook=inv_pred["item_event_codebook"],
+            )
+            event_nll = F.cross_entropy(
+                inv_pred["item_event_scores"], event_target, reduction="none"
+            ) / math.log(float(inv_pred["item_event_scores"].shape[1]))
+            base_event = inv_pred["item_event_base_scores"].argmax(dim=1)
+            hard_rows = event_target.ne(0) | (event_target.eq(0) & base_event.ne(0))
+            diagnostics.update({
+                "inventory_event_residual_nll_sum": event_nll.sum(),
+                "inventory_event_residual_nll_count": zero.new_tensor(float(event_nll.numel())),
+                "inventory_event_residual_hard_rows": hard_rows.sum().float(),
+            })
+        return diagnostics
+
 
     def configure_optimizers(self):
         # Use a higher learning rate for the classification head so it adapts
@@ -980,6 +1446,7 @@ class AttentionWorldModel(pl.LightningModule):
                 'model.fc.' in name
                 or 'model.inv_head.' in name
                 or 'model.outcome_head.' in name
+                or 'model.crafter_pose_head.' in name
             ):
                 head_params.append(param)
             else:
@@ -1053,6 +1520,7 @@ class AttentionWorldModel(pl.LightningModule):
         latent_target = self._optional_action_failed_target(info, obs.shape[0], obs.device) \
             if self.stochastic_latent_v2_enabled else None
         latent_prediction = None
+        pose_logits = None
         if self.stochastic_latent_v2_enabled:
             latent_prediction = self.forward_distribution(
                 obs, act, info, inv=inv, next_state=obs_next,
@@ -1068,6 +1536,11 @@ class AttentionWorldModel(pl.LightningModule):
             attentionWeight = stochastic_prediction["attention_weights"]
             aux_pred = stochastic_prediction["inventory_logits"]
             outcome_logits = stochastic_prediction["outcome_logits"]
+        elif self.crafter_pose_enabled:
+            obs_pred, attentionWeight, aux_pred, pose_logits = self.forward_pose(
+                obs, act, info, inv=inv
+            )
+            outcome_logits = None
         else:
             obs_pred, attentionWeight, aux_pred = self(obs, act, info, inv=inv)
             outcome_logits = None
@@ -1137,6 +1610,13 @@ class AttentionWorldModel(pl.LightningModule):
         else:
             latent_kl = observation_loss.new_zeros(())
             latent_supervision = observation_loss.new_zeros(())
+        if pose_logits is not None:
+            pose_loss, pose_metrics = self._crafter_pose_loss_and_metrics(
+                pose_logits, obs, obs_next
+            )
+        else:
+            pose_loss = observation_loss.new_zeros(())
+            pose_metrics = None
 
         # Preserve field-level values only in the local Bipedal diagnostics CSV.
         if self.is_bipedal and hasattr(self.model, "bipedal_token_specs"):
@@ -1152,18 +1632,21 @@ class AttentionWorldModel(pl.LightningModule):
 
         if self.ewc_enabled:
             ewc_raw = self.ewc_loss()
+            ewc_weighted = self.lambda_ewc * ewc_raw
             optimization_objective = (
                 observation_loss
                 + self.stochastic_latent_loss_weight * outcome_loss
                 + self.latent_kl_weight * latent_kl
                 + self.latent_supervision_weight * latent_supervision
-                + self.lambda_ewc * ewc_raw
+                + pose_loss
+                + ewc_weighted
             )
         else:
             optimization_objective = (
                 observation_loss + self.stochastic_latent_loss_weight * outcome_loss
                 + self.latent_kl_weight * latent_kl
                 + self.latent_supervision_weight * latent_supervision
+                + pose_loss
             )
 
         # One public training-loss curve for every domain.
@@ -1174,6 +1657,24 @@ class AttentionWorldModel(pl.LightningModule):
             on_step=True,
             on_epoch=False,
         )
+        if pose_metrics is not None:
+            self.log("train/pose_loss", pose_loss, on_step=True, on_epoch=False)
+            self.log("train/pose_joint_accuracy", pose_metrics["joint_accuracy"], on_step=True, on_epoch=False)
+            self.log("train/pose_position_accuracy", pose_metrics["position_accuracy"], on_step=True, on_epoch=False)
+            self.log("train/pose_direction_accuracy", pose_metrics["direction_accuracy"], on_step=True, on_epoch=False)
+        if self.ewc_enabled:
+            # Diagnostics only: they are detached and cannot change the
+            # optimization objective. The ratio is relative to the base WM
+            # observation loss, with an epsilon for near-zero losses.
+            ewc_ratio = ewc_weighted.detach() / observation_loss.detach().abs().clamp_min(1e-8)
+            self.log("train/ewc_raw", ewc_raw.detach(), on_step=True, on_epoch=False)
+            self.log("train/ewc_weighted", ewc_weighted.detach(), on_step=True, on_epoch=False)
+            self.log("train/ewc_to_wm_ratio", ewc_ratio, on_step=True, on_epoch=False)
+            # Epoch means are the experiment-level diagnostics.  The existing
+            # step values above remain available for last-batch debugging.
+            self.log("train/ewc_raw_epoch", ewc_raw.detach(), on_step=False, on_epoch=True)
+            self.log("train/ewc_weighted_epoch", ewc_weighted.detach(), on_step=False, on_epoch=True)
+            self.log("train/ewc_to_wm_ratio_epoch", ewc_ratio, on_step=False, on_epoch=True)
         if outcome_logits is not None:
             outcome_probs = torch.softmax(outcome_logits, dim=-1)
             self.log("train/outcome_loss", outcome_loss, on_step=True, on_epoch=False)
@@ -1251,6 +1752,7 @@ class AttentionWorldModel(pl.LightningModule):
         latent_target = self._optional_action_failed_target(info, obs.shape[0], obs.device) \
             if self.stochastic_latent_v2_enabled else None
         latent_prediction = None
+        pose_logits = None
         if self.stochastic_latent_v2_enabled:
             latent_prediction = self.forward_distribution(
                 obs, act, info, inv=inv, next_state=obs_next,
@@ -1266,6 +1768,11 @@ class AttentionWorldModel(pl.LightningModule):
             attention_weight = stochastic_prediction["attention_weights"]
             inv_pred = stochastic_prediction["inventory_logits"]
             outcome_logits = stochastic_prediction["outcome_logits"]
+        elif self.crafter_pose_enabled:
+            obs_pred, attention_weight, inv_pred, pose_logits = self.forward_pose(
+                obs, act, info, inv=inv
+            )
+            outcome_logits = None
         else:
             obs_pred, attention_weight, inv_pred = self(obs, act, info, inv=inv)
             outcome_logits = None
@@ -1295,7 +1802,11 @@ class AttentionWorldModel(pl.LightningModule):
                 self.accumulate_loss(loss_map[i], agent_pos)
             if self.env_type == 'crafter' and inv_pred is not None and inv_next is not None:
                 # Store per-slot categorical error rates for diagnostics.
-                inv_reconstructed = decode_crafter_inventory(inv, inv_pred)
+                inv_reconstructed = decode_crafter_inventory(
+                    inv, inv_pred, predict_survival=self.predict_survival,
+                    output_mode=self.crafter_inventory_output_mode,
+                    value_mode=self.crafter_inventory_value_mode,
+                )
                 inv_slot_error = inv_reconstructed.ne(inv_next.long()).float().mean(dim=0)
                 self.inventory_loss_accumulator.append(inv_slot_error.detach().cpu())
   
@@ -1358,11 +1869,22 @@ class AttentionWorldModel(pl.LightningModule):
         else:
             latent_kl = transition_loss.new_zeros(())
             latent_supervision = transition_loss.new_zeros(())
-        loss_val = (
+        if pose_logits is not None:
+            pose_loss, pose_metrics = self._crafter_pose_loss_and_metrics(
+                pose_logits, obs, obs_next
+            )
+            self._val_crafter_pose_diagnostics.append({
+                "pose_loss": pose_loss.detach(),
+                **{name: value.detach() for name, value in pose_metrics.items()},
+            })
+        else:
+            pose_loss = transition_loss.new_zeros(())
+        base_loss_val = (
             transition_loss + self.stochastic_latent_loss_weight * outcome_loss
             + self.latent_kl_weight * latent_kl
             + self.latent_supervision_weight * latent_supervision
         )
+        loss_val = base_loss_val + pose_loss
 
         if success_mask is None or bool(success_mask.any()):
             natural_loss, natural_field_values = self.observation_loss(
@@ -1422,6 +1944,35 @@ class AttentionWorldModel(pl.LightningModule):
                     "false_set_rate": false_set.detach(),
                     "changed_count": changed_count.detach(),
                 })
+        elif self.env_type == "crafter":
+            with torch.no_grad():
+                changed_sum, changed_count = self._crafter_changed_diagnostics(
+                    obs_pred, obs_next, obs, inv, inv_next, inv_pred
+                )
+                if self._val_crafter_changed_loss_sum is None:
+                    self._val_crafter_changed_loss_sum = changed_sum.detach()
+                    self._val_crafter_changed_count = changed_count.detach()
+                else:
+                    self._val_crafter_changed_loss_sum = (
+                        self._val_crafter_changed_loss_sum + changed_sum.detach()
+                    )
+                    self._val_crafter_changed_count = (
+                        self._val_crafter_changed_count + changed_count.detach()
+                    )
+                inventory_diagnostics = self._crafter_inventory_diagnostics(
+                    inv, inv_next, inv_pred
+                )
+                if inventory_diagnostics is not None:
+                    if self._val_crafter_inventory_diagnostics is None:
+                        self._val_crafter_inventory_diagnostics = {
+                            name: value.detach()
+                            for name, value in inventory_diagnostics.items()
+                        }
+                    else:
+                        for name, value in inventory_diagnostics.items():
+                            self._val_crafter_inventory_diagnostics[name] = (
+                                self._val_crafter_inventory_diagnostics[name] + value.detach()
+                            )
         if outcome_logits is not None:
             outcome_probs = torch.softmax(outcome_logits, dim=-1)
             self._val_stochastic_outcomes.append({
@@ -1436,7 +1987,9 @@ class AttentionWorldModel(pl.LightningModule):
                 "latent_supervision": latent_supervision.detach(),
             })
 
-        self._val_step_outputs.append(loss_val.detach())
+        # Preserve the historical checkpoint metric: pose is an isolated
+        # auxiliary readout, so it must not alter WM checkpoint selection.
+        self._val_step_outputs.append(base_loss_val.detach())
 
         return {
             "loss_wm_val": loss_val,             
@@ -1449,6 +2002,10 @@ class AttentionWorldModel(pl.LightningModule):
         self._val_minigrid_diagnostics = []
         self._val_minigrid_effect_diagnostics = []
         self._val_stochastic_outcomes = []
+        self._val_crafter_changed_loss_sum = None
+        self._val_crafter_changed_count = None
+        self._val_crafter_inventory_diagnostics = None
+        self._val_crafter_pose_diagnostics = []
         if getattr(self.hparams, "keep_cell_loss", False):
             self.loss_accumulator = [[[] for _ in range(self.col)] for _ in range(self.row)]
             self.loss_map_result = None
@@ -1494,11 +2051,15 @@ class AttentionWorldModel(pl.LightningModule):
         if self._val_natural_outputs:
             self.log("val/natural_ce", torch.stack(self._val_natural_outputs).mean())
         if self._val_field_outputs:
+            field_means = {}
             field_names = sorted({name for row in self._val_field_outputs for name in row})
             for name in field_names:
                 values = [row[name] for row in self._val_field_outputs if name in row]
                 if values:
-                    self.log(f"val/{name}_nll", torch.stack(values).mean())
+                    field_means[name] = torch.stack(values).mean()
+                    self.log(f"val/{name}_nll", field_means[name])
+        else:
+            field_means = {}
         if self._val_minigrid_diagnostics:
             for name in self._val_minigrid_diagnostics[0]:
                 self.log(
@@ -1513,6 +2074,118 @@ class AttentionWorldModel(pl.LightningModule):
                         row[name] for row in self._val_minigrid_effect_diagnostics
                     ]).mean(),
                 )
+        if self.env_type == "crafter" and self._val_crafter_changed_loss_sum is not None:
+            count = self._val_crafter_changed_count
+            changed_nll = (
+                self._val_crafter_changed_loss_sum / count
+                if bool(count > 0)
+                else self._val_crafter_changed_loss_sum
+            )
+            self.log("val/changed_nll", changed_nll)
+            self.log("val/changed_count", count)
+        if self.env_type == "crafter" and self._val_crafter_inventory_diagnostics is not None:
+            diagnostics = self._val_crafter_inventory_diagnostics
+            zero = diagnostics["_zero"]
+            inventory_metric = (
+                "inventory_effect" if self.crafter_inventory_output_mode == "categorical_effect"
+                else "inventory_gate"
+            )
+            def _ratio(numerator, denominator):
+                return numerator / denominator if bool(denominator > 0) else zero
+            self.log(
+                "val/inventory_overall_accuracy",
+                _ratio(diagnostics["inventory_correct"], diagnostics["inventory_total"]),
+            )
+            self.log(
+                f"val/{inventory_metric}_change_recall",
+                _ratio(diagnostics[f"{inventory_metric}_true_positive"], diagnostics[f"{inventory_metric}_change_count"]),
+            )
+            self.log(
+                f"val/{inventory_metric}_change_precision",
+                _ratio(
+                    diagnostics[f"{inventory_metric}_true_positive"],
+                    diagnostics[f"{inventory_metric}_true_positive"]
+                    + diagnostics[f"{inventory_metric}_false_positive"],
+                ),
+            )
+            self.log(
+                f"val/{inventory_metric}_false_positive_rate",
+                _ratio(diagnostics[f"{inventory_metric}_false_positive"], diagnostics[f"{inventory_metric}_keep_count"]),
+            )
+            self.log(
+                "val/inventory_changed_accuracy",
+                _ratio(diagnostics["inventory_changed_correct"], diagnostics["inventory_changed_count"]),
+            )
+            self.log(
+                "val/survival_changed_accuracy",
+                _ratio(diagnostics["survival_changed_correct"], diagnostics["survival_changed_count"]),
+            )
+            self.log(
+                "val/survival_prediction_enabled",
+                zero.new_tensor(float(self.predict_survival)),
+            )
+            self.log(
+                f"val/{'item_effect' if self.crafter_inventory_output_mode == 'categorical_effect' else 'item_value'}_accuracy_on_changed",
+                _ratio(diagnostics["item_value_changed_correct"], diagnostics["item_value_changed_count"]),
+            )
+            self.log(
+                f"val/{inventory_metric}_row_exact",
+                _ratio(diagnostics[f"{inventory_metric}_row_exact_correct"], diagnostics[f"{inventory_metric}_row_exact_total"]),
+            )
+            for slot, count in enumerate(diagnostics["inventory_slot_changed_counts"]):
+                self.log(f"val/inventory_slot_{slot}_changed_count", count)
+            recalls = []
+            for slot in range(12):
+                slot_prefix = f"item_slot_{inventory_metric}"
+                changed_count = diagnostics[f"{slot_prefix}_change_count"][slot]
+                keep_count = diagnostics[f"{slot_prefix}_keep_count"][slot]
+                recall = _ratio(diagnostics[f"{slot_prefix}_true_positive"][slot], changed_count)
+                fpr = _ratio(diagnostics[f"{slot_prefix}_false_positive"][slot], keep_count)
+                self.log(f"val/inventory_slot_{slot + 4}_{inventory_metric}_recall", recall)
+                self.log(f"val/inventory_slot_{slot + 4}_{inventory_metric}_false_positive_rate", fpr)
+                if bool(changed_count > 0):
+                    recalls.append(recall)
+            # A fixed DR holdout uses this alongside natural observation loss
+            # for checkpoint selection; it has no gradient path.
+            slot_macro_recall = torch.stack(recalls).mean() if recalls else zero
+            self.log(f"val/{inventory_metric}_slot_macro_recall", slot_macro_recall)
+            slot_nlls = [
+                _ratio(diagnostics[f"{slot_prefix}_nll_sum"][slot], diagnostics[f"{slot_prefix}_nll_count"][slot])
+                for slot in range(12)
+                if bool(diagnostics[f"{slot_prefix}_nll_count"][slot] > 0)
+            ]
+            slot_macro_gate_nll = torch.stack(slot_nlls).mean() if slot_nlls else zero
+            changed_value_nll = _ratio(
+                diagnostics[f"item_{inventory_metric}_changed_nll_sum"], diagnostics[f"item_{inventory_metric}_changed_nll_count"]
+            )
+            self.log(f"val/{inventory_metric}_slot_macro_nll", slot_macro_gate_nll)
+            self.log(f"val/item_{inventory_metric}_changed_nll", changed_value_nll)
+            if "inventory_event_residual_nll_sum" in diagnostics:
+                self.log(
+                    "val/inventory_event_residual_nll",
+                    _ratio(diagnostics["inventory_event_residual_nll_sum"],
+                           diagnostics["inventory_event_residual_nll_count"]),
+                )
+                self.log(
+                    "val/inventory_event_residual_hard_rows",
+                    diagnostics["inventory_event_residual_hard_rows"],
+                )
+            # These field means are the natural (unweighted) observation NLLs.
+            object_nll = field_means.get("layout_object_effect", zero)
+            direction_nll = field_means.get("layout_direction_effect", zero)
+            self.log("val/selection_loss", crafter_selection_loss(
+                object_nll, direction_nll, slot_macro_gate_nll, changed_value_nll
+            ))
+        if self._val_crafter_pose_diagnostics:
+            for name in self._val_crafter_pose_diagnostics[0]:
+                self.log(
+                    f"val/{name}",
+                    torch.stack([row[name] for row in self._val_crafter_pose_diagnostics]).mean(),
+                )
+            pose_average = torch.stack([
+                row["pose_loss"] for row in self._val_crafter_pose_diagnostics
+            ]).mean()
+            self.log("val/total_loss_with_pose", avg_loss + pose_average)
         if self._val_stochastic_outcomes:
             for name in self._val_stochastic_outcomes[0]:
                 self.log(
@@ -1525,6 +2198,10 @@ class AttentionWorldModel(pl.LightningModule):
         self._val_minigrid_diagnostics = []
         self._val_minigrid_effect_diagnostics = []
         self._val_stochastic_outcomes = []
+        self._val_crafter_changed_loss_sum = None
+        self._val_crafter_changed_count = None
+        self._val_crafter_inventory_diagnostics = None
+        self._val_crafter_pose_diagnostics = []
 
     def on_save_checkpoint(self, checkpoint):
         if hasattr(self.model, "checkpoint_contract"):

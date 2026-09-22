@@ -687,7 +687,16 @@ def get_env(env_name: str, default: Optional[str] = None) -> str:
     return env_value
 
 def load_envs(env_file: Optional[str] = '.env') -> None:
-    dotenv.load_dotenv(dotenv_path=env_file, override=True)
+    # Resolve the repository .env independently of the caller's working
+    # directory.  Running ``python -m modelBased...`` from ``wm/`` otherwise
+    # misses the project-root file and fails later while importing constants
+    # such as PROJECT_ROOT.
+    env_path = Path(env_file)
+    if not env_path.is_absolute() and not env_path.exists():
+        repo_env = Path(__file__).resolve().parents[3] / env_file
+        if repo_env.exists():
+            env_path = repo_env
+    dotenv.load_dotenv(dotenv_path=env_path, override=True)
 
 
 def merge_data_dicts(d1: Dict[str, np.ndarray], d2: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:

@@ -260,7 +260,7 @@ def run(
             logger = False
 
     # callbacks
-    metric_to_monitor = 'val/observation_loss'
+    metric_to_monitor = str(getattr(cfg.attention_model, "checkpoint_metric", "val/observation_loss"))
     early_stop_callback = EarlyStopping(
         monitor=metric_to_monitor,
         min_delta=0.00,
@@ -408,10 +408,11 @@ def run(
             fisher_beta = float(getattr(cfg.attention_model, "fisher_beta", 0.5))
             scale_factor = float(getattr(cfg.attention_model, "scale_factor", 1.0))
             new_fisher = net.compute_fisher(
-                datamodule.train_dataloader(),
+                datamodule.fisher_dataloader(fisher_samples),
                 samples=fisher_samples,
                 scale_factor=scale_factor
             )
+            result["fisher_slot_counts"] = getattr(datamodule, "fisher_sampling_stats", {})
 
             # Merge Fisher estimates with EMA smoothing.
             if fisher is not None:
@@ -454,6 +455,10 @@ def run(
         result["mode"] = "train"
         result["old_params"] = old_params
         result["fisher"] = fisher
+        result["protected_replay_slot_counts"] = getattr(
+            datamodule.data_train.dataset, "protected_replay_slot_counts", {}
+        )
+        result["fisher_slot_counts"] = getattr(datamodule, "fisher_sampling_stats", {})
         
         # Capture best validation loss
         best_score = trainer.checkpoint_callback.best_model_score

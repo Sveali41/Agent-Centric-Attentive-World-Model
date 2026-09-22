@@ -193,7 +193,14 @@ class AttentionWMP2EAdapter:
     @torch.inference_mode()
     def imagine_step(self, images, action, inventory, target_mode: str):
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.amp):
-            return imagined_crafter_step_batch(self.world_model, images, action, inventory, int(self.world_model.mask_size), target_mode)
+            return imagined_crafter_step_batch(
+                self.world_model, images, action, inventory,
+                int(self.world_model.mask_size), target_mode,
+                inventory_value_mode=getattr(
+                    self.world_model, "crafter_inventory_value_mode",
+                    "categorical_absolute",
+                ),
+            )
 
     def train_batch(self, batch: dict[str, Any]) -> float:
         device = next(self.world_model.parameters()).device; self.world_model.train()

@@ -68,7 +68,180 @@ class WMRLDataset(Dataset):
         self.hparams = hparams
         self.obs_norm_values = hparams.obs_norm_values
         self.act_norm_values = hparams.action_norm_values
+        self.replay_sampling_stats = None
+        self.protected_replay_slot_counts = {}
         self.data = self.make_data(loaded, replay_data)
+
+    @staticmethod
+    def _crafter_replay_sampling_stats(types, actions, changed_slot_signatures=None):
+        labels = ("inventory_change", "map_interaction", "agent_dynamics", "static")
+        types = np.asarray(types, dtype=np.int64)
+        actions = np.asarray(actions, dtype=np.int64).reshape(-1)
+        signatures = None
+        if changed_slot_signatures is not None:
+            signatures = np.asarray(changed_slot_signatures, dtype=np.uint16).reshape(-1)
+            if len(signatures) != len(types):
+                raise ValueError("Crafter replay changed-slot statistics are not aligned")
+        result = {}
+        for type_id, label in enumerate(labels):
+            selected = actions[types == type_id]
+            result[label] = {
+                "count": int(len(selected)),
+                "actions": {
+                    int(a): int(c) for a, c in zip(*np.unique(selected, return_counts=True))
+                },
+                "changed_slots": (
+                    {
+                        int(slot + 4): int(
+                            np.sum((signatures[types == type_id] & (1 << slot)) != 0)
+                        )
+                        for slot in range(12)
+                        if np.any((signatures[types == type_id] & (1 << slot)) != 0)
+                    }
+                    if signatures is not None else {}
+                ),
+            }
+        return result
+
+    def _crafter_soft_replay_indices(self, replay_data, count, rng):
+        """Sample historical Crafter replay by persisted transition/action bucket."""
+        buckets = np.asarray(replay_data["_replay_bucket"], dtype=np.int64)
+        types = np.asarray(replay_data["_replay_transition_type"], dtype=np.int64)
+        actions = np.asarray(replay_data["act"], dtype=np.int64).reshape(-1)
+        if len(buckets) != len(types) or len(types) != len(actions):
+            raise ValueError("Crafter replay metadata is not aligned with obs/act")
+        protected_counts = {}
+        replay_cfg = getattr(self.hparams, "crafter_transition_replay", None)
+        protected_cfg = (
+            replay_cfg.get("protected_slot_replay", {}) if isinstance(replay_cfg, dict)
+            else getattr(replay_cfg, "protected_slot_replay", {})
+        ) if replay_cfg is not None else {}
+        protected_enabled = bool(
+            protected_cfg.get("enabled", False) if isinstance(protected_cfg, dict)
+            else getattr(protected_cfg, "enabled", False)
+        )
+        protected_min = int(
+            protected_cfg.get("min_samples_per_observed_slot", 32)
+            if isinstance(protected_cfg, dict)
+            else getattr(protected_cfg, "min_samples_per_observed_slot", 32)
+        )
+        if protected_min < 1:
+            raise ValueError("protected_slot_replay.min_samples_per_observed_slot must be positive")
+        if count >= len(buckets):
+            selected = np.arange(len(buckets), dtype=np.int64)
+        else:
+            if isinstance(replay_cfg, dict):
+                exponent = float(replay_cfg.get("balance_exponent", 0.5))
+                include_action = bool(replay_cfg.get("include_action", True))
+                include_changed_slot = bool(replay_cfg.get("include_changed_slot", False))
+                inventory_fraction = float(replay_cfg.get("inventory_replay_fraction", 0.0))
+            else:
+                exponent = float(getattr(replay_cfg, "balance_exponent", 0.5))
+                include_action = bool(getattr(replay_cfg, "include_action", True))
+                include_changed_slot = bool(getattr(replay_cfg, "include_changed_slot", False))
+                inventory_fraction = float(getattr(replay_cfg, "inventory_replay_fraction", 0.0))
+            if not np.isfinite(inventory_fraction) or not 0.0 <= inventory_fraction <= 1.0:
+                raise ValueError(
+                    "crafter_transition_replay.inventory_replay_fraction must be in [0, 1]"
+                )
+            if include_changed_slot:
+                signatures = np.asarray(
+                    replay_data.get("_replay_changed_slot_signature"), dtype=np.int64
+                ).reshape(-1)
+                if len(signatures) != len(types):
+                    raise ValueError("Crafter changed-slot replay metadata is not aligned with obs/act")
+                base = types * 17 + actions if include_action else types
+                sampling_buckets = base * (1 << 12) + signatures
+            else:
+                sampling_buckets = buckets if include_action else buckets // 17
+            # Protected rehearsal uses only real historical item transitions.
+            # Rarest observed slots claim their unique examples first; a
+            # multi-slot transition can satisfy several quotas without ever
+            # being duplicated in the training set.
+            protected = []
+            if protected_enabled:
+                signatures_u16 = np.asarray(
+                    replay_data["_replay_changed_slot_signature"], dtype=np.uint16
+                ).reshape(-1)
+                slot_freq = np.asarray([
+                    np.count_nonzero(signatures_u16 & (1 << slot))
+                    for slot in range(12)
+                ])
+                for slot in np.argsort(slot_freq, kind="stable"):
+                    if slot_freq[slot] == 0 or len(protected) >= count:
+                        continue
+                    already_covered = int(np.count_nonzero(
+                        signatures_u16[np.asarray(protected, dtype=np.int64)] & (1 << slot)
+                    )) if protected else 0
+                    needed = max(0, protected_min - already_covered)
+                    if needed == 0:
+                        continue
+                    candidates = np.flatnonzero((signatures_u16 & (1 << slot)) != 0)
+                    candidates = candidates[~np.isin(candidates, protected)]
+                    take = min(needed, len(candidates), count - len(protected))
+                    if take:
+                        chosen = rng.choice(candidates, size=take, replace=False)
+                        protected.extend(chosen.tolist())
+                protected = np.asarray(protected, dtype=np.int64)
+                for slot in range(12):
+                    protected_counts[int(slot + 4)] = int(np.count_nonzero(
+                        signatures_u16[protected] & (1 << slot)
+                    )) if len(protected) else 0
+            protected = np.asarray(protected, dtype=np.int64)
+            # Reserve a deterministic fraction of historical replay for real
+            # inventory transitions.  This is deliberately a quota rather
+            # than a loss weight: map/pose still see the remaining natural
+            # replay, while the inventory head receives a minimum amount of
+            # CHANGE supervision.  If the buffer contains fewer observed
+            # inventory transitions than the quota, all of them are retained.
+            inventory_quota = int(np.ceil(count * inventory_fraction))
+            if inventory_quota > 0 and len(protected) < count:
+                protected_inventory = int(np.count_nonzero(types[protected] == 0)) if len(protected) else 0
+                needed_inventory = max(0, inventory_quota - protected_inventory)
+                inventory_candidates = np.flatnonzero(types == 0)
+                inventory_candidates = inventory_candidates[
+                    ~np.isin(inventory_candidates, protected)
+                ]
+                take = min(needed_inventory, len(inventory_candidates), count - len(protected))
+                if take:
+                    _, inverse, frequencies = np.unique(
+                        sampling_buckets[inventory_candidates],
+                        return_inverse=True,
+                        return_counts=True,
+                    )
+                    weights = frequencies[inverse].astype(np.float64) ** (-exponent)
+                    weights /= weights.sum()
+                    chosen = rng.choice(
+                        inventory_candidates, size=take, replace=False, p=weights
+                    )
+                    protected = np.concatenate((protected, chosen.astype(np.int64, copy=False)))
+            if protected_enabled:
+                for slot in range(12):
+                    protected_counts[int(slot + 4)] = int(np.count_nonzero(
+                        signatures_u16[protected] & (1 << slot)
+                    )) if len(protected) else 0
+            remaining = count - len(protected)
+            available = np.setdiff1d(np.arange(len(buckets)), protected, assume_unique=False)
+            if remaining:
+                _, inverse, frequencies = np.unique(
+                    sampling_buckets[available], return_inverse=True, return_counts=True
+                )
+                weights = frequencies[inverse].astype(np.float64) ** (-exponent)
+                weights /= weights.sum()
+                fill = rng.choice(available, size=remaining, replace=False, p=weights)
+                selected = np.concatenate((protected, fill)).astype(np.int64, copy=False)
+            else:
+                selected = protected
+        selected_signatures = None
+        if "_replay_changed_slot_signature" in replay_data:
+            selected_signatures = np.asarray(
+                replay_data["_replay_changed_slot_signature"], dtype=np.uint16
+            )[selected]
+        self.replay_sampling_stats = self._crafter_replay_sampling_stats(
+            types[selected], actions[selected], selected_signatures
+        )
+        self.protected_replay_slot_counts = protected_counts
+        return selected
 
     def _minigrid_stochastic_latent_enabled(self):
         """Whether MiniGrid stochastic training needs natural sampling."""
@@ -313,6 +486,30 @@ class WMRLDataset(Dataset):
         # colour-aware categorical inventory in transition metadata.
         inv = loaded.get('g', None) if env_type == 'crafter' else None
         inv_next = loaded.get('h', None) if env_type == 'crafter' else None
+        replay_cfg = getattr(self.hparams, "crafter_transition_replay", None)
+        if isinstance(replay_cfg, dict):
+            crafter_transition_replay_enabled = bool(replay_cfg.get("enabled", False))
+        else:
+            crafter_transition_replay_enabled = bool(
+                getattr(replay_cfg, "enabled", False)
+            )
+        if env_type == "crafter" and crafter_transition_replay_enabled:
+            if inv is None or inv_next is None:
+                raise ValueError(
+                    "Crafter transition replay requires current inv/inv_next arrays"
+                )
+            inv_arr, inv_next_arr = np.asarray(inv), np.asarray(inv_next)
+            if (
+                inv_arr.ndim != 2
+                or inv_next_arr.ndim != 2
+                or inv_arr.shape != inv_next_arr.shape
+                or inv_arr.shape[0] != len(obs)
+                or inv_arr.shape[1] < 16
+            ):
+                raise ValueError(
+                    "Crafter transition replay requires aligned inv/inv_next "
+                    "arrays with shape (N, >=16)"
+                )
         if env_type == 'minigrid':
             inv, inv_next = self._minigrid_inventory_from_info(info, done)
 
@@ -380,9 +577,64 @@ class WMRLDataset(Dataset):
 
         if replay_data is not None and 'obs' in replay_data and replay_data['obs'] is not None:
             R = len(replay_data['obs'])
+            crafter_transition_replay = crafter_transition_replay_enabled
+            has_transition_metadata = (
+                "_replay_transition_type" in replay_data
+                and "_replay_bucket" in replay_data
+            )
+            if env_type == "crafter" and crafter_transition_replay and not has_transition_metadata:
+                # The transition-aware path must never silently degrade to
+                # natural replay: metadata is reconstructed by
+                # FisherReplayBuffer.load_from_dict before this DataModule is
+                # built.  A direct caller with a legacy dict should receive a
+                # clear diagnostic instead of an unprotected training phase.
+                raise ValueError(
+                    "Crafter transition replay is enabled, but replay_data is "
+                    "missing _replay_transition_type/_replay_bucket metadata; "
+                    "load it through FisherReplayBuffer.load_from_dict() first."
+                )
+            if env_type == "crafter" and crafter_transition_replay:
+                if isinstance(replay_cfg, dict):
+                    include_changed_slot = bool(replay_cfg.get("include_changed_slot", False))
+                else:
+                    include_changed_slot = bool(
+                        getattr(replay_cfg, "include_changed_slot", False)
+                    )
+                if include_changed_slot and "_replay_changed_slot_signature" not in replay_data:
+                    raise ValueError(
+                        "Crafter changed-slot replay is enabled, but replay_data is missing "
+                        "_replay_changed_slot_signature; load it through "
+                        "FisherReplayBuffer.load_from_dict() first."
+                    )
+            if env_type == "crafter" and crafter_transition_replay:
+                replay_inv = replay_data.get("inv", None)
+                replay_inv_next = replay_data.get("inv_next", None)
+                if replay_inv is None or replay_inv_next is None:
+                    raise ValueError(
+                        "Crafter transition replay requires replay inv/inv_next arrays"
+                    )
+                replay_inv_arr = np.asarray(replay_inv)
+                replay_inv_next_arr = np.asarray(replay_inv_next)
+                if (
+                    replay_inv_arr.ndim != 2
+                    or replay_inv_next_arr.ndim != 2
+                    or replay_inv_arr.shape != replay_inv_next_arr.shape
+                    or replay_inv_arr.shape[0] != R
+                    or replay_inv_arr.shape[1] < 16
+                ):
+                    raise ValueError(
+                        "Crafter transition replay requires aligned replay "
+                        "inv/inv_next arrays with shape (R, >=16)"
+                    )
             # Sample at most `max_replay` items from the replay buffer.
             if R > max_replay and max_replay > 0:
-                idx = rng.choice(R, size=max_replay, replace=False)
+                if env_type == "crafter" and crafter_transition_replay and has_transition_metadata:
+                    idx = self._crafter_soft_replay_indices(replay_data, max_replay, rng)
+                    # The mutable replay dict is an existing per-training-call transport
+                    # object; retain diagnostics without changing the dataset contract.
+                    replay_data["_replay_sampling_stats"] = self.replay_sampling_stats
+                else:
+                    idx = rng.choice(R, size=max_replay, replace=False)
                 r_obs      = replay_data['obs'][idx]
                 r_obs_next = replay_data['obs_next'][idx]
                 r_act      = replay_data['act'][idx]
@@ -408,6 +660,13 @@ class WMRLDataset(Dataset):
                     r_inv_next = np.zeros((len(idx), inv_dim), dtype=np.float32)
             else:
                 r_obs, r_obs_next, r_act = replay_data['obs'], replay_data['obs_next'], replay_data['act']
+                if env_type == "crafter" and crafter_transition_replay and has_transition_metadata:
+                    self.replay_sampling_stats = self._crafter_replay_sampling_stats(
+                        replay_data["_replay_transition_type"],
+                        replay_data["act"],
+                        replay_data.get("_replay_changed_slot_signature"),
+                    )
+                    replay_data["_replay_sampling_stats"] = self.replay_sampling_stats
                 r_info = (replay_data['info']
                         if (env_type in ('with_obj', 'minigrid') and 'info' in replay_data and replay_data['info'] is not None)
                         else None)
@@ -642,6 +901,58 @@ class WMRLDataModule(pl.LightningDataModule):
             self.data_train = torch.utils.data.Subset(data, range(0, split_size))
             self.data_test = torch.utils.data.Subset(data, range(split_size, len(data)))
 
+        # DR checkpoint selection must use a fixed, non-target archive.  It is
+        # deliberately constructed without replay and is never part of the
+        # train subset or the Fisher loader.
+        validation_base = data
+        validation_archive = getattr(self.cfg, "dr_validation_archive", None)
+        if validation_archive:
+            validation_path = os.path.abspath(os.path.expanduser(str(validation_archive)))
+            normalized = validation_path.replace("\\", "/").lower()
+            if (
+                "target_tasks" in normalized
+                or "coverage_v2" in normalized
+                or "coverage_v3" in normalized
+            ):
+                raise ValueError(
+                    "DR checkpoint validation must not use target_tasks or controlled coverage archives"
+                )
+            if not os.path.isfile(validation_path):
+                raise FileNotFoundError(
+                    "Configured DR validation archive is missing: " + validation_path +
+                    ". Build it from independent uniform-random, non-target DR archives with: "
+                    "python trainer/analysis/build_crafter_dr_validation.py "
+                    "--candidate <random_dr_archive.npz> --output " + validation_path +
+                    " --seed <validation_seed> --training-seed <training_seed>"
+                )
+            validation_loaded = np.load(validation_path, allow_pickle=True)
+            if "validation_provenance" not in validation_loaded.files or not np.all(
+                validation_loaded["validation_provenance"] == "dr_uniform_random_non_target_v1"
+            ):
+                raise ValueError(
+                    "DR validation archive lacks non-target uniform-random provenance; "
+                    "build it with trainer/analysis/build_crafter_dr_validation.py"
+                )
+            if "training_seed" not in validation_loaded.files or np.any(
+                validation_loaded["training_seed"] == validation_loaded["validation_seed"]
+            ):
+                raise ValueError("DR validation archive must record a distinct validation seed")
+            configured_seed = getattr(self.cfg, "seed", None)
+            if configured_seed is not None and np.any(
+                validation_loaded["training_seed"] != int(configured_seed)
+            ):
+                raise ValueError(
+                    "DR validation archive training_seed does not match the current run seed"
+                )
+            validation_base = WMRLDataset(validation_loaded, self.cfg, None)
+            if len(validation_base) == 0:
+                raise ValueError("DR validation archive is empty: " + validation_path)
+            self.data_test = torch.utils.data.Subset(validation_base, range(len(validation_base)))
+            # The archive replaces—not supplements—the historical 10% split.
+            # Every current/replay transition remains eligible for training.
+            self.data_train = torch.utils.data.Subset(data, range(len(data)))
+            print(f"[DataModule] Using fixed non-target DR validation archive: {validation_path}")
+
         # Target archives are validation-only and can be much larger than is
         # useful for repeated MAC evaluation.  When requested by the caller,
         # select one deterministic random subset from the full archive.  A
@@ -655,7 +966,7 @@ class WMRLDataModule(pl.LightningDataModule):
         )
         if max_validation_samples > 0:
             if sample_from_full:
-                candidates = np.arange(len(data), dtype=np.int64)
+                candidates = np.arange(len(validation_base), dtype=np.int64)
             else:
                 candidates = np.asarray(self.data_test.indices, dtype=np.int64)
             if len(candidates) > max_validation_samples:
@@ -671,7 +982,7 @@ class WMRLDataModule(pl.LightningDataModule):
                 # Sorting does not change membership and makes traversal and
                 # debugging reproducible as well as sampling reproducible.
                 selected.sort()
-                self.data_test = torch.utils.data.Subset(data, selected.tolist())
+                self.data_test = torch.utils.data.Subset(validation_base, selected.tolist())
                 source = "full archive" if sample_from_full else "validation holdout"
                 print(
                     f"[DataModule] Fixed validation subset: "
@@ -721,6 +1032,64 @@ class WMRLDataModule(pl.LightningDataModule):
             num_workers=num_workers,
             pin_memory=True,
             persistent_workers=bool(num_workers > 0)
+        )
+
+    def fisher_dataloader(self, samples: int):
+        """A deterministic Fisher loader that covers each observed Crafter slot."""
+        train_indices = np.asarray(self.data_train.indices, dtype=np.int64)
+        selected = np.empty(0, dtype=np.int64)
+        self.fisher_sampling_stats = {}
+        cfg = getattr(self.cfg, "fisher_slot_stratified", None)
+        enabled = bool(cfg.get("enabled", False) if isinstance(cfg, dict) else getattr(cfg, "enabled", False))
+        per_slot = int(cfg.get("min_samples_per_observed_slot", 16) if isinstance(cfg, dict) else getattr(cfg, "min_samples_per_observed_slot", 16)) if cfg is not None else 16
+        if enabled and str(getattr(self.cfg, "env_type", "")) == "crafter":
+            data = self.data_train.dataset.data
+            inv, inv_next = data.get("inv"), data.get("inv_next")
+            if inv is None or inv_next is None:
+                raise ValueError("fisher_slot_stratified requires Crafter inv/inv_next")
+            sig = np.sum(
+                (np.asarray(inv)[train_indices, 4:16] != np.asarray(inv_next)[train_indices, 4:16]).astype(np.uint16)
+                * (1 << np.arange(12, dtype=np.uint16))[None, :], axis=1, dtype=np.uint16
+            )
+            positions = []
+            frequencies = np.asarray([np.count_nonzero(sig & (1 << slot)) for slot in range(12)])
+            rng = np.random.default_rng(int(getattr(self.cfg, "seed", 0)))
+            for slot in np.argsort(frequencies, kind="stable"):
+                if frequencies[slot] == 0 or len(positions) >= samples:
+                    continue
+                already_covered = int(np.count_nonzero(
+                    sig[np.asarray(positions, dtype=np.int64)] & (1 << slot)
+                )) if positions else 0
+                needed = max(0, per_slot - already_covered)
+                if needed == 0:
+                    continue
+                candidates = np.flatnonzero((sig & (1 << slot)) != 0)
+                candidates = candidates[~np.isin(candidates, positions)]
+                take = min(needed, len(candidates), samples - len(positions))
+                if take:
+                    positions.extend(rng.choice(candidates, size=take, replace=False).tolist())
+            selected = train_indices[np.asarray(positions, dtype=np.int64)]
+        remaining = min(int(samples) - len(selected), len(train_indices) - len(selected))
+        if remaining > 0:
+            available = np.setdiff1d(train_indices, selected, assume_unique=False)
+            rng = np.random.default_rng(int(getattr(self.cfg, "seed", 0)) + 7919)
+            selected = np.concatenate((selected, rng.choice(available, size=remaining, replace=False)))
+        if enabled and str(getattr(self.cfg, "env_type", "")) == "crafter":
+            all_inv = np.asarray(self.data_train.dataset.data["inv"])[selected, 4:16]
+            all_next = np.asarray(self.data_train.dataset.data["inv_next"])[selected, 4:16]
+            final_sig = np.sum(
+                (all_inv != all_next).astype(np.uint16) * (1 << np.arange(12, dtype=np.uint16))[None, :],
+                axis=1, dtype=np.uint16,
+            )
+            self.fisher_sampling_stats = {
+                int(slot + 4): int(np.count_nonzero(final_sig & (1 << slot)))
+                for slot in range(12) if np.any(final_sig & (1 << slot))
+            }
+        return DataLoader(
+            torch.utils.data.Subset(self.data_train.dataset, selected.tolist()),
+            batch_size=self.cfg.batch_size, shuffle=False, drop_last=False,
+            num_workers=int(getattr(self.cfg, "n_cpu", 0)), pin_memory=True,
+            persistent_workers=bool(int(getattr(self.cfg, "n_cpu", 0)) > 0),
         )
 
     def val_dataloader(self):

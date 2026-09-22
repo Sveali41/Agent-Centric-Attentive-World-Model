@@ -350,7 +350,8 @@ class CustomCrafterEnv(gym.Env):
                 print(f"[CrafterCustomEnv] Parsed initial inventory: {self.initial_inventory}")
         elif not self.layout_str:
             # Fallback tiny map if nothing is provided
-            self.layout_str = "GGGGGGG\nGGGGGGG\nGGGPGGG\nGGGGGGG\nGGGGGGG"
+            # Crafter uses ``A`` for the player; ``P`` is a MiniGrid symbol.
+            self.layout_str = "GGGGGGG\nGGGGGGG\nGGGAGGG\nGGGGGGG\nGGGGGGG"
 
         self.initial_inventory.update(explicit_initial_inventory)
             
@@ -480,9 +481,10 @@ class CustomCrafterEnv(gym.Env):
         self.env._world = world
         self.env._player = player
 
-        # Critical fix: reload textures and rebuild view pipeline
+        # Reuse the textures loaded by crafter.Env.__init__. Textures are
+        # independent of the world; only the views need rebuilding because
+        # they retain a reference to the current world.
         from crafter import engine, constants
-        self.env._textures = engine.Textures(constants.root / "assets")
         view_h, view_w = self.env._view
         item_rows = int(np.ceil(len(constants.items) / view_h))
         self.env._local_view = engine.LocalView(

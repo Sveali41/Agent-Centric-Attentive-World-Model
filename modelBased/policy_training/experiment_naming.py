@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 import re
 
@@ -24,6 +25,19 @@ from modelBased.common.artifacts import (
     rmax_like_enabled,
     validate_acquisition_flags,
 )
+
+
+_WANDB_NAME_LIMIT = 128
+CRAFTER_ACHIEVEMENT_MASK_SUFFIX = "achmask22"
+_CHECKPOINT_SEED_PATTERN = re.compile(r"(?:^|_)seed(?P<seed>\d+)(?:_|$)")
+
+
+def _bounded_wandb_name(value: str, limit: int = _WANDB_NAME_LIMIT) -> str:
+    """Keep WandB identifiers within its limit without creating collisions."""
+    if len(value) <= limit:
+        return value
+    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:10]
+    return f"{value[: limit - len(digest) - 1]}_{digest}"
 
 
 def policy_training_source(cfg) -> str:
@@ -64,6 +78,52 @@ def _add_policy_experiment_label(path: Path, cfg) -> Path:
     return path.with_name(f"{stem}{path.suffix}").resolve()
 
 
+def _add_crafter_achievement_mask_suffix(path: Path, domain: str) -> Path:
+    """Keep 22-bit achievement-aware policies separate from legacy inputs."""
+    if str(domain).lower() != "crafter":
+        return path
+    stem = path.stem
+    if "_seed" in stem:
+        prefix, seed = stem.rsplit("_seed", 1)
+        stem = f"{prefix}_{CRAFTER_ACHIEVEMENT_MASK_SUFFIX}_seed{seed}"
+    else:
+        stem = f"{stem}_{CRAFTER_ACHIEVEMENT_MASK_SUFFIX}"
+    return path.with_name(f"{stem}{path.suffix}")
+
+
+def _crafter_planning_policy_path(cfg) -> Path:
+    """Name a Crafter imagined-policy by task and its actual WM seed."""
+    configured_wm = getattr(cfg.PPO, "checkpoint_path_wm", None)
+    if configured_wm is None or str(configured_wm).strip().lower() in {
+        "",
+        "null",
+        "none",
+    }:
+        configured_wm = getattr(
+            cfg.domains.crafter, "planning_world_model_checkpoint", None
+        )
+    if configured_wm is None or str(configured_wm).strip().lower() in {
+        "",
+        "null",
+        "none",
+    }:
+        raise ValueError(
+            "Crafter planning policy naming requires PPO.checkpoint_path_wm or "
+            "domains.crafter.planning_world_model_checkpoint"
+        )
+
+    matches = list(_CHECKPOINT_SEED_PATTERN.finditer(Path(str(configured_wm)).stem))
+    if not matches:
+        raise ValueError(
+            "Cannot determine the WM seed from Crafter checkpoint path "
+            f"{configured_wm!s}; include '_seed<N>' in the checkpoint filename"
+        )
+    wm_seed = int(matches[-1].group("seed"))
+    task_name = str(cfg.domains.crafter.task_name)
+    filename = f"policy_crafter_{task_name}_seed{wm_seed}.ckpt"
+    return (Path(str(cfg.PPO.checkpoint_dir)).expanduser() / filename).resolve()
+
+
 def policy_checkpoint_path(cfg, domain: str | None = None) -> Path:
     """Resolve an explicit override or the source-specific default path."""
     explicit = getattr(cfg.PPO, "checkpoint_path", None)
@@ -71,7 +131,10 @@ def policy_checkpoint_path(cfg, domain: str | None = None) -> Path:
         return Path(str(explicit)).expanduser().resolve()
 
     source = policy_training_source(cfg)
-    validate_acquisition_flags(cfg, str(domain or cfg.domain))
+    selected_domain = str(domain or cfg.domain)
+    validate_acquisition_flags(cfg, selected_domain)
+    if source == "planning" and selected_domain == "crafter":
+        return _crafter_planning_policy_path(cfg)
     if domain is not None and str(domain) != str(cfg.domain):
         task_name = str(cfg.domains[str(domain)].task_name)
         source_suffix = "_realenv" if source == "real_env" else ""
@@ -92,7 +155,9 @@ def policy_checkpoint_path(cfg, domain: str | None = None) -> Path:
             if continual_learning_enabled(cfg, str(domain))
             else path
         )
-        return _add_policy_experiment_label(path, cfg)
+        return _add_policy_experiment_label(
+            _add_crafter_achievement_mask_suffix(path, str(domain)), cfg
+        )
 
     field = f"checkpoint_path_{source}"
     if not hasattr(cfg.PPO, field):
@@ -111,7 +176,32 @@ def policy_checkpoint_path(cfg, domain: str | None = None) -> Path:
         if continual_learning_enabled(cfg, str(domain or cfg.domain))
         else path
     )
-    return _add_policy_experiment_label(path, cfg)
+    return _add_policy_experiment_label(
+        _add_crafter_achievement_mask_suffix(path, str(domain or cfg.domain)), cfg
+    )
+
+
+def policy_selection_paths(checkpoint_path: str | Path) -> dict[str, Path]:
+    """Return canonical, best, last, and selection-manifest policy artifacts."""
+    canonical = Path(checkpoint_path).expanduser().resolve()
+    suffix = canonical.suffix or ".ckpt"
+    stem = canonical.stem if canonical.suffix else canonical.name
+    return {
+        "canonical": canonical,
+        "best": canonical.with_name(f"{stem}_best{suffix}"),
+        "last": canonical.with_name(f"{stem}_last{suffix}"),
+        "manifest": canonical.with_name(f"{stem}_selection.json"),
+    }
+
+
+def policy_checkpoint_for_evaluation(cfg, domain: str | None = None) -> Path:
+    """Return the canonical artifact, which selection keeps equal to best."""
+    return policy_checkpoint_path(cfg, domain=domain)
+
+
+def policy_validation_stem(cfg, domain: str | None = None) -> str:
+    """Derive evaluation artifact names from the exact policy being loaded."""
+    return f"{policy_checkpoint_for_evaluation(cfg, domain=domain).stem}_test"
 
 
 def policy_wandb_identity(cfg) -> tuple[str, str, str]:
@@ -134,6 +224,8 @@ def policy_wandb_identity(cfg) -> tuple[str, str, str]:
         group_base += f"_{RMAX_LIKE_SUFFIX}"
     if continual_learning_enabled(cfg, domain):
         group_base += "_continue"
+    if domain == "crafter":
+        group_base += f"_{CRAFTER_ACHIEVEMENT_MASK_SUFFIX}"
     group = (
         f"{group_base}_realenv_policy"
         if source == "real_env"
@@ -150,13 +242,16 @@ def policy_wandb_identity(cfg) -> tuple[str, str, str]:
         run_base += f"_{RMAX_LIKE_SUFFIX}"
     if continual_learning_enabled(cfg, domain):
         run_base += "_continue"
+    if domain == "crafter":
+        run_base += f"_{CRAFTER_ACHIEVEMENT_MASK_SUFFIX}"
     if source == "real_env":
         run_base += "_realenv"
     experiment_label = policy_experiment_label(cfg)
     if experiment_label:
         group += f"_{experiment_label}"
         run_base += f"_{experiment_label}"
-    run_name = f"{run_base}_seed{seed}"
+    group = _bounded_wandb_name(group)
+    run_name = _bounded_wandb_name(f"{run_base}_seed{seed}")
     return group, run_name, source
 
 
@@ -181,7 +276,7 @@ def policy_checkpoint_is_compatible(path, cfg, domain: str = "minigrid") -> bool
         width = max(len(line) for line in layout_lines)
         if domain == "crafter":
             inventory_dim = int(getattr(cfg.domains[domain], "inventory_dim", 16))
-            expected_state_dim = 2 * height * width + inventory_dim
+            expected_state_dim = 2 * height * width + inventory_dim + 22
             expected_action_dim = 17
         else:
             expected_state_dim = 3 * height * width + INVENTORY_TOKEN_COUNT

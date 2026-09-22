@@ -1,10 +1,14 @@
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Mapping
 
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
+from modelBased.world_model.crafter_dynamics import CRAFTER_CANONICAL_EVENT_CODEBOOK
 
 PLAYER_ID = 13  # Updated: player ID in new CustomCrafterEnv mapping (was 10)
 
@@ -14,6 +18,345 @@ CRAFTER_INVENTORY_LABELS = (
     "Wood_Pickaxe", "Stone_Pickaxe", "Iron_Pickaxe",
     "Wood_Sword", "Stone_Sword", "Iron_Sword",
 )
+
+
+@dataclass(frozen=True)
+class CrafterPlanningCheckpointSpec:
+    """The complete Crafter WM contract required by imagined PPO rollouts."""
+
+    data_type: str
+    grid_shape: tuple[int, int, int]
+    frame_stack: int
+    attention_mask_size: int
+    embed_dim: int
+    num_heads: int
+    output_mode: str
+    inventory_output_mode: str
+    inventory_classes: int
+    inventory_value_mode: str
+    inventory_architecture: str
+    inventory_event_residual_enabled: bool
+    inventory_event_residual_hidden_dims: tuple[int, ...]
+    inventory_event_residual_action_embed_dim: int
+    inventory_event_residual_change_bias: float
+    pose_enabled: bool
+    pose_mode: str
+    predict_survival: bool
+    obs_norm_values: tuple[float, ...]
+    action_count: int
+
+
+def _checkpoint_value(mapping: Mapping[str, Any], key: str, default: Any = None) -> Any:
+    """Read ordinary dicts and OmegaConf mappings without resolving config text."""
+    try:
+        return mapping.get(key, default)
+    except AttributeError:
+        return default
+
+
+def _canonical_crafter_state_dict(raw_state: Mapping[str, Any]) -> dict[str, torch.Tensor]:
+    state = {
+        str(key)[6:] if str(key).startswith("model.") else str(key): value
+        for key, value in raw_state.items()
+    }
+    if not state or not all(isinstance(value, torch.Tensor) for value in state.values()):
+        raise ValueError("Crafter checkpoint state_dict must contain tensor parameters")
+    return state
+
+
+def _single_head_width(state: Mapping[str, torch.Tensor], suffix: str) -> int:
+    # Do not let ``crafter_inventory_action_embedding`` masquerade as the
+    # shared ``action_embedding`` merely because their text suffix overlaps.
+    widths = [int(value.shape[0]) for key, value in state.items()
+              if (key == suffix or key.endswith("." + suffix)) and value.ndim == 2]
+    if len(widths) != 1:
+        raise ValueError(f"Crafter checkpoint must contain exactly one {suffix} tensor")
+    return widths[0]
+
+
+def _validate_inventory_architecture(state: Mapping[str, torch.Tensor], architecture: str) -> str:
+    """Validate decoder keys so planning never guesses an inventory head."""
+    architecture = str(architecture or "shared_pool_v1").lower()
+    if architecture not in {"shared_pool_v1", "isolated_global_v1", "slot_attention_v1"}:
+        raise ValueError(f"Unsupported Crafter inventory architecture {architecture!r}")
+    if architecture == "shared_pool_v1":
+        _single_head_width(state, "inv_head.2.weight")
+    elif architecture == "isolated_global_v1":
+        if _single_head_width(state, "crafter_inventory_head.2.weight") != 60:
+            raise ValueError("isolated_global_v1 requires a 12x5 inventory head")
+        if _single_head_width(state, "crafter_inventory_action_embedding.weight") != 17:
+            raise ValueError("isolated_global_v1 requires a 17-action private embedding")
+    else:
+        if _single_head_width(state, "crafter_inventory_slot_head.2.weight") != 5:
+            raise ValueError("slot_attention_v1 requires a 5-way per-slot head")
+        if _single_head_width(state, "crafter_inventory_action_embedding.weight") != 17:
+            raise ValueError("slot_attention_v1 requires a 17-action private embedding")
+        required = {"crafter_inventory_value_embedding.weight", "crafter_inventory_slot_embedding"}
+        if not required.issubset(state):
+            raise ValueError("slot_attention_v1 checkpoint lacks inventory token parameters")
+    return architecture
+
+
+def _validate_event_residual(
+    state: Mapping[str, torch.Tensor], inventory: Mapping[str, Any],
+) -> tuple[bool, tuple[int, ...], int, float]:
+    """Validate opt-in residual metadata and tensors; legacy is disabled."""
+    residual = _checkpoint_value(inventory, "event_residual", {})
+    enabled = bool(_checkpoint_value(residual, "enabled", False))
+    if not enabled:
+        if any(key.startswith("crafter_inventory_event_") for key in state):
+            raise ValueError("Crafter checkpoint has event residual tensors but contract disables it")
+        return False, (), 0, 0.0
+    hidden = tuple(int(value) for value in _checkpoint_value(residual, "hidden_dims", ()))
+    action_dim = int(_checkpoint_value(residual, "action_embed_dim", 0))
+    bias = float(_checkpoint_value(residual, "change_bias", float("nan")))
+    codebook = _checkpoint_value(residual, "codebook", None)
+    if not hidden or any(value <= 0 for value in hidden) or action_dim <= 0 or not np.isfinite(bias):
+        raise ValueError("Crafter event residual contract has invalid dimensions or change_bias")
+    if not isinstance(codebook, list) or len(codebook) != 17 or any(len(row) != 12 for row in codebook):
+        raise ValueError("Crafter event residual contract requires a [17,12] codebook")
+    expected = torch.tensor(codebook, dtype=torch.long)
+    if expected.tolist() != [list(row) for row in CRAFTER_CANONICAL_EVENT_CODEBOOK]:
+        raise ValueError("Crafter event residual contract codebook is not canonical")
+    buffer = state.get("crafter_inventory_event_codebook")
+    if buffer is None or not torch.equal(buffer.long(), expected):
+        raise ValueError("Crafter event residual codebook metadata does not match checkpoint")
+    if _single_head_width(state, "crafter_inventory_event_action_embedding.weight") != 17:
+        raise ValueError("Crafter event residual requires a 17-action embedding")
+    final_weight = state.get("crafter_inventory_event_residual.%d.weight" % (2 * len(hidden)))
+    if final_weight is None or tuple(final_weight.shape) != (17, hidden[-1]):
+        raise ValueError("Crafter event residual final layer does not match contract")
+    return True, hidden, action_dim, bias
+
+
+def _infer_attention_mask_size(state: Mapping[str, torch.Tensor]) -> int:
+    widths = [int(value.shape[1]) for key, value in state.items()
+              if key.endswith("pos_embedding") and value.ndim == 3]
+    if len(widths) != 1:
+        raise ValueError("Crafter checkpoint must contain exactly one positional embedding")
+    side = int(round(widths[0] ** 0.5))
+    if side * side != widths[0]:
+        raise ValueError(f"Crafter positional embedding has non-square token count {widths[0]}")
+    return side
+
+
+def _infer_embed_dim(state: Mapping[str, torch.Tensor]) -> int:
+    tensors = [value for key, value in state.items()
+               if key.endswith("pos_embedding") and value.ndim == 3]
+    if len(tensors) != 1:
+        raise ValueError("Crafter checkpoint must contain exactly one positional embedding")
+    return int(tensors[0].shape[2])
+
+
+def _crafter_contract_from_hparams(hparams: Mapping[str, Any], state: Mapping[str, torch.Tensor]) -> dict[str, Any]:
+    """Recover the pre-contract checkpoint format, validating every inferable field."""
+    if str(_checkpoint_value(hparams, "env_type", "")) != "crafter":
+        raise ValueError("Checkpoint metadata is not for env_type='crafter'")
+    if str(_checkpoint_value(hparams, "data_type", "")) != "discrete":
+        raise ValueError("Crafter planning requires data_type='discrete'")
+    if str(_checkpoint_value(hparams, "model_type", "")).lower() != "attention":
+        raise ValueError("Crafter imagined planning requires an Attention WM checkpoint")
+    grid_shape = tuple(int(v) for v in _checkpoint_value(hparams, "grid_shape", ()))
+    if len(grid_shape) != 3 or grid_shape[0] != 2:
+        raise ValueError(f"Crafter checkpoint requires grid_shape=[2,H,W], got {grid_shape}")
+    action_count = int(_checkpoint_value(hparams, "action_norm_values", 0))
+    if action_count != 17 or _single_head_width(state, "action_embedding.weight") != 17:
+        raise ValueError(f"Crafter planning requires 17 actions, got {action_count}")
+    inventory_output_mode = str(
+        _checkpoint_value(hparams, "crafter_inventory_output_mode", "categorical_gate")
+    ).lower()
+    value_mode = str(_checkpoint_value(hparams, "crafter_inventory_value_mode", "")).lower()
+    inventory_architecture = _validate_inventory_architecture(
+        state, _checkpoint_value(hparams, "crafter_inventory_architecture", "shared_pool_v1")
+    )
+    if inventory_architecture != "shared_pool_v1" and inventory_output_mode != "categorical_effect":
+        raise ValueError(
+            "Isolated Crafter inventory architectures require "
+            "crafter_inventory_output_mode='categorical_effect'"
+        )
+    inventory_width = (
+        _single_head_width(state, "inv_head.2.weight")
+        if inventory_architecture == "shared_pool_v1" else 104
+    )
+    expected_width = {"categorical_absolute": 188, "categorical_delta": 116}
+    if inventory_output_mode == "categorical_effect":
+        valid_inventory = inventory_width == 104
+    else:
+        valid_inventory = value_mode in expected_width and inventory_width == expected_width[value_mode]
+    if not valid_inventory:
+        raise ValueError(
+            "Crafter inventory metadata/head mismatch: "
+            f"output_mode={inventory_output_mode!r}, value_mode={value_mode!r}, "
+            f"output width={inventory_width}; expected 188 for categorical_absolute, "
+            "116 for categorical_delta, or 104 for categorical_effect"
+        )
+    if inventory_architecture != "shared_pool_v1" and bool(_checkpoint_value(hparams, "predict_survival", True)):
+        raise ValueError("Isolated Crafter inventory checkpoint requires predict_survival=false")
+    pose_cfg = _checkpoint_value(hparams, "crafter_pose", {})
+    pose_enabled = bool(_checkpoint_value(pose_cfg, "enabled", False))
+    pose_mode = str(_checkpoint_value(pose_cfg, "mode", "learned_detached")).lower()
+    pose_keys = [key for key in state if key.startswith("crafter_pose_head.")]
+    if pose_enabled != bool(pose_keys):
+        raise ValueError("Crafter pose metadata does not match checkpoint pose-head tensors")
+    if pose_enabled and (pose_mode != "learned_detached" or _single_head_width(state, "crafter_pose_head.2.weight") != 20):
+        raise ValueError("Crafter pose checkpoint must use a learned_detached 20-way pose head")
+    output_mode = crafter_output_mode_from_state_dict(state)
+    if output_mode != "effect":
+        raise ValueError("Crafter imagined planning requires categorical effect map outputs")
+    inferred_mask = _infer_attention_mask_size(state)
+    inferred_embed_dim = _infer_embed_dim(state)
+    if int(_checkpoint_value(hparams, "embed_dim", 0)) != inferred_embed_dim:
+        raise ValueError("Crafter hparams embed_dim does not match positional embedding")
+    saved_mask = _checkpoint_value(hparams, "attention_mask_size", None)
+    if isinstance(saved_mask, (int, float)) and int(saved_mask) != inferred_mask:
+        raise ValueError("Crafter hparams attention_mask_size does not match positional embedding")
+    if "predict_survival" not in hparams:
+        raise ValueError("Crafter legacy checkpoint lacks required predict_survival semantic metadata")
+    return {
+        "version": "crafter_planning_v1",
+        "domain": "crafter",
+        "data_type": str(_checkpoint_value(hparams, "data_type", "")),
+        "grid_shape": list(grid_shape),
+        "frame_stack": int(_checkpoint_value(hparams, "frame_stack", 1)),
+        "attention_mask_size": inferred_mask,
+        "embed_dim": inferred_embed_dim,
+        "num_heads": int(_checkpoint_value(hparams, "num_heads", 0)),
+        "output_mode": output_mode,
+        "inventory": {
+            "output_mode": inventory_output_mode, "classes": 10, "value_mode": value_mode,
+            "architecture": inventory_architecture,
+            "effect_values": [-4, -2, -1, 1] if inventory_output_mode == "categorical_effect" else None,
+            "event_residual": {"enabled": False},
+        },
+        "pose": {"enabled": pose_enabled, "mode": pose_mode},
+        "predict_survival": bool(_checkpoint_value(hparams, "predict_survival", True)),
+        "obs_norm_values": list(_checkpoint_value(hparams, "obs_norm_values", ())),
+        "action_count": action_count,
+    }
+
+
+def _spec_from_contract(contract: Mapping[str, Any], state: Mapping[str, torch.Tensor]) -> CrafterPlanningCheckpointSpec:
+    if str(_checkpoint_value(contract, "domain", "")) != "crafter":
+        raise ValueError("Checkpoint world_model_contract is not for Crafter")
+    if "predict_survival" not in contract:
+        raise ValueError("Crafter world_model_contract lacks predict_survival ownership")
+    if str(_checkpoint_value(contract, "data_type", "")) != "discrete":
+        raise ValueError("Crafter contract requires data_type='discrete'")
+    inventory = _checkpoint_value(contract, "inventory", {})
+    pose = _checkpoint_value(contract, "pose", {})
+    inventory_output_mode = str(_checkpoint_value(inventory, "output_mode", ""))
+    if inventory_output_mode not in {"categorical_gate", "categorical_effect"} or int(_checkpoint_value(inventory, "classes", 0)) != 10:
+        raise ValueError("Crafter contract requires categorical_gate/effect inventory with 10 values")
+    value_mode = str(_checkpoint_value(inventory, "value_mode", "")).lower()
+    inventory_architecture = _validate_inventory_architecture(
+        state, _checkpoint_value(inventory, "architecture", "shared_pool_v1")
+    )
+    residual_enabled, residual_hidden, residual_action_dim, residual_bias = _validate_event_residual(
+        state, inventory
+    )
+    if inventory_architecture != "shared_pool_v1" and inventory_output_mode != "categorical_effect":
+        raise ValueError(
+            "Isolated Crafter inventory architectures require "
+            "inventory.output_mode='categorical_effect'"
+        )
+    expected_width = {"categorical_absolute": 188, "categorical_delta": 116}
+    if inventory_output_mode == "categorical_effect":
+        if list(_checkpoint_value(inventory, "effect_values", ())) != [-4, -2, -1, 1]:
+            raise ValueError("Crafter categorical_effect contract requires effect_values [-4, -2, -1, 1]")
+        valid_inventory = (
+            _single_head_width(state, "inv_head.2.weight") == 104
+            if inventory_architecture == "shared_pool_v1" else True
+        )
+    else:
+        valid_inventory = value_mode in expected_width and _single_head_width(state, "inv_head.2.weight") == expected_width[value_mode]
+    if not valid_inventory:
+        raise ValueError("Crafter world_model_contract inventory mode does not match inv_head shape")
+    if inventory_architecture != "shared_pool_v1" and bool(_checkpoint_value(contract, "predict_survival", True)):
+        raise ValueError("Isolated Crafter inventory contract requires predict_survival=false")
+    pose_enabled = bool(_checkpoint_value(pose, "enabled", False))
+    pose_keys = [key for key in state if key.startswith("crafter_pose_head.")]
+    if pose_enabled != bool(pose_keys):
+        raise ValueError("Crafter world_model_contract pose metadata does not match pose-head tensors")
+    if pose_enabled and (_checkpoint_value(pose, "mode", "") != "learned_detached" or _single_head_width(state, "crafter_pose_head.2.weight") != 20):
+        raise ValueError("Crafter pose contract requires learned_detached 20-way head")
+    output_mode = str(_checkpoint_value(contract, "output_mode", ""))
+    if output_mode != crafter_output_mode_from_state_dict(state) or output_mode != "effect":
+        raise ValueError("Crafter world_model_contract output mode does not match fc head")
+    action_count = int(_checkpoint_value(contract, "action_count", 0))
+    if action_count != 17 or _single_head_width(state, "action_embedding.weight") != 17:
+        raise ValueError("Crafter planning requires a 17-action checkpoint")
+    grid_shape = tuple(int(v) for v in _checkpoint_value(contract, "grid_shape", ()))
+    if len(grid_shape) != 3 or grid_shape[0] != 2:
+        raise ValueError("Crafter contract requires grid_shape=[2,H,W]")
+    mask_size = int(_checkpoint_value(contract, "attention_mask_size", 0))
+    if mask_size != _infer_attention_mask_size(state):
+        raise ValueError("Crafter contract attention_mask_size does not match positional embedding")
+    obs_norm_values = tuple(float(v) for v in _checkpoint_value(contract, "obs_norm_values", ()))
+    if len(obs_norm_values) < 2:
+        raise ValueError("Crafter contract must provide at least two observation normalizers")
+    embed_dim = int(_checkpoint_value(contract, "embed_dim", 0))
+    num_heads = int(_checkpoint_value(contract, "num_heads", 0))
+    if embed_dim != _infer_embed_dim(state) or embed_dim < 8 or num_heads < 1 or embed_dim % num_heads:
+        raise ValueError("Crafter contract has invalid embed_dim/num_heads")
+    return CrafterPlanningCheckpointSpec(
+        data_type=str(_checkpoint_value(contract, "data_type", "")), grid_shape=grid_shape,
+        frame_stack=int(_checkpoint_value(contract, "frame_stack", 1)), attention_mask_size=mask_size,
+        embed_dim=embed_dim, num_heads=num_heads,
+        output_mode=output_mode, inventory_output_mode=str(_checkpoint_value(inventory, "output_mode", "")),
+        inventory_classes=int(_checkpoint_value(inventory, "classes", 0)), inventory_value_mode=value_mode,
+        inventory_architecture=inventory_architecture,
+        inventory_event_residual_enabled=residual_enabled,
+        inventory_event_residual_hidden_dims=residual_hidden,
+        inventory_event_residual_action_embed_dim=residual_action_dim,
+        inventory_event_residual_change_bias=residual_bias,
+        pose_enabled=pose_enabled, pose_mode=str(_checkpoint_value(pose, "mode", "")),
+        predict_survival=bool(_checkpoint_value(contract, "predict_survival", True)), obs_norm_values=obs_norm_values,
+        action_count=action_count,
+    )
+
+
+def inspect_crafter_planning_checkpoint(path: str | Path) -> CrafterPlanningCheckpointSpec:
+    """Inspect a semantic Crafter checkpoint before constructing planning WM."""
+    raw = torch.load(Path(path).expanduser().resolve(), map_location="cpu", weights_only=False)
+    if not isinstance(raw, Mapping) or "state_dict" not in raw:
+        raise ValueError("Crafter planning refuses a pure state_dict without semantic metadata")
+    state = _canonical_crafter_state_dict(raw["state_dict"])
+    contract = raw.get("world_model_contract")
+    if contract is None:
+        hparams = raw.get("hyper_parameters")
+        if hparams is None:
+            raise ValueError("Crafter planning checkpoint lacks world_model_contract and Lightning hyper_parameters")
+        contract = _crafter_contract_from_hparams(hparams, state)
+    return _spec_from_contract(contract, state)
+
+
+def load_crafter_planning_model(path: str | Path):
+    """Strictly load the Attention WM selected by its checkpoint contract."""
+    spec = inspect_crafter_planning_checkpoint(path)
+    from modelBased.world_model.AttentionWM_support import AttentionModule
+
+    model = AttentionModule(
+        spec.data_type, spec.grid_shape, spec.attention_mask_size, spec.embed_dim, spec.num_heads,
+        env_type="crafter", frame_stack=spec.frame_stack, crafter_output_mode=spec.output_mode,
+        crafter_inventory_classes=spec.inventory_classes,
+        crafter_inventory_output_mode=spec.inventory_output_mode,
+        crafter_inventory_value_mode=spec.inventory_value_mode,
+        crafter_inventory_architecture=spec.inventory_architecture,
+        crafter_pose_enabled=spec.pose_enabled,
+        crafter_inventory_event_residual_enabled=spec.inventory_event_residual_enabled,
+        crafter_inventory_event_residual_hidden_dims=spec.inventory_event_residual_hidden_dims or (64,),
+        crafter_inventory_event_residual_action_embed_dim=(
+            spec.inventory_event_residual_action_embed_dim or 8
+        ),
+        crafter_inventory_event_residual_change_bias=spec.inventory_event_residual_change_bias,
+    )
+    raw = torch.load(Path(path).expanduser().resolve(), map_location="cpu", weights_only=False)
+    state = _canonical_crafter_state_dict(raw["state_dict"])
+    model.load_state_dict(state, strict=True)
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+    model.eval()
+    return model, spec
 
 
 def _to_nchw(obs: np.ndarray) -> np.ndarray:
@@ -35,7 +378,6 @@ def _to_nchw(obs: np.ndarray) -> np.ndarray:
 def interpret_env(terrain_map, cfg, inventory_vec=None):
     import torch
     import numpy as np
-    from legacy.generator.crafter_env_designer import CRAFTER_OBJ_MAP
     
     # Handle inputs
     if isinstance(terrain_map, torch.Tensor):
@@ -299,7 +641,6 @@ def plot_crafter_coverage_from_npz(data_path: str, save_path: str | None = None,
 # ============================================================
 #  World Model Support Functions for Crafter (Categorical Effects)
 # ============================================================
-import torch
 import torch.nn.functional as F
 
 from modelBased.world_model.crafter_dynamics import (
@@ -441,6 +782,9 @@ def crafter_effect_loss(
 def crafter_reconstruct_from_logits(
     prediction: torch.Tensor,
     current: torch.Tensor | None = None,
+    *,
+    constrain_agent: bool = False,
+    suppress_agent: bool = False,
 ) -> torch.Tensor:
     """
     Reconstruct Crafter channels from effect logits.
@@ -450,8 +794,17 @@ def crafter_reconstruct_from_logits(
     without being confused with the new 27-channel effect artifacts.
     """
     channels = int(prediction.shape[1])
+    if constrain_agent and suppress_agent:
+        raise ValueError("Crafter decode cannot both constrain and suppress the player")
     if channels == CRAFTER_ABSOLUTE_CHANNELS:
-        obj_pred = prediction[:, :CRAFTER_OBJ_CLASSES].argmax(dim=1)
+        obj_logits = prediction[:, :CRAFTER_OBJ_CLASSES]
+        obj_pred = obj_logits.argmax(dim=1)
+        if constrain_agent:
+            obj_pred = _decode_crafter_object_with_single_agent(
+                obj_logits, current_obj=None
+            )
+        elif suppress_agent:
+            obj_pred = _decode_crafter_object_without_agent(obj_logits, current_obj=None)
         dir_pred = prediction[:, CRAFTER_OBJ_CLASSES:].argmax(dim=1)
         return torch.stack([obj_pred, dir_pred], dim=1).float()
     if channels != CRAFTER_EFFECT_CHANNELS:
@@ -462,11 +815,96 @@ def crafter_reconstruct_from_logits(
         )
     if current is None:
         raise ValueError("Current Crafter state is required to apply categorical effects")
-    obj_effect = prediction[:, :CRAFTER_OBJ_EFFECT_CLASSES].argmax(dim=1)
+    obj_effect_logits = prediction[:, :CRAFTER_OBJ_EFFECT_CLASSES]
+    obj_effect = obj_effect_logits.argmax(dim=1)
     dir_effect = prediction[:, CRAFTER_OBJ_EFFECT_CLASSES:].argmax(dim=1)
-    obj_pred = apply_categorical_effect(current[:, 0], obj_effect)
+    current_obj = current[:, 0]
+    if constrain_agent:
+        obj_pred = _decode_crafter_object_with_single_agent(
+            obj_effect_logits, current_obj=current_obj
+        )
+    elif suppress_agent:
+        obj_pred = _decode_crafter_object_without_agent(
+            obj_effect_logits, current_obj=current_obj
+        )
+    else:
+        obj_pred = apply_categorical_effect(current_obj, obj_effect)
     dir_pred = apply_categorical_effect(current[:, 1], dir_effect)
     return torch.stack([obj_pred, dir_pred], dim=1).float()
+
+
+def _crafter_next_class_probabilities(
+    logits: torch.Tensor,
+    current_obj: torch.Tensor | None,
+    classes: int,
+) -> torch.Tensor:
+    """Map effect logits to absolute next-object probabilities.
+
+    Effect class zero means KEEP, so its probability mass is added to the
+    current object class before applying any state invariant projection.
+    """
+    probabilities = logits.softmax(dim=1)
+    if current_obj is None:
+        return probabilities
+    current_obj = current_obj.long().clamp(0, classes - 1)
+    next_probabilities = probabilities[:, 1 : classes + 1].clone()
+    next_probabilities.scatter_add_(
+        1, current_obj.unsqueeze(1), probabilities[:, 0:1]
+    )
+    return next_probabilities
+
+
+def _decode_crafter_object_with_single_agent(
+    logits: torch.Tensor,
+    current_obj: torch.Tensor | None,
+) -> torch.Tensor:
+    """Decode object probabilities with the Crafter one-player invariant."""
+    is_effect = logits.shape[1] == CRAFTER_OBJ_EFFECT_CLASSES
+    if not is_effect and logits.shape[1] != CRAFTER_OBJ_CLASSES:
+        raise ValueError(
+            "Crafter object logits must have 20 absolute or 21 effect classes, "
+            f"got {logits.shape[1]}"
+        )
+    probabilities = _crafter_next_class_probabilities(
+        logits, current_obj if is_effect else None, CRAFTER_OBJ_CLASSES
+    )
+    flat = probabilities.flatten(2)
+    agent_probability = flat[:, PLAYER_ID]
+    nonagent = flat.clone()
+    nonagent[:, PLAYER_ID] = 0.0
+    best_nonagent_probability, _ = nonagent.max(dim=1)
+    choice_score = torch.log(agent_probability.clamp_min(1e-12)) - torch.log(
+        best_nonagent_probability.clamp_min(1e-12)
+    )
+    chosen = choice_score.argmax(dim=1)
+    decoded = nonagent.argmax(dim=1)
+    decoded.scatter_(1, chosen.unsqueeze(1), torch.full_like(
+        chosen.unsqueeze(1), PLAYER_ID
+    ))
+    return decoded.reshape_as(probabilities[:, 0])
+
+
+def _decode_crafter_object_without_agent(
+    logits: torch.Tensor,
+    current_obj: torch.Tensor | None,
+) -> torch.Tensor:
+    """Decode each cell's strongest non-player next class.
+
+    Used only by the learned-pose planner path: its separate pose readout
+    writes the one player afterwards, while this preserves the spatial WM's
+    best terrain/object prediction under every candidate player location.
+    """
+    is_effect = logits.shape[1] == CRAFTER_OBJ_EFFECT_CLASSES
+    if not is_effect and logits.shape[1] != CRAFTER_OBJ_CLASSES:
+        raise ValueError(
+            "Crafter object logits must have 20 absolute or 21 effect classes, "
+            f"got {logits.shape[1]}"
+        )
+    probabilities = _crafter_next_class_probabilities(
+        logits, current_obj if is_effect else None, CRAFTER_OBJ_CLASSES
+    ).clone()
+    probabilities[:, PLAYER_ID] = 0.0
+    return probabilities.argmax(dim=1)
 
 
 def crafter_output_mode_from_state_dict(state_dict: dict[str, torch.Tensor]) -> str:

@@ -1,5 +1,6 @@
 import sys
 import random
+import json
 from collections import Counter, deque
 from pathlib import Path
 
@@ -243,6 +244,148 @@ def imagined_minigrid_step_batch(
         collect_diagnostics=False,
     )
     return next_states, inventory_tokens - 1
+
+
+def policy_selection_paths(checkpoint_path):
+    """Return the canonical, best, last, and manifest paths for WM PPO."""
+    canonical = Path(checkpoint_path)
+    suffix = canonical.suffix or ".ckpt"
+    stem = canonical.stem if canonical.suffix else canonical.name
+    return {
+        "canonical": canonical,
+        "best": canonical.with_name(f"{stem}_best{suffix}"),
+        "last": canonical.with_name(f"{stem}_last{suffix}"),
+        "manifest": canonical.with_name("policy_selection.json"),
+    }
+
+
+def policy_selection_is_better(candidate, incumbent):
+    """Lexicographic WM-only policy ranking: success, distance, then steps."""
+    if incumbent is None:
+        return True
+    candidate_key = (
+        int(candidate["success_count"]),
+        -float(candidate["mean_min_goal_distance"]),
+        -float(candidate["mean_steps"]),
+    )
+    incumbent_key = (
+        int(incumbent["success_count"]),
+        -float(incumbent["mean_min_goal_distance"]),
+        -float(incumbent["mean_steps"]),
+    )
+    return candidate_key > incumbent_key
+
+
+def evaluate_deterministic_minigrid_wm_policy(
+    ppo_agent,
+    model,
+    initial_state_templates,
+    goal_position_yx,
+    goal_distance_map,
+    attention_mask_size,
+    obs_norm_values,
+    directions,
+    max_steps,
+):
+    """Score ``policy_old`` in fixed WM rollouts without sampling or real env use.
+
+    Each requested initial direction gets one argmax rollout.  Scores are
+    lexicographically comparable by successful directions, then optimistic
+    minimum goal distance, then steps (failed rollouts count as ``max_steps``).
+    """
+    directions = [int(direction) for direction in directions]
+    states = initial_state_templates[directions].clone()
+    batch_size = len(directions)
+    carrying_key = torch.full((batch_size,), -1, device=states.device, dtype=torch.long)
+    goal_positions = torch.as_tensor(goal_position_yx, device=states.device, dtype=torch.long)
+    goal_positions = goal_positions.expand(batch_size, -1)
+    agent_positions = utils.get_agent_position_torch(states)
+    initial_distances = goal_distance_map[
+        agent_positions[:, 0].long(), agent_positions[:, 1].long()
+    ].float()
+    # A disconnected optimistic map should rank below any finite distance but
+    # remain a finite JSON metric.
+    initial_distances = torch.where(
+        torch.isfinite(initial_distances) & (initial_distances >= 0),
+        initial_distances,
+        torch.full_like(initial_distances, float(max_steps)),
+    )
+    min_distances = initial_distances.clone()
+    steps = torch.full((batch_size,), int(max_steps), device=states.device, dtype=torch.long)
+    successes = torch.zeros(batch_size, device=states.device, dtype=torch.bool)
+    active = torch.ones(batch_size, device=states.device, dtype=torch.bool)
+    old_training = ppo_agent.policy_old.training
+    ppo_agent.policy_old.eval()
+    try:
+        with torch.no_grad():
+            for step in range(1, int(max_steps) + 1):
+                if not bool(active.any()):
+                    break
+                previous_states = states
+                previous_positions = utils.get_agent_position_torch(states)
+                front_objects, _, _, _, valid_front = minigrid_front_cells(
+                    states, previous_positions
+                )
+                policy_states = utils.normalize_obs(
+                    states.clone(), obs_norm_values
+                ).reshape(batch_size, -1)
+                policy_states = append_inventory_to_policy_state(policy_states, carrying_key)
+                actions = torch.argmax(ppo_agent.policy_old.actor(policy_states), dim=-1)
+                next_states, next_carrying = imagined_minigrid_step_batch(
+                    model,
+                    states,
+                    actions,
+                    carrying_key,
+                    attention_mask_size,
+                    agent_positions=previous_positions,
+                )
+                lava = active & (actions == 2) & valid_front & (front_objects == 9)
+                agent_present = (next_states[:, 0] == 10).flatten(1).any(dim=1)
+                agent_lost = active & ~agent_present
+                # Match training's transition semantics: a missing agent is
+                # always restored before positions/distances are measured;
+                # lava remains a separate terminal outcome.
+                states = torch.where(
+                    agent_lost[:, None, None, None], previous_states, next_states
+                )
+                carrying_key = torch.where(agent_lost, carrying_key, next_carrying)
+                current_positions = utils.get_agent_position_torch(states)
+                distances = goal_distance_map[
+                    current_positions[:, 0].long(), current_positions[:, 1].long()
+                ].float()
+                distances = torch.where(
+                    torch.isfinite(distances) & (distances >= 0),
+                    distances,
+                    torch.full_like(distances, float(max_steps)),
+                )
+                min_distances = torch.where(active, torch.minimum(min_distances, distances), min_distances)
+                reached_goal = active & ~lava & ~agent_lost & torch.all(
+                    current_positions == goal_positions, dim=1
+                )
+                just_finished = active & (reached_goal | lava | agent_lost)
+                # Failures intentionally retain max_steps, as stated in the
+                # selection metric; only successful directions get their
+                # actual trajectory length.
+                steps[reached_goal] = step
+                successes |= reached_goal
+                active &= ~just_finished
+    finally:
+        ppo_agent.policy_old.train(old_training)
+    per_direction = [
+        {
+            "direction": direction,
+            "success": bool(successes[index].item()),
+            "steps": int(steps[index].item()),
+            "min_goal_distance": float(min_distances[index].item()),
+        }
+        for index, direction in enumerate(directions)
+    ]
+    return {
+        "success_count": int(successes.sum().item()),
+        "mean_min_goal_distance": float(min_distances.mean().item()),
+        "mean_steps": float(steps.float().mean().item()),
+        "per_direction": per_direction,
+    }
 
 
 def planner_behavior_cloning_warm_start(cfg, model, ppo_agent):
@@ -639,6 +782,42 @@ def run_ppo_wm(cfg):
     )
     if diagnostics_every_updates < 1:
         raise ValueError("PPO.diagnostics_every_updates must be at least 1")
+    best_policy_selection_enabled = bool(
+        getattr(hparams_PPO, "best_policy_selection_enabled", True)
+    )
+    selection_eval_freq_value = getattr(
+        hparams_PPO, "best_policy_eval_freq", None
+    )
+    selection_eval_freq = (
+        save_model_freq
+        if selection_eval_freq_value is None
+        else int(selection_eval_freq_value)
+    )
+    selection_directions = list(
+        getattr(hparams_PPO, "best_policy_directions", [0, 1, 2, 3])
+    )
+    selection_max_steps_value = getattr(hparams_PPO, "best_policy_max_steps", None)
+    selection_max_steps = (
+        max_ep_len
+        if selection_max_steps_value is None
+        else int(selection_max_steps_value)
+    )
+    if best_policy_selection_enabled:
+        if selection_eval_freq < 1:
+            raise ValueError("PPO.best_policy_eval_freq must be positive or null")
+        if selection_max_steps < 1:
+            raise ValueError("PPO.best_policy_max_steps must be positive or null")
+        if not selection_directions or any(
+            int(direction) not in (0, 1, 2, 3) for direction in selection_directions
+        ):
+            raise ValueError(
+                "PPO.best_policy_directions must be a non-empty subset of [0, 1, 2, 3]"
+            )
+        if len(set(map(int, selection_directions))) != len(selection_directions):
+            raise ValueError("PPO.best_policy_directions must not contain duplicates")
+        selection_paths = policy_selection_paths(checkpoint_path)
+    else:
+        selection_paths = None
     
 
     if use_wandb:
@@ -827,6 +1006,76 @@ def run_ppo_wm(cfg):
     )
     if use_main_dense_reward:
         goal_distance_map = build_main_goal_distance_map(states[0], goal_position_yx)
+
+    selection_history = []
+    best_selection_score = None
+    last_selection_timestep = None
+    next_selection_timestep = selection_eval_freq
+
+    def write_policy_selection_manifest():
+        if not best_policy_selection_enabled:
+            return
+        manifest = {
+            "selection_source": "frozen_world_model_deterministic_argmax",
+            "score_definition": (
+                "Lexicographic: maximize success_count; then minimize "
+                "mean_min_goal_distance; then minimize mean_steps. "
+                "One fixed argmax rollout per configured initial direction; "
+                "failures use max_steps. No real-environment evaluation is used."
+            ),
+            "enabled": True,
+            "directions": [int(direction) for direction in selection_directions],
+            "max_steps": selection_max_steps,
+            "best_timestep": None if best_selection_score is None else best_selection_score["timestep"],
+            "best_metrics": best_selection_score,
+            "best_path": str(selection_paths["best"]),
+            "last_path": str(selection_paths["last"]),
+            "canonical_path": str(selection_paths["canonical"]),
+            "evaluation_history": selection_history,
+        }
+        selection_paths["manifest"].parent.mkdir(parents=True, exist_ok=True)
+        with selection_paths["manifest"].open("w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, indent=2, sort_keys=True)
+
+    def evaluate_and_select_policy(timestep):
+        nonlocal best_selection_score, last_selection_timestep
+        timestep = int(timestep)
+        if not best_policy_selection_enabled or last_selection_timestep == timestep:
+            return False
+        metrics = evaluate_deterministic_minigrid_wm_policy(
+            ppo_agent,
+            model,
+            initial_state_templates,
+            goal_position_yx,
+            goal_distance_map,
+            hparams_world_model.attention_mask_size,
+            hparams_world_model.obs_norm_values,
+            selection_directions,
+            selection_max_steps,
+        )
+        candidate = {"timestep": timestep, **metrics}
+        selection_history.append(candidate)
+        last_selection_timestep = timestep
+        ppo_agent.save(selection_paths["last"])
+        if policy_selection_is_better(candidate, best_selection_score):
+            best_selection_score = candidate
+            ppo_agent.save(selection_paths["best"])
+            # Keep old consumers/evaluators compatible: canonical is always best.
+            ppo_agent.save(selection_paths["canonical"])
+            selected = True
+        else:
+            selected = False
+        write_policy_selection_manifest()
+        print(
+            "[WM PPO best-policy] "
+            f"t={timestep} success={candidate['success_count']}/{len(selection_directions)} "
+            f"min_dist={candidate['mean_min_goal_distance']:.3f} "
+            f"steps={candidate['mean_steps']:.1f} selected={selected}"
+        )
+        return selected
+
+    # This establishes both a best and last artifact before the first update.
+    evaluate_and_select_policy(0)
     goal_region_mask = build_goal_region_mask(states[0], goal_position_yx)
     door_topology = build_door_topology(states[0], goal_position_yx)
     goal_region_seen = torch.zeros(
@@ -1757,6 +2006,10 @@ def run_ppo_wm(cfg):
             )
             log_ppo_update(update_metrics)
             report_update_diagnostics(update_metrics, agent_positions)
+            if best_policy_selection_enabled and time_step >= next_selection_timestep:
+                evaluate_and_select_policy(time_step)
+                while next_selection_timestep <= time_step:
+                    next_selection_timestep += selection_eval_freq
 
         completed = torch.nonzero(
             (
@@ -1918,8 +2171,13 @@ def run_ppo_wm(cfg):
 
         if time_step >= next_save_timestep:
             print("--------------------------------------------------------------------------------------------")
-            print("saving model at : " + checkpoint_path)
-            ppo_agent.save(checkpoint_path)
+            save_path = (
+                str(selection_paths["last"])
+                if best_policy_selection_enabled
+                else checkpoint_path
+            )
+            print("saving latest model at : " + save_path)
+            ppo_agent.save(save_path)
             print("model saved")
             print("Elapsed Time  : ", datetime.now().replace(microsecond=0) - start_time)
             print("--------------------------------------------------------------------------------------------")
@@ -1944,12 +2202,24 @@ def run_ppo_wm(cfg):
         report_update_diagnostics(
             update_metrics, utils.get_agent_position_torch(states)
         )
+        # A partial update may be the final policy change and must be scored.
+        evaluate_and_select_policy(time_step)
     else:
         ppo_agent.buffer.clear()
 
-    # Final save after loop completes
-    ppo_agent.save(checkpoint_path)
-    print(f"Final policy saved at: {checkpoint_path}")
+    # Final policy is retained separately; canonical remains the best frozen-WM
+    # deterministic policy for backward-compatible consumers.
+    if best_policy_selection_enabled:
+        ppo_agent.save(selection_paths["last"])
+        # Covers an exact-budget final PPO update; duplicate timestamps are
+        # intentionally ignored by the selector.
+        evaluate_and_select_policy(time_step)
+        write_policy_selection_manifest()
+        print(f"Best policy saved at: {selection_paths['canonical']}")
+        print(f"Last policy saved at: {selection_paths['last']}")
+    else:
+        ppo_agent.save(checkpoint_path)
+        print(f"Final policy saved at: {checkpoint_path}")
     env.close()
     if use_wandb:
         sub_run.finish()

@@ -1,4 +1,4 @@
-domain: minigrid  # crafter | minigrid | bipedalwalker
+domain: crafter  # crafter | minigrid | bipedalwalker
 
 # Canonical WM artifact tree. Reusable datasets/checkpoints remain in their
 # dedicated data/model directories; all run outputs live below this one root.
@@ -30,7 +30,7 @@ pipeline:
 domains:
   crafter:
     env_type: crafter
-    task_name: crafter_progression_small
+    task_name: crafter_target_task_5
     data_collection:
       # Per-episode environment cap used while collecting WM transitions.
       # Match the policy horizon so rare long-range interactions can appear
@@ -41,22 +41,48 @@ domains:
       mini_dataset_size: 8000
       maximum_dataset_size: 400000
       uniform_reset_steps: 5000
+    # Validation-only benchmark collector. Select explicitly with
+    # ``env.collect.data_type=coverage_v3``; training/replay remain random.
+    target_collection:
+      samples_per_target: 12500
+      # Standalone WM config has no root-level seed; oc.select keeps this
+      # resolvable there while trainer configs can still override ``seed``.
+      seed: ${oc.select:seed,0}
+      target_id: -1
+      version: coverage_v3
+      ai_enabled: false
+      output_dir: ${oc.env:TRAINER_PATH}/data/crafter/target_tasks
     policy:
       # The current progression layout is compact but its resources are spread
       # out; allow PPO enough horizon for inefficient exploratory trajectories.
       max_ep_len: 4096
-      # 8192 / 8 imagined environments = 1024 temporal steps per update.
+      # 4096 / 16 imagined environments = 256 temporal steps per update.
       rollout_steps: 4096
-      num_imagined_envs: 64
+      num_imagined_envs: 16
+      # Crafter's multi-stage resource chains need a longer discount horizon
+      # than the shared PPO fallback, while a small entropy bonus retains some
+      # exploration without keeping the final policy excessively stochastic.
+      gamma: 0.999
+      entropy_coef: 0.001
+      experiment_label: dr_preppo_1149_last50
+      checkpoint_path: ${oc.env:MODEL_FPATH}/Policy/policy_crafter_${domains.crafter.task_name}_dr_preppo_1149_last50_seed0.ckpt
       max_training_timesteps: 3000000
       total_test_episodes: 100
+      # Crafter's Python environment benefits from batched policy inference;
+      # use one environment for render/GIF evaluation.
+      test_num_envs: 16
     grid_shape: [2, 0, 0]
     attention_mask_size: 5
     obs_norm_values: [20, 5, 0]
     action_norm_values: 17
+    # Health, food, drink and energy are updated by Crafter's rule tracker in
+    # imagined planning.  The WM head remains checkpoint-compatible but is not
+    # supervised or decoded when this is false. Set true to reproduce legacy
+    # all-neural inventory prediction.
+    predict_survival: false
     # Canonical layout source. Data collection, WM identity checks and policy
     # environment configuration all reference this single field.
-    layout_path: ${oc.env:ENV_PATH}/crafter/${domains.crafter.task_name}.txt
+    layout_path: ${oc.env:ENV_PATH}/crafter/target_tasks/${domains.crafter.task_name}.txt
     data_save_path: ${oc.env:TRAIN_DATASET_PATH}/crafter_${domains.crafter.task_name}_${env.collect.data_type}.npz
     # Used only when continual_learning=false and p2e.enabled=true.
     p2e_data_save_path: ${oc.env:TRAIN_DATASET_PATH}/crafter_${domains.crafter.task_name}_p2e_official_dv2_attnwm_v1.npz
@@ -68,6 +94,9 @@ domains:
     # Standard single-run WM. Continual training writes its separate final
     # artifact to continual_learning.final_checkpoint below.
     world_model_checkpoint: ${oc.env:MODEL_FPATH}/AttentionWM/attention_world_model_crafter_${domains.crafter.task_name}_effect_inventory_gate_natural_v2_rmax_count_local5_inv12_v1_no_continual_seed${rmax_like.seed}.ckpt
+    # Fixed DR checkpoint used by Crafter policy planning. Keeping this
+    # separate prevents policy-only runs from changing the WM training target.
+    planning_world_model_checkpoint: ${oc.env:MODEL_FPATH}/AttentionWM/dr_preppo_1149_attention_world_model_crafter_none_seed0_last.ckpt
     # Existing Crafter validation files use different map shapes/layouts.
     # Re-enable this after collecting a validation split for this layout.
     validation_data_dir: null
@@ -163,19 +192,19 @@ domains:
   minigrid:
     env_type: minigrid
     stochastic:
-      enabled: false
+      enabled: False
       move_failure_prob: 0.2
     # Representative large target layout used for direct policy planning.
     task_name: target_task2
     data_collection:
       max_steps: 5000
-      data_type: random
-      episodes: 1000
-      mini_dataset_size: 8000
-      maximum_dataset_size: 60000
-      uniform_reset_steps: 5000
+      data_type: uniform
+      episodes: 100
+      mini_dataset_size: 10000
+      maximum_dataset_size: 10000
+      uniform_reset_steps: 50
       # In uniform mode, reserve this fraction for staged real key/door steps.
-      interaction_fraction: 0.3
+      interaction_fraction: 0
     policy:
       # Match the faster baseline: 128 temporal steps per imagined environment.
       max_ep_len: 512
@@ -193,16 +222,16 @@ domains:
     # Canonical layout source. Normally only task_name needs to change.
     layout_path: /home/siyao/phd_file/Research/rlPractice/Curriculum_world_model_learning/trainer/level/minigrid/target_task/target_task2.txt
     data_save_path: ${oc.env:TRAIN_DATASET_PATH}/minigrid_${domains.minigrid.task_name}_inventory_v1_${env.collect.data_type}.npz
-    world_model_checkpoint: /home/siyao/phd_file/Research/rlPractice/Curriculum_world_model_learning/wm/modelBased/models/AttentionWM/dr_attention_world_model_minigrid_none_effect_seed10.ckpt
+    world_model_checkpoint: ${oc.env:MODEL_FPATH}/AttentionWM/mac_attention_world_model_minigrid_none_effect_seed0.ckpt
     validation_data_dir: null
     visualize_filename: ${domains.minigrid.task_name}_${env.collect.data_type}_coverage.png
     env_visualize_filename: ${domains.minigrid.task_name}_${env.collect.data_type}_env.png
     use_bipedal_attention: false
-    transition_balanced_sampling: true
+    transition_balanced_sampling: False
     wm_data_type: discrete
     # Generated by the MiniGrid transition contract from minigrid_transition_mode.
     observation_schema: []
-    collection_replace_start_with_empty: false
+    collection_replace_start_with_empty: true
 
   bipedalwalker:
     env_type: bipedalwalker
@@ -349,6 +378,11 @@ attention_model:
   # The domain-level stochastic switch is the only user-facing stochastic
   # control. Model selection is derived at runtime.
   stochastic_enabled: ${oc.select:domains.${domain}.stochastic.enabled,false}
+  # Defaults to true for legacy domain configs/checkpoints. Crafter overrides
+  # this deliberately above; other domains do not use this setting.
+  predict_survival: ${oc.select:domains.${domain}.predict_survival,true}
+  crafter_inventory_value_mode: categorical_absolute
+  crafter_inventory_architecture: shared_pool_v1
   stochastic_latent:
     loss_weight: 1.0
     num_factors: 1
@@ -368,7 +402,7 @@ attention_model:
   frame_stack: 1  # K=1 for deterministic Crafter (no need for temporal context)
 
   # freeze weights
-  freeze_weight: False  # When true, load weights and skip further training.
+  freeze_weight: True  # When true, load weights and skip further training.
   allow_legacy_dataset: false
   keep_cell_loss: false
   continue_learning: false
@@ -399,7 +433,7 @@ env:
     stochastic: False     # False = entities frozen (zombie/cow don't move)
     slippery_prob: 0.0     # 0.0 = fully deterministic for initial validation
   collect:
-    data_type: ${domains.${domain}.data_collection.data_type} # uniform | random
+    data_type: ${domains.${domain}.data_collection.data_type} # uniform | random | coverage_v2 | coverage_v3 (Crafter target only)
     # During MiniGrid collection only, parse S as E for random starts. Policy
     # training still reads the original layout and uses S as its fixed start.
     replace_start_with_empty: ${oc.select:domains.${domain}.collection_replace_start_with_empty,false}
@@ -489,7 +523,7 @@ PPO:
   seed: 1
   # Separates the single-environment RMax/no-continual policy checkpoint,
   # WandB group/run, and the shared multi-seed validation CSV.
-  experiment_label: null
+  experiment_label: ${oc.select:domains.${domain}.policy.experiment_label,null}
   env_type: ${domains.${domain}.env_type}
   has_continuous_action_space: False
   # Maximum actions before an unfinished episode resets. Increase this with
@@ -511,14 +545,12 @@ PPO:
   # never run eight optimizer epochs on a single 3- or 4-step episode.
   rollout_steps: ${domains.${domain}.policy.rollout_steps}
   # Number of GPU-batched imagined trajectories used only by WM training.
-  # With rollout_steps=8192, 8 envs provide a full 1024-step trajectory per
-  # PPO update, matching Crafter's episode horizon and improving sparse-reward
-  # credit assignment. rollout_steps and max_training_timesteps must both be
-  # divisible by this value.
+  # Each trajectory contains rollout_steps / num_imagined_envs temporal steps;
+  # rollout_steps and max_training_timesteps must both be divisible by it.
   num_imagined_envs: ${oc.select:domains.${domain}.policy.num_imagined_envs,64}
   # Zero is the usual choice when deterministic argmax performance matters;
   # positive entropy explicitly rewards keeping the policy stochastic.
-  entropy_coef: 0.01
+  entropy_coef: ${oc.select:domains.${domain}.policy.entropy_coef,0.01}
   normalize_advantages: True
   normalize_returns: False
   max_grad_norm: 0.5
@@ -589,15 +621,17 @@ PPO:
   door_open_reward: 0.0
   lr_actor: 0.0003  # learning rate for actor
   lr_critic: 0.001  # learning rate for critic
-  # Leave null to select the matching source-specific path automatically.
-  # A command-line PPO.checkpoint_path=... override still takes precedence.
-  checkpoint_path: null
+  # Use a domain-specific override when configured; otherwise keep automatic
+  # source-specific naming. A command-line override still takes precedence.
+  checkpoint_path: ${oc.select:domains.${domain}.policy.checkpoint_path,null}
   checkpoint_dir: ${oc.env:MODEL_FPATH}/Policy
   checkpoint_path_real_env: ${oc.env:MODEL_FPATH}/Policy/policy_${domain}_${domains.${domain}.task_name}_realenv_seed${PPO.seed}.ckpt
   checkpoint_path_planning: ${oc.env:MODEL_FPATH}/Policy/policy_${domain}_${domains.${domain}.task_name}_seed${PPO.seed}.ckpt
+  # Crafter imagined-policy artifacts normally use domain, task, and WM seed;
+  # the domain-specific checkpoint_path above isolates this comparison run.
   # Leave null to select the standard or continual WM path automatically.
   # run_pipeline.py passes the resolved path explicitly to policy training.
-  checkpoint_path_wm: /home/siyao/phd_file/Research/rlPractice/Curriculum_world_model_learning/wm/modelBased/models/AttentionWM/mac_attention_world_model_minigrid_none_effect_seed0.ckpt
+  checkpoint_path_wm: ${oc.select:domains.${domain}.planning_world_model_checkpoint,null}
   compute_regret: False
   regret_eval_freq: 5000
   regret_eval_episodes: 5
@@ -623,12 +657,26 @@ PPO:
   min_action_std: 0.1
   # The final checkpoint is always saved separately.
   save_model_freq: 1e6
+  # MiniGrid WM PPO: retain the strongest deterministic policy without using
+  # real target evaluation.  Ranking is success count, then minimum WM goal
+  # distance, then steps across these fixed initial directions.
+  best_policy_selection_enabled: true
+  # null uses save_model_freq; evaluation also occurs at timestep 0 and after
+  # the final PPO update (including an exact-budget update).
+  best_policy_eval_freq: null
+  # Crafter uses these fixed frozen-WM argmax starts. Its ranking is diamond
+  # successes, unlocked achievements, imagined native return, then fewer steps.
+  best_policy_eval_episodes: 8
+  best_policy_eval_seed: ${PPO.seed}
+  best_policy_directions: [0, 1, 2, 3]
+  # null uses max_ep_len.
+  best_policy_max_steps: null
   ########################################
   # test
   total_test_episodes: ${domains.${domain}.policy.total_test_episodes}
-  # Batch policy inference across independent real environments. Set to 1 for
-  # the serial evaluator; GIF/render require one environment.
-  test_num_envs: 128
+  # Batch policy inference across independent real environments. Domains may
+  # override this (Crafter uses 16); GIF/render require one environment.
+  test_num_envs: ${oc.select:domains.${domain}.policy.test_num_envs,128}
   # Print live throughput/progress during batched evaluation.
   test_progress_every_steps: 100
   render: False

@@ -10,11 +10,193 @@ import tempfile
 
 
 class FisherReplayBuffer:
-    def __init__(self, max_size, contact_positive_ratio=0.5):
+    """Replay storage with an optional Crafter transition-aware admission path."""
+    CRAFTER_TRANSITION_TYPES = (
+        "inventory_change", "map_interaction", "agent_dynamics", "static",
+    )
+
+    def __init__(
+        self,
+        max_size,
+        contact_positive_ratio=0.5,
+        crafter_transition_replay=None,
+        seed=0,
+    ):
         self.buffer = []
         self.max_size = max_size
         self.mask_size = 3  # Cross mask size
         self.contact_positive_ratio = contact_positive_ratio  # Ratio of contact=1 samples in label-balanced sampling
+        replay_cfg = crafter_transition_replay or {}
+        if isinstance(replay_cfg, dict):
+            get_cfg = replay_cfg.get
+        else:
+            get_cfg = lambda key, default=None: getattr(replay_cfg, key, default)
+        self.crafter_transition_replay_enabled = bool(get_cfg("enabled", False))
+        self.crafter_transition_replay_exponent = float(get_cfg("balance_exponent", 0.5))
+        self.crafter_transition_replay_include_action = bool(get_cfg("include_action", True))
+        # Opt-in refinement: distinguish observed item-change signatures inside
+        # the inventory-change class without duplicating a transition.
+        self.crafter_transition_replay_include_changed_slot = bool(
+            get_cfg("include_changed_slot", False)
+        )
+        if self.crafter_transition_replay_exponent < 0:
+            raise ValueError("crafter transition replay balance_exponent must be non-negative")
+        # Keep replay selection reproducible without perturbing process-global RNG state.
+        self._rng = np.random.default_rng(int(seed))
+
+    @staticmethod
+    def _crafter_object_map(batch):
+        """Return the object plane from a NCHW or NHWC Crafter batch."""
+        arr = np.asarray(batch)
+        if arr.ndim != 4:
+            raise ValueError(f"Crafter transition replay expects 4D observations, got {arr.shape}")
+        if arr.shape[1] <= 4 and arr.shape[-1] > 4:  # NCHW
+            return arr[:, 0], arr, "nchw"
+        if arr.shape[-1] <= 4 and arr.shape[1] > 4:  # NHWC
+            return arr[..., 0], arr, "nhwc"
+        raise ValueError(
+            "Cannot infer Crafter observation layout; expected NCHW/NHWC with <=4 channels, "
+            f"got {arr.shape}"
+        )
+
+    @classmethod
+    def classify_crafter_transitions(cls, samples: Dict) -> np.ndarray:
+        """Classify real Crafter outcomes; 0..3 match ``CRAFTER_TRANSITION_TYPES``."""
+        required = ("obs", "obs_next", "act", "inv", "inv_next")
+        missing = [key for key in required if key not in samples or samples[key] is None]
+        if missing:
+            raise ValueError(
+                "Crafter transition replay requires " + ", ".join(required) +
+                f"; missing {missing}"
+            )
+        obj, obs, layout = cls._crafter_object_map(samples["obs"])
+        obj_next, obs_next, next_layout = cls._crafter_object_map(samples["obs_next"])
+        inv = np.asarray(samples["inv"])
+        inv_next = np.asarray(samples["inv_next"])
+        act = np.asarray(samples["act"])
+        n = len(obj)
+        if next_layout != layout or len(obj_next) != n or len(inv) != n or len(inv_next) != n or len(act) != n:
+            raise ValueError("Crafter transition replay fields must have aligned batch lengths/layouts")
+        if inv.ndim != 2 or inv_next.ndim != 2 or inv.shape != inv_next.shape or inv.shape[1] < 16:
+            raise ValueError(
+                "Crafter transition replay requires aligned (B, >=16) inv/inv_next arrays"
+            )
+
+        # Rule-tracked physiological slots 0:4 intentionally do not define a critical event.
+        inventory_changed = np.any(inv[:, 4:16] != inv_next[:, 4:16], axis=1)
+        types = np.full(n, 3, dtype=np.int8)  # static
+        types[inventory_changed] = 0
+
+        for i in range(n):
+            current_player = obj[i] == 13
+            next_player = obj_next[i] == 13
+            # Object interactions are evaluated after removing either agent footprint.
+            non_agent_changed = np.any(
+                (obj[i] != obj_next[i]) & ~current_player & ~next_player
+            )
+            if not inventory_changed[i] and non_agent_changed:
+                types[i] = 1
+                continue
+            if inventory_changed[i]:
+                continue
+
+            current_pos = np.argwhere(current_player)
+            next_pos = np.argwhere(next_player)
+            position_changed = (
+                len(current_pos) != len(next_pos)
+                or (len(current_pos) > 0 and not np.array_equal(current_pos, next_pos))
+            )
+            direction_changed = False
+            if not position_changed and len(current_pos) == 1:
+                y, x = current_pos[0]
+                if layout == "nchw":
+                    direction_changed = not np.array_equal(obs[i, :, y, x], obs_next[i, :, y, x])
+                else:
+                    direction_changed = not np.array_equal(obs[i, y, x, :], obs_next[i, y, x, :])
+            if position_changed or direction_changed:
+                types[i] = 2
+        return types
+
+    def _crafter_buckets(self, transition_types, actions):
+        return self._crafter_buckets_with_signatures(transition_types, actions, None)
+
+    @staticmethod
+    def crafter_changed_slot_signatures(samples: Dict) -> np.ndarray:
+        """Bit-mask of changed item slots (local indices 0..11); survival is excluded."""
+        inv = np.asarray(samples["inv"])
+        inv_next = np.asarray(samples["inv_next"])
+        if inv.ndim != 2 or inv_next.ndim != 2 or inv.shape != inv_next.shape or inv.shape[1] < 16:
+            raise ValueError("Crafter replay requires aligned (B, >=16) inv/inv_next arrays")
+        changed = inv[:, 4:16] != inv_next[:, 4:16]
+        bit_values = (1 << np.arange(12, dtype=np.uint16))[None, :]
+        return np.sum(changed.astype(np.uint16) * bit_values, axis=1, dtype=np.uint16)
+
+    def _crafter_buckets_with_signatures(self, transition_types, actions, signatures):
+        actions = np.asarray(actions).reshape(-1)
+        if len(transition_types) != len(actions):
+            raise ValueError("transition type and action lengths must match")
+        # The persisted joint bucket remains stable even if sampling ignores actions.
+        base = np.asarray(transition_types, dtype=np.int64) * 17 + actions.astype(np.int64)
+        if not self.crafter_transition_replay_include_changed_slot:
+            return base
+        if signatures is None:
+            raise ValueError("changed-slot replay requires a signature per transition")
+        signatures = np.asarray(signatures, dtype=np.int64).reshape(-1)
+        if len(signatures) != len(base) or np.any(signatures < 0) or np.any(signatures >= (1 << 12)):
+            raise ValueError("Crafter changed-slot signatures must be aligned 12-bit values")
+        return base * (1 << 12) + signatures
+
+    def _crafter_sampling_buckets(self, transition_types, actions, signatures, persisted_buckets):
+        if not self.crafter_transition_replay_include_changed_slot:
+            return persisted_buckets if self.crafter_transition_replay_include_action else persisted_buckets // 17
+        types = np.asarray(transition_types, dtype=np.int64)
+        actions = np.asarray(actions, dtype=np.int64).reshape(-1)
+        signatures = np.asarray(signatures, dtype=np.int64).reshape(-1)
+        base = types * 17 + actions if self.crafter_transition_replay_include_action else types
+        return base * (1 << 12) + signatures
+
+    def _soft_balanced_indices(self, indices, buckets, quota):
+        indices = np.asarray(indices, dtype=np.int64)
+        if quota >= len(indices):
+            return indices.copy()
+        if quota <= 0 or len(indices) == 0:
+            return np.empty(0, dtype=np.int64)
+        # Callers supply persisted buckets only; derive legacy sampling here.
+        sample_buckets = buckets if self.crafter_transition_replay_include_action else buckets // 17
+        _, inverse, counts = np.unique(sample_buckets, return_inverse=True, return_counts=True)
+        weights = counts[inverse].astype(np.float64) ** (-self.crafter_transition_replay_exponent)
+        weights /= weights.sum()
+        return self._rng.choice(indices, size=quota, replace=False, p=weights)
+
+    def transition_replay_stats(self, samples=None) -> Dict[str, Dict]:
+        """Counts suitable for DR diagnostics; accepts raw samples or the live buffer."""
+        if samples is None:
+            if not self.buffer:
+                return {name: {"count": 0, "actions": {}} for name in self.CRAFTER_TRANSITION_TYPES}
+            samples = self.export_dict()
+        if "_replay_transition_type" in samples:
+            types = np.asarray(samples["_replay_transition_type"], dtype=np.int64)
+        else:
+            types = self.classify_crafter_transitions(samples)
+        actions = np.asarray(samples["act"]).reshape(-1).astype(np.int64)
+        signatures = (
+            np.asarray(samples["_replay_changed_slot_signature"], dtype=np.uint16)
+            if "_replay_changed_slot_signature" in samples
+            else self.crafter_changed_slot_signatures(samples)
+        )
+        stats = {}
+        for type_id, name in enumerate(self.CRAFTER_TRANSITION_TYPES):
+            selected = actions[types == type_id]
+            stats[name] = {
+                "count": int(len(selected)),
+                "actions": {int(action): int(count) for action, count in zip(*np.unique(selected, return_counts=True))},
+                "changed_slots": {
+                    int(slot + 4): int(np.sum((signatures[types == type_id] & (1 << slot)) != 0))
+                    for slot in range(12)
+                    if np.any((signatures[types == type_id] & (1 << slot)) != 0)
+                },
+            }
+        return stats
 
     @staticmethod
     def _sample_at(samples: Dict, index: int) -> Dict:
@@ -336,6 +518,10 @@ class FisherReplayBuffer:
         if total_quota <= 0:
             return
 
+        if self.crafter_transition_replay_enabled:
+            self._update_crafter_transition_aware(samples, total_quota)
+            return
+
         # === Part 1: salient element samples ===
         obs = samples['obs']
         is_vector_obs = (
@@ -485,6 +671,76 @@ class FisherReplayBuffer:
             indices_to_keep = sorted(list(set(all_indices) - set(indices_to_remove)))
             self.buffer = [self.buffer[i] for i in indices_to_keep]
 
+    def _update_crafter_transition_aware(self, samples: Dict, total_quota: int):
+        """Admission for Crafter DR: retain real critical outcomes before fillers."""
+        transition_types = self.classify_crafter_transitions(samples)
+        signatures = self.crafter_changed_slot_signatures(samples)
+        buckets = self._crafter_buckets_with_signatures(
+            transition_types, samples["act"], signatures
+        )
+        critical = np.flatnonzero(transition_types <= 1)
+        noncritical = np.flatnonzero(transition_types >= 2)
+
+        if len(critical) <= total_quota:
+            selected = critical.copy()
+            remaining = total_quota - len(selected)
+            # Fill from movement/static without giving proxy salience any role.
+            if remaining:
+                selected = np.concatenate([
+                    selected,
+                    self._rng.choice(
+                        noncritical, size=min(remaining, len(noncritical)), replace=False
+                    ),
+                ])
+        else:
+            # Critical overflow is the only case where a critical outcome can be dropped.
+            selected = self._crafter_soft_balanced_indices(
+                critical, transition_types, samples["act"], signatures, buckets, total_quota
+            )
+
+        if len(selected) > 1:
+            selected = self._rng.permutation(selected)
+        for index in selected:
+            sample = self._sample_at(samples, int(index))
+            sample["_replay_transition_type"] = np.int8(transition_types[index])
+            sample["_replay_changed_slot_signature"] = np.uint16(signatures[index])
+            sample["_replay_bucket"] = np.int64(buckets[index])
+            self.buffer.append(sample)
+
+        # Preserve legacy buffer capacity semantics, but use the local RNG.
+        if len(self.buffer) > self.max_size:
+            # Unlike the legacy buffer, do not randomly erase rare observed
+            # outcomes after admission.  Capacity retention uses the same
+            # persisted transition/action buckets as replay sampling.
+            buckets = np.asarray(
+                [sample["_replay_bucket"] for sample in self.buffer], dtype=np.int64
+            )
+            all_types = np.asarray([sample["_replay_transition_type"] for sample in self.buffer])
+            all_actions = np.asarray([sample["act"] for sample in self.buffer])
+            all_signatures = np.asarray([
+                sample.get("_replay_changed_slot_signature", 0) for sample in self.buffer
+            ])
+            keep = self._crafter_soft_balanced_indices(
+                np.arange(len(self.buffer), dtype=np.int64), all_types, all_actions,
+                all_signatures, buckets, self.max_size
+            )
+            self.buffer = [self.buffer[int(i)] for i in keep]
+
+    def _crafter_soft_balanced_indices(self, indices, types, actions, signatures, buckets, quota):
+        indices = np.asarray(indices, dtype=np.int64)
+        if quota >= len(indices):
+            return indices.copy()
+        if quota <= 0 or len(indices) == 0:
+            return np.empty(0, dtype=np.int64)
+        sample_buckets = self._crafter_sampling_buckets(
+            np.asarray(types)[indices], np.asarray(actions)[indices],
+            np.asarray(signatures)[indices], np.asarray(buckets)[indices]
+        )
+        _, inverse, counts = np.unique(sample_buckets, return_inverse=True, return_counts=True)
+        weights = counts[inverse].astype(np.float64) ** (-self.crafter_transition_replay_exponent)
+        weights /= weights.sum()
+        return self._rng.choice(indices, size=quota, replace=False, p=weights)
+
     def add_from_npz(self, path, current_sample_ratio=0.05, fisher_buffer_elements_ratio=0.5, target_shape=None):
         """Helper to load data from npz and add to buffer using update_combined."""
         if not os.path.exists(path):
@@ -514,6 +770,8 @@ class FisherReplayBuffer:
             )
             print(f"[FisherBuffer] Added samples from {os.path.basename(path)}. Buffer size: {len(self.buffer)}")
         except Exception as e:
+            if self.crafter_transition_replay_enabled:
+                raise
             print(f"[FisherBuffer] Error loading {path}: {e}")
 
     def add_from_batch(
@@ -593,6 +851,37 @@ class FisherReplayBuffer:
         for key in required:
             if len(data_dict[key]) != length:
                 raise ValueError(f"Replay field '{key}' has inconsistent length")
+
+        # Checkpoint/replay compatibility: old Crafter buffers have no replay
+        # metadata.  In opt-in mode rebuild it from the actual transition;
+        # never silently fall back to natural replay sampling.
+        if self.crafter_transition_replay_enabled and (
+            "_replay_transition_type" not in data_dict
+            or "_replay_bucket" not in data_dict
+        ):
+            reconstructed = self.classify_crafter_transitions(data_dict)
+            data_dict = dict(data_dict)
+            data_dict["_replay_transition_type"] = reconstructed
+            if self.crafter_transition_replay_include_changed_slot:
+                signatures = self.crafter_changed_slot_signatures(data_dict)
+                data_dict["_replay_changed_slot_signature"] = signatures
+                data_dict["_replay_bucket"] = self._crafter_buckets_with_signatures(
+                    reconstructed, data_dict["act"], signatures
+                )
+            else:
+                data_dict["_replay_bucket"] = self._crafter_buckets(
+                    reconstructed, data_dict["act"]
+                )
+        if self.crafter_transition_replay_enabled and self.crafter_transition_replay_include_changed_slot and (
+            "_replay_changed_slot_signature" not in data_dict
+        ):
+            data_dict = dict(data_dict)
+            signatures = self.crafter_changed_slot_signatures(data_dict)
+            data_dict["_replay_changed_slot_signature"] = signatures
+            types = np.asarray(data_dict["_replay_transition_type"])
+            data_dict["_replay_bucket"] = self._crafter_buckets_with_signatures(
+                types, data_dict["act"], signatures
+            )
 
         optional_keys = [
             key for key in data_dict

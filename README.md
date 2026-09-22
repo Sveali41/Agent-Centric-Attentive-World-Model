@@ -301,14 +301,30 @@ observation_loss = mean(normalized_field_loss for field in observation_schema)
 
 Categorical fields use cross-entropy normalized by `log(number_of_classes)`,
 binary fields use BCE normalized by `log(2)`, normalized continuous fields use
-MSE. Crafter inventory uses structured categorical KEEP/CHANGE/value targets.
-The field terms are averaged without domain-specific or rarity-specific
-multipliers. Training logs one public loss curve, `train/observation_loss`;
-validation uses the same objective as `val/observation_loss`. Crafter continual
+MSE. Crafter inventory uses structured categorical KEEP/CHANGE/value targets:
+the inventory gate and survival effect use non-empty-group balanced means, while
+the item-value head is supervised only on genuinely changed slots. This
+prevents the naturally rare CHANGE transitions from being erased by static
+KEEP slots without changing action or replay sampling. Training logs one public
+loss curve, `train/observation_loss`; validation keeps the natural-distribution
+NLL and additionally reports gate recall/false-positive rate, changed-only
+inventory/survival/value accuracy, and per-slot change counts. Crafter continual
 training is replay-only: it does not compute Fisher matrices or apply EWC. Each
 domain declares only its fields in `domains.<domain>.observation_schema` inside
 `modelBased/config/config.yaml`; adding a domain does not require another loss
-implementation.
+implementation. The dedicated DR-EWC experiment enables EWC separately with
+the configured Fisher settings and writes a distinct balanced-inventory
+checkpoint/CSV artifact. Its opt-in `crafter_transition_replay` path classifies
+observed transitions into inventory, map, agent-dynamics, and static buckets,
+persists the joint type/action bucket, retains critical outcomes during buffer
+admission, and samples historical replay with configurable
+`n^-balance_exponent` soft balancing (Crafter DR currently uses `0.25`). The
+current batch remains naturally distributed; summary and detailed CSV files
+record current, buffer, and sampled-replay coverage. DR may additionally opt
+into `include_changed_slot`, which extends only inventory-change buckets with
+the deterministic bit-mask of changed item slots (excluding survival slots),
+so a rare observed diamond/tool transition is not merged with wood under the
+same action bucket.
 
 MiniGrid treats carried inventory as part of the learned state: token `0`
 means empty hands and tokens `1..6` represent the six key colours. The WM
