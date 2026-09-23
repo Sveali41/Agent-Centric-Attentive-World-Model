@@ -13,11 +13,11 @@ second reward function: ``PPO.use_main_dense_reward=True`` and
 
 Example (the default is seeds 0..4 and targets 0..2)::
 
-    python wm/modelBased/policy_training/run_policy_target_eval.py --baseline dr
+    python wm/modelBased/policy_training/runners/run_policy_target_eval.py --baseline dr
 
 Small smoke run::
 
-    python wm/modelBased/policy_training/run_policy_target_eval.py \
+    python wm/modelBased/policy_training/runners/run_policy_target_eval.py \
         --train-timesteps 32768 --test-episodes 20 --test-envs 8
 
 Use ``--dry-run`` to inspect all commands without starting training.
@@ -34,10 +34,10 @@ import sys
 from datetime import datetime
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 WM_ROOT = REPO_ROOT / "wm"
-TRAINING_ENTRY = WM_ROOT / "modelBased" / "policy_training" / "PPO_world_training.py"
-EVAL_ENTRY = WM_ROOT / "modelBased" / "policy_training" / "PPO_world_test.py"
+TRAINING_ENTRY = WM_ROOT / "modelBased" / "policy_training" / "ppo" / "PPO_world_training.py"
+EVAL_ENTRY = WM_ROOT / "modelBased" / "policy_training" / "ppo" / "PPO_world_test.py"
 DEFAULT_WM_DIR = WM_ROOT / "modelBased" / "models" / "AttentionWM"
 DEFAULT_LAYOUT_DIR = REPO_ROOT / "trainer" / "level" / "minigrid" / "target_task"
 

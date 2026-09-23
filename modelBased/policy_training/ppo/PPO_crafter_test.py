@@ -5,7 +5,7 @@ import sys
 import time
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -20,14 +20,14 @@ from domain.crafter.crafter_custom_env import CustomCrafterEnv
 from modelBased.common import utils
 from modelBased.common.utils import WM_OUTPUTS_PATH
 from modelBased.common.artifacts import append_mean_row, detail_rows
-from modelBased.policy_training.PPO import PPO
-from modelBased.policy_training.experiment_naming import (
+from modelBased.policy_training.ppo.PPO import PPO
+from modelBased.policy_training.common.experiment_naming import (
     policy_checkpoint_is_compatible,
     policy_checkpoint_for_evaluation,
     policy_training_source,
     policy_validation_stem,
 )
-from modelBased.policy_training.PPO_crafter_training import (
+from modelBased.policy_training.ppo.PPO_crafter_training import (
     CRAFTER_ACTION_COUNT,
     CRAFTER_ACHIEVEMENT_MASK_DIM,
     build_policy_state,

@@ -21,8 +21,8 @@ from modelBased.exploration.count_based import (
     CrafterStateActionCounter,
     build_crafter_policy_state,
 )
-from modelBased.policy_training.PPO import PPO
-from modelBased.policy_training.crafter_vector_env import CrafterSubprocessVectorEnv
+from modelBased.policy_training.ppo.PPO import PPO
+from modelBased.policy_training.common.crafter_vector_env import CrafterSubprocessVectorEnv
 
 
 def apply_death_penalty(

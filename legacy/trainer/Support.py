@@ -24,7 +24,7 @@ from legacy.generator.data.env_dataset_support import replace_vector_value, visu
 from learning_buffer import EnvLearningBuffer
 from legacy.generator.data.env_dataset_support import is_reachable
 from modelBased.world_model import AttentionWM_training
-from modelBased.policy_training import PPO_world_training
+from modelBased.policy_training.ppo import PPO_world_training
 
 
 class Support:

@@ -6,7 +6,7 @@ import math
 import time
 from pathlib import Path
 
-WM_ROOT = Path(__file__).resolve().parents[2]
+WM_ROOT = Path(__file__).resolve().parents[3]
 if str(WM_ROOT) not in sys.path:
     sys.path.insert(0, str(WM_ROOT))
 # Direct module execution starts below the repository root, so load the shared

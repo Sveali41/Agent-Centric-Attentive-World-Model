@@ -352,7 +352,7 @@ PPO:
 Then run:
 
 ```bash
-python -m modelBased.policy_training.PPO_world_training domain=minigrid
+python -m modelBased.policy_training.ppo.PPO_world_training domain=minigrid
 ```
 
 The current world-model PPO implementation is MiniGrid-specific.
@@ -371,15 +371,15 @@ health reward, while terminated is based on predicted health and truncated is
 based on the planning step limit. Crafter policy planning can be run with:
 
 ```bash
-python -m modelBased.policy_training.PPO_crafter_training domain=crafter
-python -m modelBased.policy_training.PPO_crafter_test domain=crafter
+python -m modelBased.policy_training.ppo.PPO_crafter_training domain=crafter
+python -m modelBased.policy_training.ppo.PPO_crafter_test domain=crafter
 ```
 
 Crafter validation can save the first evaluated episode as a GIF. This works
 headlessly; `PPO.render=true` additionally displays the live render:
 
 ```bash
-python -m modelBased.policy_training.PPO_crafter_test \
+python -m modelBased.policy_training.ppo.PPO_crafter_test \
   domain=crafter \
   PPO.total_test_episodes=1 \
   PPO.render=false \
@@ -426,7 +426,7 @@ Run model-free PPO directly with:
 
 ```bash
 wandb login  # required once per machine
-python -m modelBased.policy_training.PPO_world_training domain=minigrid
+python -m modelBased.policy_training.ppo.PPO_world_training domain=minigrid
 ```
 
 With `PPO.use_wandb=true`, every episode records `episode/reward`,
@@ -445,9 +445,9 @@ For controlled multi-seed experiments, set `PPO.seed` in the YAML or override
 it on the command line:
 
 ```bash
-python -m modelBased.policy_training.PPO_world_training domain=minigrid PPO.seed=0
-python -m modelBased.policy_training.PPO_world_training domain=minigrid PPO.seed=1
-python -m modelBased.policy_training.PPO_world_training domain=minigrid PPO.seed=2
+python -m modelBased.policy_training.ppo.PPO_world_training domain=minigrid PPO.seed=0
+python -m modelBased.policy_training.ppo.PPO_world_training domain=minigrid PPO.seed=1
+python -m modelBased.policy_training.ppo.PPO_world_training domain=minigrid PPO.seed=2
 ```
 
 WandB grouping and artifact names are derived automatically from
@@ -491,7 +491,7 @@ override is needed.
 The same settings can be supplied without editing the YAML file:
 
 ```bash
-python -m modelBased.policy_training.PPO_world_training \
+python -m modelBased.policy_training.ppo.PPO_world_training \
   domain=minigrid \
   PPO.train_in_real_env=true \
   domains.minigrid.task_name=simple_test
@@ -509,11 +509,11 @@ python run_pipeline.py pipeline.label=minigrid PPO.train_in_real_env=true
 ```bash
 # Run the learned compact-action policy in the real MiniGrid environment and
 # open a live render window.
-python -m modelBased.policy_training.PPO_world_test domain=minigrid \
+python -m modelBased.policy_training.ppo.PPO_world_test domain=minigrid \
   PPO.total_test_episodes=1 PPO.render=true PPO.save_gif=false PPO.save_csv=false
 
 # Headless alternative: save the first real-environment episode as a GIF.
-python -m modelBased.policy_training.PPO_world_test domain=minigrid \
+python -m modelBased.policy_training.ppo.PPO_world_test domain=minigrid \
   PPO.total_test_episodes=1 PPO.render=false PPO.save_gif=true PPO.save_csv=false
 ```
 

@@ -31,8 +31,8 @@ from domain.minigrid.action_codec import (
 )
 from domain.minigrid.minigrid_custom_env import CustomMiniGridEnv
 from modelBased.common import utils
-from modelBased.policy_training.minigrid_wm_rollout import rollout_minigrid_wm
-from modelBased.policy_training.mpc_planner import (
+from modelBased.policy_training.common.minigrid_wm_rollout import rollout_minigrid_wm
+from modelBased.policy_training.planners.mpc_planner import (
     DEVICE,
     _find_goal,
     _load_world_model,
@@ -368,7 +368,7 @@ def run_online_mcts(cfg: DictConfig) -> list[dict]:
     return rows
 
 
-@hydra.main(version_base=None, config_path="../config", config_name="config")
+@hydra.main(version_base=None, config_path="../../config", config_name="config")
 def main(cfg: DictConfig):
     run_online_mcts(cfg)
 

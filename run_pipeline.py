@@ -11,7 +11,7 @@ import hydra
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 from modelBased.common.artifacts import dataset_matches
-from modelBased.policy_training.experiment_naming import (
+from modelBased.policy_training.common.experiment_naming import (
     policy_checkpoint_is_compatible,
     policy_checkpoint_path,
 )
@@ -526,10 +526,8 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
         control_cfg = getattr(cfg.PPO, control_mode)
         if control_mode == "mpc":
             control_names = (
-                "horizon", "population", "elite_count", "iterations", "gamma",
-                "goal_reward", "progress_reward", "step_penalty", "invalid_action_penalty",
-                "uncertainty_penalty", "fallback_action", "episodes",
-                "print_every_steps", "output_dir",
+                "horizon", "cpu_threads", "execute_steps", "population", "elite_count", "iterations", "gamma",
+                "fallback_action", "episodes", "print_every_steps", "output_dir",
             )
         elif control_mode == "mcts":
             control_names = (
@@ -553,14 +551,23 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
             )
             if hasattr(control_cfg, name)
         ]
+        if control_mode == "mpc":
+            control_overrides.append(
+                "PPO.use_main_dense_reward="
+                f"{str(bool(cfg.PPO.use_main_dense_reward)).lower()}"
+            )
+            control_overrides.extend(
+                f"PPO.main_dense_reward.{name}={value}"
+                for name, value in cfg.PPO.main_dense_reward.items()
+            )
         run_command(
             [
                 python,
                 "-m",
                 (
-                    "modelBased.policy_training.dijkstra_planner"
+                    "modelBased.policy_training.planners.dijkstra_planner"
                     if control_mode == "astar"
-                    else f"modelBased.policy_training.{control_mode}_planner"
+                    else f"modelBased.policy_training.planners.{control_mode}_planner"
                 ),
                 "domain=minigrid",
                 f"PPO.checkpoint_path_wm={policy_world_model_path}",
@@ -592,7 +599,7 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
                 [
                     python,
                     "-m",
-                    "modelBased.policy_training.PPO_world_training",
+                    "modelBased.policy_training.ppo.PPO_world_training",
                     "domain=minigrid",
                     f"PPO.checkpoint_path={policy_path}",
                     f"PPO.checkpoint_path_wm={policy_world_model_path}",
@@ -608,7 +615,7 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
                 [
                     python,
                     "-m",
-                    "modelBased.policy_training.PPO_world_test",
+                    "modelBased.policy_training.ppo.PPO_world_test",
                     "domain=minigrid",
                     f"PPO.checkpoint_path={policy_path}",
                     *policy_overrides,
@@ -644,7 +651,7 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
                 [
                     python,
                     "-m",
-                    "modelBased.policy_training.PPO_crafter_training",
+                    "modelBased.policy_training.ppo.PPO_crafter_training",
                     "domain=crafter",
                     f"PPO.checkpoint_path={policy_path}",
                     f"PPO.checkpoint_path_wm={policy_world_model_path}",
@@ -664,7 +671,7 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
             [
                 python,
                 "-m",
-                "modelBased.policy_training.PPO_crafter_test",
+                "modelBased.policy_training.ppo.PPO_crafter_test",
                 "domain=crafter",
                 f"PPO.checkpoint_path={policy_path}",
                 *policy_overrides,

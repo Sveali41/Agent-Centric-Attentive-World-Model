@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -34,15 +34,15 @@ from domain.minigrid.minigrid_support import (
 )
 from modelBased.common.artifacts import append_mean_row
 from modelBased.common.utils import normalize_obs
-from modelBased.policy_training.PPO import PPO
-from modelBased.policy_training.minigrid_dense_reward import (
+from modelBased.policy_training.ppo.PPO import PPO
+from modelBased.policy_training.common.minigrid_dense_reward import (
     build_door_topology,
     build_goal_distance_map,
     build_goal_region_mask,
     main_dense_rewards,
     reward_settings as main_dense_reward_settings,
 )
-from modelBased.policy_training.experiment_naming import (
+from modelBased.policy_training.common.experiment_naming import (
     policy_checkpoint_is_compatible,
     policy_checkpoint_path,
     policy_training_source,

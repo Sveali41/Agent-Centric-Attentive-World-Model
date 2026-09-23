@@ -460,19 +460,18 @@ PPO:
   wm_control_mode: ppo  # ppo | mpc | mcts | astar
   mpc:
     horizon: 16
+    cpu_threads: 4
+    # Number of actions executed in the real environment before replanning.
+    # A mismatch with the WM prediction ends the block early and replans.
+    execute_steps: 8
     population: 128
     elite_count: 16
     iterations: 3
     gamma: 0.99
-    goal_reward: 100.0
-    progress_reward: 1.0
-    step_penalty: 0.01
-    invalid_action_penalty: 0.10
-    uncertainty_penalty: 0.02
     fallback_action: 0
     episodes: 10
     print_every_steps: 1
-    output_dir: ${paths.planning}/mpc/${domains.minigrid.task_name}_seed${PPO.seed}
+    output_dir: ${paths.planning}/mpc/${domains.minigrid.task_name}_seed${PPO.seed}_dense_exec${PPO.mpc.execute_steps}
   mcts:
     simulations: 64
     max_depth: 256

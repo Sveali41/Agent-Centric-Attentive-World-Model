@@ -16,7 +16,7 @@ from modelBased.common.artifacts import continual_phase_data_path, dataset_match
 from modelBased.data.data_collect import save_dataset_coverage, save_experiments
 from modelBased.exploration.count_based import CrafterStateActionCounter, build_crafter_policy_state
 from modelBased.exploration.crafter_rmax_collect import _make_ppo
-from modelBased.policy_training.crafter_vector_env import CrafterSubprocessVectorEnv
+from modelBased.policy_training.common.crafter_vector_env import CrafterSubprocessVectorEnv
 
 
 def _phase_cfg(cfg: DictConfig, phase: dict, data_path: Path) -> DictConfig:

@@ -27,7 +27,7 @@ from modelBased.world_model.crafter_dynamics import (
 from domain.crafter.crafter_support import load_crafter_planning_model
 
 
-WM_ROOT = Path(__file__).resolve().parents[2]
+WM_ROOT = Path(__file__).resolve().parents[3]
 REPOSITORY_ROOT = WM_ROOT.parent
 ACTION_NAMES = (
     "noop", "move_left", "move_right", "move_up", "move_down", "do", "sleep",

@@ -18,7 +18,7 @@ import json
 from collections import deque
 from pathlib import Path
 
-WM_PACKAGE_ROOT = Path(__file__).resolve().parents[2]
+WM_PACKAGE_ROOT = Path(__file__).resolve().parents[3]
 if str(WM_PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(WM_PACKAGE_ROOT))
 
@@ -34,8 +34,8 @@ from modelBased.world_model.crafter_dynamics import (
     crafter_player_counts,
     imagined_crafter_step_batch as _shared_imagined_crafter_step_batch,
 )
-from modelBased.policy_training.PPO import PPO
-from modelBased.policy_training.experiment_naming import (
+from modelBased.policy_training.ppo.PPO import PPO
+from modelBased.policy_training.common.experiment_naming import (
     policy_checkpoint_path,
     policy_selection_paths,
     policy_wandb_identity,
@@ -49,7 +49,7 @@ from domain.crafter.crafter_support import (
     inspect_crafter_planning_checkpoint,
     load_crafter_planning_model,
 )
-from modelBased.policy_training.crafter_vector_env import CrafterSubprocessVectorEnv
+from modelBased.policy_training.common.crafter_vector_env import CrafterSubprocessVectorEnv
 
 import wandb
 

@@ -4,7 +4,7 @@ import json
 from collections import Counter, deque
 from pathlib import Path
 
-SCRIPT_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT_ROOT = Path(__file__).resolve().parents[3]
 if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 
@@ -14,8 +14,8 @@ from domain.minigrid.minigrid_support import stochastic_env_kwargs
 from minigrid.wrappers import FullyObsWrapper
 import torch
 import numpy as np
-from modelBased.policy_training.PPO import PPO
-from modelBased.policy_training.experiment_naming import (
+from modelBased.policy_training.ppo.PPO import PPO
+from modelBased.policy_training.common.experiment_naming import (
     policy_checkpoint_path,
     policy_wandb_identity,
 )
@@ -30,13 +30,13 @@ from domain.minigrid.action_codec import (
     carrying_token_from_env,
     compact_to_native,
 )
-from modelBased.policy_training.dijkstra_planner import (
+from modelBased.policy_training.planners.dijkstra_planner import (
     plan_exact_minigrid,
     replay_actions_in_real_env,
     replay_actions_in_world_model,
 )
-from modelBased.policy_training.minigrid_wm_rollout import rollout_minigrid_wm
-from modelBased.policy_training.minigrid_dense_reward import (
+from modelBased.policy_training.common.minigrid_wm_rollout import rollout_minigrid_wm
+from modelBased.policy_training.common.minigrid_dense_reward import (
     build_goal_distance_map as build_main_goal_distance_map,
     build_door_topology,
     build_goal_region_mask,
@@ -49,7 +49,7 @@ from modelBased.world_model import AttentionWM_support
 from modelBased.world_model import Embedding_support
 from modelBased.world_model import MLP_support
 import wandb
-from modelBased.policy_training.PPO import preprocess_observation 
+from modelBased.policy_training.ppo.PPO import preprocess_observation 
 import time
 
 
@@ -2747,7 +2747,7 @@ def run_training_real_env(cfg):
 def run_policy_evaluation(cfg: DictConfig):
     # Keep one authoritative MiniGrid evaluation path so direct callers and
     # run_pipeline use the same dense/native reward and goal-region metrics.
-    from modelBased.policy_training.PPO_world_test import validate_policy
+    from modelBased.policy_training.ppo.PPO_world_test import validate_policy
 
     return validate_policy(cfg)
 
@@ -2761,21 +2761,21 @@ def main(cfg: DictConfig):
     if control_mode == "mpc":
         if getattr(cfg.PPO, "train_in_real_env", False):
             raise ValueError("PPO.wm_control_mode=mpc requires PPO.train_in_real_env=false")
-        from modelBased.policy_training.mpc_planner import run_online_mpc
+        from modelBased.policy_training.planners.mpc_planner import run_online_mpc
         print("Running online MPC with world-model rollouts...")
         run_online_mpc(cfg)
         return
     if control_mode == "mcts":
         if getattr(cfg.PPO, "train_in_real_env", False):
             raise ValueError("PPO.wm_control_mode=mcts requires PPO.train_in_real_env=false")
-        from modelBased.policy_training.mcts_planner import run_online_mcts
+        from modelBased.policy_training.planners.mcts_planner import run_online_mcts
         print("Running online MCTS with world-model rollouts...")
         run_online_mcts(cfg)
         return
     if control_mode == "astar":
         if getattr(cfg.PPO, "train_in_real_env", False):
             raise ValueError("PPO.wm_control_mode=astar requires PPO.train_in_real_env=false")
-        from modelBased.policy_training.dijkstra_planner import (
+        from modelBased.policy_training.planners.dijkstra_planner import (
             plan_and_validate_world_model,
         )
         print("Running receding-horizon A* with frozen world-model rollouts...")

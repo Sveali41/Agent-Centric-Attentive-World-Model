@@ -2,7 +2,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from modelBased.policy_training.experiment_naming import (
+from modelBased.policy_training.common.experiment_naming import (
     _bounded_wandb_name,
     policy_checkpoint_path,
     policy_selection_paths,
