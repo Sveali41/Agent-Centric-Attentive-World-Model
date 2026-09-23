@@ -118,6 +118,7 @@ class AttentionWorldModel(pl.LightningModule):
         # value over every changed unit in the full epoch.
         self._val_crafter_changed_loss_sum = None
         self._val_crafter_changed_count = None
+        self._val_crafter_focal_diagnostics = None
         self._val_crafter_inventory_diagnostics = None
 
         self.fisher = 0
@@ -1295,6 +1296,54 @@ class AttentionWorldModel(pl.LightningModule):
             changed_count = changed_count + item_changed.sum().to(dtype=changed_count.dtype)
         return loss_sum, changed_count
 
+    def _crafter_focal_diagnostics(self, obs_pred, obs_next, obs, inv, inv_next, inv_pred):
+        """Count-weighted changed-only focal diagnostics for Crafter validation."""
+        zero = obs_pred.new_zeros((), dtype=torch.float32)
+        result = {
+            "layout_object_changed_loss_sum": zero, "layout_object_changed_count": zero,
+            "layout_object_false_set_sum": zero, "layout_object_keep_count": zero,
+            "layout_direction_changed_loss_sum": zero, "layout_direction_changed_count": zero,
+            "layout_direction_false_set_sum": zero, "layout_direction_keep_count": zero,
+            "inventory_changed_loss_sum": zero, "inventory_changed_count": zero,
+            "inventory_false_set_sum": zero, "inventory_keep_count": zero,
+            "inventory_focal_available": zero,
+        }
+        if self.env_type != "crafter":
+            return result
+        for spec in self.observation_schema:
+            if str(spec.get("distribution")) != "categorical_effect" or str(spec.get("target_source", "observation")) == "inventory":
+                continue
+            index = int(spec["target_index"])
+            start, stop = map(int, spec["prediction_slice"])
+            effects = categorical_effect_target(obs[:, index], obs_next[:, index])
+            per_cell = balanced_categorical_effect_loss(
+                obs_pred[:, start:stop], effects, reduction="none",
+                label_smoothing=float(spec.get("label_smoothing", 0.0)), focal_gamma=1.0,
+            )
+            prefix = "layout_object" if index == 0 else "layout_direction"
+            changed, keep = effects.ne(0), effects.eq(0)
+            result[f"{prefix}_changed_loss_sum"] = per_cell[changed].sum()
+            result[f"{prefix}_changed_count"] = changed.sum().float()
+            result[f"{prefix}_false_set_sum"] = obs_pred[:, start:stop].argmax(dim=1)[keep].ne(0).sum().float()
+            result[f"{prefix}_keep_count"] = keep.sum().float()
+        if (inv is None or inv_next is None or not isinstance(inv_pred, dict)
+                or self.crafter_inventory_output_mode != "categorical_effect"):
+            return result
+        current = inv.long()[:, SURVIVAL_SLOTS:]
+        following = inv_next.long()[:, SURVIVAL_SLOTS:]
+        effects = categorical_inventory_effect_target(current, following)
+        logits = inv_pred["item_effect_logits"]
+        per_slot = balanced_categorical_effect_loss(logits, effects, reduction="none", focal_gamma=1.0)
+        changed, keep = effects.ne(0), effects.eq(0)
+        result.update({
+            "inventory_changed_loss_sum": per_slot[changed].sum(),
+            "inventory_changed_count": changed.sum().float(),
+            "inventory_false_set_sum": logits.argmax(dim=1)[keep].ne(0).sum().float(),
+            "inventory_keep_count": keep.sum().float(),
+            "inventory_focal_available": zero.new_tensor(1.0),
+        })
+        return result
+
     def _crafter_inventory_diagnostics(self, inv, inv_next, inv_pred):
         """Return count-based, natural-distribution Crafter inventory diagnostics.
 
@@ -1959,6 +2008,18 @@ class AttentionWorldModel(pl.LightningModule):
                     self._val_crafter_changed_count = (
                         self._val_crafter_changed_count + changed_count.detach()
                     )
+                focal_diagnostics = self._crafter_focal_diagnostics(
+                    obs_pred, obs_next, obs, inv, inv_next, inv_pred
+                )
+                if self._val_crafter_focal_diagnostics is None:
+                    self._val_crafter_focal_diagnostics = {
+                        name: value.detach() for name, value in focal_diagnostics.items()
+                    }
+                else:
+                    for name, value in focal_diagnostics.items():
+                        self._val_crafter_focal_diagnostics[name] = (
+                            self._val_crafter_focal_diagnostics[name] + value.detach()
+                        )
                 inventory_diagnostics = self._crafter_inventory_diagnostics(
                     inv, inv_next, inv_pred
                 )
@@ -2004,6 +2065,7 @@ class AttentionWorldModel(pl.LightningModule):
         self._val_stochastic_outcomes = []
         self._val_crafter_changed_loss_sum = None
         self._val_crafter_changed_count = None
+        self._val_crafter_focal_diagnostics = None
         self._val_crafter_inventory_diagnostics = None
         self._val_crafter_pose_diagnostics = []
         if getattr(self.hparams, "keep_cell_loss", False):
@@ -2083,6 +2145,38 @@ class AttentionWorldModel(pl.LightningModule):
             )
             self.log("val/changed_nll", changed_nll)
             self.log("val/changed_count", count)
+        if self.env_type == "crafter" and self._val_crafter_focal_diagnostics is not None:
+            diagnostics = self._val_crafter_focal_diagnostics
+            zero = diagnostics["layout_object_changed_count"].new_zeros(())
+            def _ratio(numerator, denominator):
+                return numerator / denominator if bool(denominator > 0) else zero
+            layout_fields = ("layout_object", "layout_direction")
+            layout_changed = [
+                _ratio(diagnostics[f"{name}_changed_loss_sum"], diagnostics[f"{name}_changed_count"])
+                for name in layout_fields if bool(diagnostics[f"{name}_changed_count"] > 0)
+            ]
+            layout_false_set = [
+                _ratio(diagnostics[f"{name}_false_set_sum"], diagnostics[f"{name}_keep_count"])
+                for name in layout_fields if bool(diagnostics[f"{name}_keep_count"] > 0)
+            ]
+            nan = zero.new_full((), float("nan"))
+            layout_focal = torch.stack(layout_changed).mean() if layout_changed else nan
+            layout_fpr = torch.stack(layout_false_set).mean() if layout_false_set else nan
+            self.log("val/layout_changed_focal_loss", layout_focal)
+            self.log("val/layout_false_set_rate", layout_fpr)
+            self.log("val/layout_changed_count", sum(diagnostics[f"{name}_changed_count"] for name in layout_fields))
+            groups = [layout_focal] if layout_changed else []
+            if bool(diagnostics["inventory_focal_available"] > 0):
+                inventory_focal = (_ratio(diagnostics["inventory_changed_loss_sum"], diagnostics["inventory_changed_count"])
+                                   if bool(diagnostics["inventory_changed_count"] > 0) else nan)
+                inventory_fpr = (_ratio(diagnostics["inventory_false_set_sum"], diagnostics["inventory_keep_count"])
+                                 if bool(diagnostics["inventory_keep_count"] > 0) else nan)
+                self.log("val/inventory_changed_focal_loss", inventory_focal)
+                self.log("val/inventory_false_set_rate", inventory_fpr)
+                self.log("val/inventory_changed_count", diagnostics["inventory_changed_count"])
+                if bool(diagnostics["inventory_changed_count"] > 0):
+                    groups.append(inventory_focal)
+            self.log("val/changed_focal_loss", torch.stack(groups).mean() if groups else nan)
         if self.env_type == "crafter" and self._val_crafter_inventory_diagnostics is not None:
             diagnostics = self._val_crafter_inventory_diagnostics
             zero = diagnostics["_zero"]
@@ -2200,6 +2294,7 @@ class AttentionWorldModel(pl.LightningModule):
         self._val_stochastic_outcomes = []
         self._val_crafter_changed_loss_sum = None
         self._val_crafter_changed_count = None
+        self._val_crafter_focal_diagnostics = None
         self._val_crafter_inventory_diagnostics = None
         self._val_crafter_pose_diagnostics = []
 
@@ -2318,6 +2413,44 @@ class AttentionWorldModel(pl.LightningModule):
         return float(
             self.calc_minigrid_probe_metrics(trajectory_data)["changed_focal_loss"]
         )
+
+    @torch.no_grad()
+    def calc_crafter_changed_focal_loss(self, trajectory_data):
+        """Changed-only focal loss for one held-out Crafter rollout.
+
+        This mirrors validation: mean non-empty layout fields, then mean the
+        layout and inventory groups. A rollout with no scored change is NaN.
+        """
+        if self.env_type != "crafter" or not trajectory_data:
+            return float("nan")
+        was_training = self.training
+        self.eval()
+        try:
+            batch = {"obs": trajectory_data["obs"].to(self.device),
+                     "act": trajectory_data["act"].to(self.device),
+                     "obs_next": trajectory_data["obs_next"].to(self.device),
+                     "info": None}
+            for name in ("inv", "inv_next"):
+                value = trajectory_data.get(name)
+                if value is not None:
+                    batch[name] = value.to(self.device) if torch.is_tensor(value) else value
+            obs, act, obs_next, info, _, _, inv, inv_next = self.preprocess_batch(batch)
+            obs_pred, _, inv_pred = self(obs, act, info, inv=inv)
+            diagnostics = self._crafter_focal_diagnostics(
+                obs_pred, obs_next, obs, inv, inv_next, inv_pred
+            )
+            layout = []
+            for name in ("layout_object", "layout_direction"):
+                count = diagnostics[f"{name}_changed_count"]
+                if bool(count > 0):
+                    layout.append(diagnostics[f"{name}_changed_loss_sum"] / count)
+            groups = [torch.stack(layout).mean()] if layout else []
+            count = diagnostics["inventory_changed_count"]
+            if bool(diagnostics["inventory_focal_available"] > 0) and bool(count > 0):
+                groups.append(diagnostics["inventory_changed_loss_sum"] / count)
+            return float(torch.stack(groups).mean().item()) if groups else float("nan")
+        finally:
+            self.train(was_training)
 
     def on_train_end(self):
         """Save a final visualization at the end of training."""

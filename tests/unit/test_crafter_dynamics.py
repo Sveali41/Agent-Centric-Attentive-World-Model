@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
+from pathlib import Path
 
 import torch
 from omegaconf import OmegaConf
@@ -26,6 +28,7 @@ from modelBased.world_model.crafter_dynamics import (
     crafter_player_counts,
 )
 from modelBased.world_model.AttentionWM import AttentionWorldModel, crafter_selection_loss
+from trainer.target_baseline_experiment import _ensure_baseline_csv
 from modelBased.world_model.AttentionWM_support import AttentionModule
 from domain.crafter.crafter_support import (
     PLAYER_ID,
@@ -757,5 +760,153 @@ class CrafterAgentProjectionTest(unittest.TestCase):
         ))
 
 
+
+class CrafterFocalDiagnosticsTest(unittest.TestCase):
+    def test_effect_head_reports_separate_layout_and_inventory_counts(self):
+        # Call the validation-only helper without constructing a Lightning trainer.
+        helper = type("CrafterDiagnostics", (), {
+            "env_type": "crafter",
+            "crafter_inventory_output_mode": "categorical_effect",
+            "observation_schema": (
+                {"distribution": "categorical_effect", "target_index": 0, "prediction_slice": (0, 21)},
+                {"distribution": "categorical_effect", "target_index": 1, "prediction_slice": (21, 27)},
+            ),
+        })()
+        current = torch.zeros((1, 2, 2, 2), dtype=torch.long)
+        following = current.clone()
+        following[0, 0, 0, 0] = 2
+        following[0, 1, 1, 1] = 3
+        logits = torch.full((1, 27, 2, 2), -8.0)
+        logits[:, 0] = 8.0
+        logits[0, 3, 0, 0] = 12.0  # SET_TO object 2
+        logits[0, 25, 1, 1] = 12.0  # SET_TO direction 3
+        inv = torch.zeros((1, 16), dtype=torch.long)
+        inv_next = inv.clone()
+        inv_next[0, 4] = 1
+        item_logits = torch.full((1, 5, 12), -8.0)
+        item_logits[:, 0] = 8.0
+        item_logits[0, 4, 0] = 12.0
+        diagnostics = AttentionWorldModel._crafter_focal_diagnostics(
+            helper, logits, following, current, inv, inv_next,
+            {"item_effect_logits": item_logits},
+        )
+        self.assertEqual(float(diagnostics["layout_object_changed_count"]), 1.0)
+        self.assertEqual(float(diagnostics["layout_direction_changed_count"]), 1.0)
+        self.assertEqual(float(diagnostics["inventory_changed_count"]), 1.0)
+        self.assertEqual(float(diagnostics["inventory_focal_available"]), 1.0)
+        self.assertEqual(float(diagnostics["layout_object_false_set_sum"]), 0.0)
+        self.assertEqual(float(diagnostics["inventory_false_set_sum"]), 0.0)
+
+    def test_legacy_gate_omits_inventory_focal_metric(self):
+        helper = type("CrafterDiagnostics", (), {
+            "env_type": "crafter", "crafter_inventory_output_mode": "categorical_gate",
+            "observation_schema": (),
+        })()
+        diagnostics = AttentionWorldModel._crafter_focal_diagnostics(
+            helper, torch.zeros((1, 1, 1, 1)), torch.zeros((1, 2, 1, 1), dtype=torch.long),
+            torch.zeros((1, 2, 1, 1), dtype=torch.long), torch.zeros((1, 16), dtype=torch.long),
+            torch.zeros((1, 16), dtype=torch.long), {},
+        )
+        self.assertEqual(float(diagnostics["inventory_focal_available"]), 0.0)
+
+class CrafterGeneratorInventoryEditTest(unittest.TestCase):
+    def test_materialization_ignores_survival_banks_and_keeps_item_edits(self):
+        import numpy as np
+        from types import SimpleNamespace
+        from generator.generator_interface import GeneratorInterface
+        fake = SimpleNamespace(
+            is_crafter=True,
+            is_minigrid=False,
+            cfg=SimpleNamespace(generator_agent=SimpleNamespace(random_stats_actions=False)),
+            _apply_action=lambda obj, action, mask: (obj, obj, obj),
+        )
+        stats_actions = torch.zeros((1, 32), dtype=torch.long)
+        stats_actions[0, 0] = 1       # survival slot 0, +1: ignored
+        stats_actions[0, 19] = 1      # survival slot 3, +5: ignored
+        stats_actions[0, 4] = 1       # item slot 4, +1
+        stats_actions[0, 21] = 1      # item slot 5, +5
+        _, _, _, stats = GeneratorInterface._materialize_candidates(
+            fake, np.zeros((1, 2, 2), dtype=np.int64), np.zeros((1, 2, 2), dtype=np.int64),
+            stats_actions.numpy(), np.zeros((1, 16), dtype=np.int64), torch.zeros((1, 1, 2, 2)),
+        )
+        self.assertEqual(stats[0][:4].tolist(), [0, 0, 0, 0])
+        self.assertEqual(stats[0][4], 1)
+        self.assertEqual(stats[0][5], 5)
+
+    def test_random_and_ppo_masks_disable_both_survival_banks(self):
+        from generator.generator_network import MapEditorActorCritic
+        from generator.random_generator_agent import RandomGeneratorAgent
+        model = MapEditorActorCritic(env_type="crafter")
+        logits = torch.zeros((2, 32, 2))
+        ppo_mask = model._get_stats_topk_mask(logits, 1.0)
+        self.assertFalse(ppo_mask[:, 0:4].any())
+        self.assertFalse(ppo_mask[:, 16:20].any())
+        self.assertEqual(int(ppo_mask[0].sum()), 24)
+        random_agent = RandomGeneratorAgent(12, device="cpu", env_type="crafter")
+        result = random_agent.select_action(torch.zeros((2, 3, 3, 3)), None, torch.zeros((2, 1, 3, 3)), 0.0, 1.0)
+        stats_action, random_mask = result[1], result[6]
+        self.assertFalse(random_mask[:, 0:4].any())
+        self.assertFalse(random_mask[:, 16:20].any())
+        self.assertTrue(torch.equal(stats_action[:, 0:4], torch.zeros_like(stats_action[:, 0:4])))
+        self.assertTrue(torch.equal(stats_action[:, 16:20], torch.zeros_like(stats_action[:, 16:20])))
+
+class CrafterLearningProgressAggregationTest(unittest.TestCase):
+    def test_aggregates_only_finite_identical_probe_pairs(self):
+        from generator.generator_interface import GeneratorInterface
+        pre, post, progress, paired = GeneratorInterface._aggregate_crafter_learning_progress(
+            [1.0, float("nan"), 3.0], [0.5, 0.0, float("nan")]
+        )
+        self.assertAlmostEqual(pre, 1.0)
+        self.assertAlmostEqual(post, 0.5)
+        self.assertAlmostEqual(progress, 0.5)
+        self.assertEqual(paired.tolist(), [True, False, False])
+
+    def test_no_finite_pair_is_unavailable(self):
+        import numpy as np
+        from generator.generator_interface import GeneratorInterface
+        pre, post, progress, paired = GeneratorInterface._aggregate_crafter_learning_progress(
+            [float("nan")], [1.0]
+        )
+        self.assertTrue(np.isnan(pre))
+        self.assertTrue(np.isnan(post))
+        self.assertTrue(np.isnan(progress))
+        self.assertEqual(paired.tolist(), [False])
+
+class CrafterLearningProgressRewardTest(unittest.TestCase):
+    def test_finalization_replaces_provisional_difficulty_rewards(self):
+        import numpy as np
+        from types import SimpleNamespace
+        from generator.generator_interface import GeneratorInterface
+        interface = SimpleNamespace(
+            is_crafter=True,
+            batch_size=3,
+            crafter_reward_cfg=SimpleNamespace(learning_progress=2.0, clip=10.0),
+            ppo=SimpleNamespace(buffer={"reward": [99.0, 88.0, 77.0]}),
+            _pending_crafter_round={
+                "valid": [True, True, False],
+                "pre_changed_focal_losses": np.array([3.0, np.nan, 1.0]),
+                "probe_trajectories": [{}, {}, {}],
+                "rewards": [99.0, 88.0, 77.0],
+                "auxiliary_rewards": [1.0, 2.0, 3.0],
+            },
+            last_crafter_metrics={},
+        )
+        interface._evaluate_crafter_changed_focal_losses = lambda trajectories, valid, phase: np.array([2.5, 1.0, 0.0])
+        interface._aggregate_crafter_learning_progress = GeneratorInterface._aggregate_crafter_learning_progress
+        GeneratorInterface.finalize_crafter_learning_progress(interface, apply_rewards=True)
+        # paired: 1 + 2 * (3 - 2.5); valid-unpaired: auxiliary only; invalid: -5.
+        self.assertEqual(interface.ppo.buffer["reward"], [2.0, 2.0, -5.0])
+        self.assertIsNone(interface._pending_crafter_round)
+
+class TargetBaselineCsvSchemaTest(unittest.TestCase):
+    def test_headered_schema_mismatch_is_backed_up_not_appended(self):
+        with tempfile.TemporaryDirectory() as directory:
+            csv_path = Path(directory) / "summary.csv"
+            csv_path.write_text("Seed,Iter\n0,1\n", encoding="utf-8")
+            self.assertFalse(_ensure_baseline_csv(csv_path, ["Seed", "Iter", "new_metric"]))
+            self.assertFalse(csv_path.exists())
+            backups = list(Path(directory).glob("summary_schema_backup*.csv"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_text(encoding="utf-8"), "Seed,Iter\n0,1\n")
 if __name__ == "__main__":
     unittest.main()

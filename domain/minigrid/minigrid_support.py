@@ -259,10 +259,10 @@ def extract_masked_state(state, mask_size, agent_position_yx):
         state = state.detach().cpu().numpy()
         tensor_flag = True
 
-    # --- Environment-Specific Padding ---
-    # Crafter (2 channels) -> Pad with Grass (ID 2)
-    # MiniGrid (3 channels) -> Pad with Zero (ID 0)
-    pad_val = 2 if state.shape[-3] == 2 else 0
+    # Keep out-of-bounds cells neutral across domains.  In Crafter this gives
+    # [object=None, direction=none] ([0, 0]); in MiniGrid it is the existing
+    # zero padding convention.
+    pad_val = 0
     
     if len(state.shape) == 3:
         state_masked = utilis_support.extract_masked_state_support(
