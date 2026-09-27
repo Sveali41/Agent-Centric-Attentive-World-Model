@@ -12,6 +12,7 @@ import csv
 import json
 import random
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,6 +41,10 @@ from modelBased.policy_training.common.minigrid_dense_reward import (
 )
 from modelBased.policy_training.common.minigrid_wm_rollout import rollout_minigrid_wm
 from modelBased.world_model import AttentionWM_support
+from domain.crafter.crafter_custom_env import CustomCrafterEnv
+from domain.crafter.crafter_reward import ACHIEVEMENT_NAMES, native_reward_batch
+from domain.crafter.crafter_support import CRAFTER_ACTION_NAMES, load_crafter_planning_model
+from modelBased.world_model.crafter_dynamics import SURVIVAL_SLOTS, crafter_player_counts, imagined_crafter_step_batch
 
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -157,7 +162,7 @@ class MPCPlan:
     actions: list[int]
     score: float
     predicted_positions: list[tuple[int, int]]
-    predicted_inventories: list[int]
+    predicted_inventories: list[int] | list[list[float]]
     diagnostics: dict[str, float | int]
 
 
@@ -399,8 +404,1120 @@ def _state_from_observation(observation) -> np.ndarray:
     return minigrid_utils.ColRowCanl_to_CanlRowCol(observation["image"])
 
 
+def _crafter_resource_distances(objects: np.ndarray, resource_ids: tuple[int, ...]) -> np.ndarray:
+    """Steps to a walkable cell adjacent to a visible resource."""
+    height, width = objects.shape
+    walkable = np.isin(objects, (0, 2, 4, 5, 13, 18))
+    resources = np.isin(objects, resource_ids)
+    distances = np.full((height, width), np.inf, dtype=np.float32)
+    queue = deque()
+    for y, x in np.argwhere(resources):
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            ny, nx = int(y + dy), int(x + dx)
+            if 0 <= ny < height and 0 <= nx < width and walkable[ny, nx] and not np.isfinite(distances[ny, nx]):
+                distances[ny, nx] = 0.0
+                queue.append((ny, nx))
+    while queue:
+        y, x = queue.popleft()
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < height and 0 <= nx < width and walkable[ny, nx] and not np.isfinite(distances[ny, nx]):
+                distances[ny, nx] = distances[y, x] + 1.0
+                queue.append((ny, nx))
+    return distances
+
+
+def _crafter_guided_resource_prefix(
+    objects: np.ndarray, position: tuple[int, int], direction: int,
+    distances: np.ndarray, resource_id: int, horizon: int,
+    interaction_action: int | None = 5,
+) -> list[int]:
+    """Follow a real-map distance gradient, then attempt an interaction."""
+    y, x = position
+    if not np.isfinite(distances[y, x]):
+        return []
+    # Action IDs and direction IDs use different orderings.
+    moves = ((3, 1, -1, 0), (4, 2, 1, 0), (1, 3, 0, -1), (2, 4, 0, 1))
+    prefix = []
+    while distances[y, x] > 0 and len(prefix) < horizon:
+        next_step = None
+        for action, facing, dy, dx in moves:
+            ny, nx = y + dy, x + dx
+            if (0 <= ny < objects.shape[0] and 0 <= nx < objects.shape[1]
+                    and distances[ny, nx] < distances[y, x]):
+                next_step = (action, facing, ny, nx)
+                break
+        if next_step is None:
+            return []
+        action, direction, y, x = next_step
+        prefix.append(action)
+    if distances[y, x] > 0 or interaction_action is None:
+        return prefix
+    for action, facing, dy, dx in moves:
+        ny, nx = y + dy, x + dx
+        if (0 <= ny < objects.shape[0] and 0 <= nx < objects.shape[1]
+                and objects[ny, nx] == resource_id):
+            if direction != facing and len(prefix) < horizon:
+                prefix.append(action)
+            if len(prefix) < horizon:
+                prefix.append(interaction_action)
+            break
+    return prefix
+
+
+def _crafter_distance_progress(
+    distances: torch.Tensor, positions: torch.Tensor, max_distance: float = 8.0
+) -> torch.Tensor:
+    """Convert a BFS distance to a bounded, small proximity potential."""
+    if positions.ndim == 1:
+        positions = positions.unsqueeze(0)
+    height, width = distances.shape
+    valid = (
+        positions[:, 0].ge(0) & positions[:, 0].lt(height)
+        & positions[:, 1].ge(0) & positions[:, 1].lt(width)
+    )
+    y = positions[:, 0].clamp(0, height - 1)
+    x = positions[:, 1].clamp(0, width - 1)
+    distance = distances[y, x]
+    finite = torch.isfinite(distance) & valid
+    return torch.where(
+        finite,
+        (1.0 - distance / float(max_distance)).clamp(0.0, 1.0),
+        torch.zeros_like(distance),
+    )
+
+
+def _crafter_tool_progress(
+    objects: torch.Tensor,
+    inventories: torch.Tensor,
+    positions: torch.Tensor,
+    tree_distances: torch.Tensor,
+    stone_distances: torch.Tensor,
+    table_distances: torch.Tensor,
+    *,
+    reserve_wood_for_first_table: bool = False,
+) -> torch.Tensor:
+    """Return four bounded potentials for the wood-to-stone tool chain.
+
+    Columns are table preparation, wood-pickaxe readiness, stone acquisition,
+    and stone-pickaxe readiness. Distances come from the current real map; an
+    imagined table is recognized from the endpoint map and gets its distance
+    map at the next real replanning boundary.
+    """
+    if objects.ndim == 2:
+        objects = objects.unsqueeze(0)
+    if inventories.ndim == 1:
+        inventories = inventories.unsqueeze(0)
+    if positions.ndim == 1:
+        positions = positions.unsqueeze(0)
+    if objects.ndim != 3 or inventories.ndim != 2 or positions.shape[-1] != 2:
+        raise ValueError("Crafter tool progress expects batched objects, inventories, and positions")
+    if inventories.shape[1] != 16:
+        raise ValueError("Crafter inventory must contain 16 slots")
+
+    wood = inventories[:, 4].clamp(0.0, 9.0)
+    stone = inventories[:, 5].clamp(0.0, 9.0)
+    wood_pickaxe = inventories[:, 10].ge(0.5)
+    stone_pickaxe = inventories[:, 11].ge(0.5)
+    table_exists = objects.eq(11).flatten(1).any(dim=1)
+
+    tree_proximity = _crafter_distance_progress(tree_distances, positions)
+    stone_proximity = _crafter_distance_progress(stone_distances, positions)
+    table_proximity = _crafter_distance_progress(table_distances, positions)
+    # A newly imagined table has no distance map yet. It is treated as usable
+    # for this endpoint; the next real replan computes its BFS distance.
+    has_observed_table = torch.isfinite(table_distances).any()
+    observed_table_access = torch.where(
+        table_exists, table_proximity, torch.zeros_like(table_proximity)
+    )
+    imagined_table_access = torch.where(
+        table_exists, torch.ones_like(table_proximity), table_proximity
+    )
+    table_access = torch.where(
+        has_observed_table, observed_table_access, imagined_table_access
+    )
+    height, width = table_distances.shape
+    valid_position = (
+        positions[:, 0].ge(0) & positions[:, 0].lt(height)
+        & positions[:, 1].ge(0) & positions[:, 1].lt(width)
+    )
+    y = positions[:, 0].clamp(0, height - 1)
+    x = positions[:, 1].clamp(0, width - 1)
+    table_reachable = (
+        table_exists & valid_position
+        & (torch.isfinite(table_distances[y, x]) | ~has_observed_table)
+    )
+
+    table_material = (wood / 2.0).clamp(0.0, 1.0)
+    table_progress = torch.where(
+        table_reachable,
+        torch.ones_like(table_material),
+        table_material + 0.2 * (1.0 - table_material) * tree_proximity,
+    )
+    # The first wood pickaxe needs another wood after placing the table.
+    # Keep tree proximity useful even while the table is farther away.
+    wood_material = wood.clamp(max=1.0)
+    wood_supply = wood_material + 0.2 * (1.0 - wood_material) * tree_proximity
+    craft_access = torch.where(
+        table_reachable,
+        0.8 + 0.2 * table_access,
+        torch.zeros_like(table_access),
+    )
+    # Before the first table, reserve its two wood plus one for the pickaxe.
+    # A third wood then advances the tool-chain potential before placement.
+    reserve_material = (wood - 2.0).clamp(0.0, 1.0)
+    reserve_progress = torch.where(
+        wood.ge(2.0),
+        reserve_material + 0.2 * (1.0 - reserve_material) * tree_proximity,
+        torch.zeros_like(wood),
+    )
+    wood_pickaxe_progress = torch.where(
+        wood_pickaxe,
+        torch.ones_like(table_material),
+        torch.where(
+            ~table_exists, reserve_progress, craft_access * wood_supply
+        ) if reserve_wood_for_first_table else craft_access * wood_supply,
+    )
+    stone_progress = torch.where(
+        stone.ge(0.5) | stone_pickaxe,
+        torch.ones_like(table_material),
+        torch.where(wood_pickaxe, stone_proximity, torch.zeros_like(stone_proximity)),
+    )
+    stone_pickaxe_progress = torch.where(
+        stone_pickaxe,
+        torch.ones_like(table_material),
+        craft_access * stone.clamp(max=1.0) * wood_supply,
+    )
+    return torch.stack(
+        (table_progress, wood_pickaxe_progress, stone_progress, stone_pickaxe_progress),
+        dim=1,
+    )
+
+
+def _crafter_inventory_progress_stage(objects: np.ndarray, inventory: np.ndarray) -> int:
+    """Current real tool tier, with table placement as the first substage."""
+    if inventory[12] >= 0.5:
+        return 4  # iron pickaxe: seek diamond
+    if inventory[11] >= 0.5:
+        return 3  # stone pickaxe: prepare iron pickaxe
+    if inventory[10] >= 0.5:
+        return 2  # wood pickaxe: seek stone
+    return 1 if np.any(objects == 11) else 0  # table placed or not
+
+
+def _crafter_inventory_progress_targets(stage: int, furnace_exists: bool) -> tuple[tuple[int, float], ...]:
+    """Only materials still needed for the next tool milestone earn progress."""
+    if stage == 0:
+        return ((4, 3.0),)  # two wood for table, one for wood pickaxe
+    if stage == 1:
+        return ((4, 1.0),)
+    if stage == 2:
+        return ((5, 1.0),)  # stone pickaxe
+    if stage == 3:
+        materials = ((6, 1.0), (7, 1.0))  # coal and iron
+        return materials if furnace_exists else ((5, 4.0),) + materials
+    if stage == 4:
+        return ((8, 1.0),)  # diamond
+    raise ValueError(f"Unknown Crafter inventory progress stage: {stage}")
+
+
+def _crafter_inventory_progress_gain(
+    inventories: torch.Tensor, peaks: torch.Tensor,
+    targets: tuple[tuple[int, float], ...],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Count newly reached material thresholds once per stage and episode."""
+    if not targets:
+        return torch.zeros(inventories.shape[0], device=inventories.device), peaks
+    slots = [slot for slot, _ in targets]
+    caps = inventories.new_tensor([cap for _, cap in targets])
+    observed = inventories[:, slots].clamp_min(0.0).minimum(caps)
+    new_peaks = peaks.clone()
+    new_peaks[:, slots] = torch.maximum(peaks[:, slots], observed)
+    gain = (new_peaks[:, slots] - peaks[:, slots]).sum(dim=1)
+    return gain, new_peaks
+
+
+def _crafter_late_tool_progress(
+    objects: torch.Tensor, inventories: torch.Tensor, positions: torch.Tensor,
+    tree_distances: torch.Tensor, stone_distances: torch.Tensor,
+    coal_distances: torch.Tensor, iron_distances: torch.Tensor,
+    diamond_distances: torch.Tensor, table_distances: torch.Tensor,
+) -> torch.Tensor:
+    """Bounded preparation for iron pickaxe, then diamond after it is held."""
+    if objects.ndim == 2:
+        objects = objects.unsqueeze(0)
+    if inventories.ndim == 1:
+        inventories = inventories.unsqueeze(0)
+    if positions.ndim == 1:
+        positions = positions.unsqueeze(0)
+    stone_pickaxe = inventories[:, 11].ge(0.5)
+    iron_pickaxe = inventories[:, 12].ge(0.5)
+    active = stone_pickaxe | iron_pickaxe
+    furnace = objects.eq(12).flatten(1).any(dim=1)
+
+    def material(slot: int, distances: torch.Tensor) -> torch.Tensor:
+        held = inventories[:, slot].clamp(0.0, 1.0)
+        pending = held + 0.2 * (1.0 - held) * _crafter_distance_progress(distances, positions)
+        return torch.where(iron_pickaxe, torch.ones_like(held),
+                           torch.where(active, pending, torch.zeros_like(held)))
+
+    wood = material(4, tree_distances)
+    coal = material(6, coal_distances)
+    iron = material(7, iron_distances)
+    stone_fraction = (inventories[:, 5] / 4.0).clamp(0.0, 1.0)
+    furnace_preparation = (
+        0.7 * stone_fraction
+        + 0.2 * _crafter_distance_progress(table_distances, positions)
+        + 0.1 * (1.0 - stone_fraction) * _crafter_distance_progress(stone_distances, positions)
+    ).clamp(0.0, 1.0)
+    furnace_ready = torch.where(furnace | iron_pickaxe, torch.ones_like(stone_fraction),
+                                furnace_preparation)
+    furnace_ready = torch.where(active, furnace_ready, torch.zeros_like(furnace_ready))
+    diamond_held = inventories[:, 8].ge(0.5)
+    diamond = torch.where(
+        iron_pickaxe,
+        torch.where(diamond_held, torch.ones_like(stone_fraction),
+                    0.2 * _crafter_distance_progress(diamond_distances, positions)),
+        torch.zeros_like(stone_fraction),
+    )
+    return torch.stack((wood, coal, iron, furnace_ready, diamond), dim=1)
+
+
+def _crafter_late_crafting_prefix(
+    objects: np.ndarray, position: tuple[int, int], direction: int,
+    horizon: int, craft_action: int,
+) -> list[int]:
+    """Reach a valid furnace placement or pickaxe crafting pose."""
+    if craft_action not in (9, 11, 12, 13):
+        raise ValueError("Crafter crafting route supports furnace and pickaxes")
+    tables = np.argwhere(objects == 11)
+    furnaces = np.argwhere(objects == 12)
+    if not len(tables) or (craft_action == 13 and not len(furnaces)):
+        return []
+    moves = ((3, 1, -1, 0), (4, 2, 1, 0), (1, 3, 0, -1), (2, 4, 0, 1))
+    offsets = {facing: (dy, dx) for _, facing, dy, dx in moves}
+    walkable = (0, 2, 4, 5, 13, 18)
+
+    def near(cells: np.ndarray, y: int, x: int) -> bool:
+        return bool(np.any((np.abs(cells[:, 0] - y) <= 1)
+                           & (np.abs(cells[:, 1] - x) <= 1)))
+
+    def ready(y: int, x: int, facing: int) -> bool:
+        if not near(tables, y, x):
+            return False
+        if craft_action in (11, 12):
+            return True
+        if craft_action == 13:
+            return near(furnaces, y, x)
+        dy, dx = offsets.get(facing, (0, 0))
+        ny, nx = y + dy, x + dx
+        return (facing in offsets and 0 <= ny < objects.shape[0]
+                and 0 <= nx < objects.shape[1]
+                and objects[ny, nx] in (2, 4, 5))
+
+    start = (*position, direction)
+    queue = deque([(start, [])])
+    seen = {start}
+    while queue:
+        (y, x, facing), route = queue.popleft()
+        if ready(y, x, facing):
+            return route + [craft_action]
+        if len(route) + 1 >= horizon:
+            continue
+        for action, next_facing, dy, dx in moves:
+            ny, nx = y + dy, x + dx
+            if not (0 <= ny < objects.shape[0] and 0 <= nx < objects.shape[1]
+                    and objects[ny, nx] in walkable):
+                ny, nx = y, x
+            next_state = (ny, nx, next_facing)
+            if next_state not in seen:
+                seen.add(next_state)
+                queue.append((next_state, route + [action]))
+    return []
+
+
+def _crafter_late_guided_prefixes(
+    objects: np.ndarray, inventory: np.ndarray, position: tuple[int, int],
+    direction: int, distances: dict[int, np.ndarray], horizon: int,
+) -> list[tuple[list[int], bool]]:
+    """Propose routes toward missing materials after a real pickaxe unlock."""
+    stone_pickaxe = inventory[11] >= 0.5
+    iron_pickaxe = inventory[12] >= 0.5
+    if not (stone_pickaxe or iron_pickaxe):
+        return []
+    furnace_exists = bool((objects == 12).any())
+    targets = []
+    if iron_pickaxe:
+        if inventory[8] < 0.5:
+            targets.append(10)  # diamond
+    else:
+        if inventory[4] < 1:
+            targets.append(6)  # tree
+        if inventory[6] < 1:
+            targets.append(8)  # coal
+        if inventory[7] < 1:
+            targets.append(9)  # iron
+        if not furnace_exists and inventory[5] < 4:
+            targets.append(3)  # stone for furnace
+    y, x = position
+    targets.sort(key=lambda resource: float(distances[resource][y, x]))
+    proposals = []
+    for resource in targets:
+        prefix = _crafter_guided_resource_prefix(
+            objects, position, direction, distances[resource], resource, horizon
+        )
+        if prefix:
+            proposals.append((prefix, 5 in prefix[:horizon]))
+    if stone_pickaxe and not iron_pickaxe:
+        craft_action = None
+        if not furnace_exists and inventory[5] >= 4:
+            craft_action = 9  # place_furnace
+        elif (furnace_exists and inventory[4] >= 1 and inventory[6] >= 1
+              and inventory[7] >= 1):
+            craft_action = 13  # make_iron_pickaxe
+        if craft_action is not None:
+            prefix = _crafter_late_crafting_prefix(
+                objects, position, direction, horizon, craft_action
+            )
+            if prefix:
+                proposals.append((prefix, True))
+    return proposals
+
+
+def _crafter_initial_visit_map(objects: np.ndarray) -> np.ndarray:
+    """Start a per-episode visit mask with the current player cell marked."""
+    player_yx = np.argwhere(np.asarray(objects) == 13)
+    if len(player_yx) != 1:
+        raise ValueError("Crafter MPC expects exactly one player on the current map")
+    visited = np.zeros(np.asarray(objects).shape, dtype=np.bool_)
+    visited[tuple(player_yx[0])] = True
+    return visited
+
+
+def _crafter_unvisited_distances(objects: np.ndarray, visited: np.ndarray) -> np.ndarray:
+    """BFS distance to the nearest currently reachable unvisited walkable tile."""
+    height, width = objects.shape
+    if visited.shape != objects.shape:
+        raise ValueError(f"Crafter visited map shape {visited.shape} does not match {objects.shape}")
+    walkable = np.isin(objects, (0, 2, 4, 5, 13, 18))
+    targets = walkable & ~visited
+    distances = np.full((height, width), np.inf, dtype=np.float32)
+    queue = deque()
+    for y, x in np.argwhere(targets):
+        distances[y, x] = 0.0
+        queue.append((int(y), int(x)))
+    while queue:
+        y, x = queue.popleft()
+        next_distance = distances[y, x] + 1.0
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if (0 <= ny < height and 0 <= nx < width and walkable[ny, nx]
+                    and not np.isfinite(distances[ny, nx])):
+                distances[ny, nx] = next_distance
+                queue.append((ny, nx))
+    return distances
+
+
+def _crafter_exploration_bonus(
+    predicted_positions: torch.Tensor,
+    visited: torch.Tensor,
+    frontier_distances: torch.Tensor,
+    start_distance: float,
+    alive: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score unique imagined new cells and progress toward the nearest frontier."""
+    population, horizon, _ = predicted_positions.shape
+    height, width = visited.shape
+    batch_ids = torch.arange(population, device=predicted_positions.device)
+    imagined_seen = torch.zeros(
+        (population, height, width), dtype=torch.bool, device=predicted_positions.device
+    )
+    novel_count = torch.zeros(population, dtype=torch.float32, device=predicted_positions.device)
+    for step in range(horizon):
+        positions = predicted_positions[:, step]
+        valid_position = positions[:, 0].ge(0) & positions[:, 0].lt(height)
+        valid_position &= positions[:, 1].ge(0) & positions[:, 1].lt(width) & alive
+        y = positions[:, 0].clamp(0, height - 1)
+        x = positions[:, 1].clamp(0, width - 1)
+        first_visit = valid_position & ~visited[y, x] & ~imagined_seen[batch_ids, y, x]
+        novel_count += first_visit.float()
+        imagined_seen[batch_ids[valid_position], y[valid_position], x[valid_position]] = True
+
+    bonus = (0.1 * novel_count).clamp(max=0.5)
+    if np.isfinite(start_distance) and start_distance > 0:
+        final_positions = predicted_positions[:, -1]
+        valid_final = final_positions[:, 0].ge(0) & final_positions[:, 0].lt(height)
+        valid_final &= final_positions[:, 1].ge(0) & final_positions[:, 1].lt(width) & alive
+        y = final_positions[:, 0].clamp(0, height - 1)
+        x = final_positions[:, 1].clamp(0, width - 1)
+        end_distance = frontier_distances[y, x]
+        finite_end = torch.isfinite(end_distance) & valid_final
+        progress = ((start_distance - torch.where(
+            finite_end, end_distance, torch.full_like(end_distance, start_distance)
+        )) / 4.0).clamp(0.0, 1.0)
+        bonus += 0.25 * progress
+    reachable_frontier = bool(np.isfinite(start_distance) and start_distance > 0)
+    if not reachable_frontier:
+        bonus.zero_()
+        novel_count.zero_()
+    bonus = torch.where(alive, bonus, 0.0)
+    novel_count = torch.where(alive, novel_count, 0.0)
+    return bonus, novel_count
+
+
+def _crafter_context(env: CustomCrafterEnv, state: torch.Tensor):
+    """Synchronize hidden simulator progress at each planning boundary."""
+    player = env.env._player
+    unlocked = torch.tensor(
+        [[bool(player.achievements.get(name, 0)) for name in ACHIEVEMENT_NAMES]],
+        device=DEVICE, dtype=torch.bool,
+    )
+    life = {
+        name: torch.tensor([getattr(player, attr)], device=DEVICE, dtype=dtype)
+        for name, attr, dtype in (
+            ("hunger", "_hunger", torch.float32),
+            ("thirst", "_thirst", torch.float32),
+            ("fatigue", "_fatigue", torch.float32),
+            ("recover", "_recover", torch.float32),
+            ("sleeping", "sleeping", torch.bool),
+        )
+    }
+    hp = torch.full_like(state[0], -1.0)
+    for entity in env.env._world.objects:
+        if type(entity).__name__.lower() in {"cow", "zombie", "skeleton"}:
+            x, y = map(int, entity.pos)
+            if 0 <= y < hp.shape[0] and 0 <= x < hp.shape[1]:
+                hp[y, x] = max(0.0, float(entity.health))
+    return unlocked, life, hp.unsqueeze(0)
+
+
+class CrafterWorldModelMPC:
+    """Elite categorical search over Crafter's 17 native actions."""
+
+    def __init__(self, model, spec, config):
+        self.model, self.spec = model, spec
+        self.horizon = int(config.horizon)
+        self.population = int(config.population)
+        self.elite_count = int(config.elite_count)
+        self.iterations = int(config.iterations)
+        self.execute_steps = int(config.execute_steps)
+        self.gamma = float(config.gamma)
+        self.fallback_action = int(config.fallback_action)
+        self.terminal_penalty = float(config.crafter_terminal_penalty)
+        self.resource_guidance_weight = float(config.crafter_resource_guidance_weight)
+        self.exploration_weight = float(config.crafter_exploration_weight)
+        self.tool_progress_weight = float(getattr(config, "crafter_tool_progress_weight", 0.25))
+        self.require_three_wood_for_first_table = bool(
+            getattr(config, "crafter_require_three_wood_for_first_table", False)
+        )
+        self.late_stage_guidance = bool(getattr(config, "crafter_late_stage_guidance", False))
+        self.inventory_progress_weight = float(getattr(config, "crafter_inventory_progress_weight", 0.0))
+        self.action_count = len(CRAFTER_ACTION_NAMES)
+        if spec.action_count != self.action_count:
+            raise ValueError(f"Crafter WM supports {spec.action_count} actions; expected {self.action_count}")
+        if min(self.horizon, self.population, self.iterations) < 1:
+            raise ValueError("MPC horizon, population, and iterations must be positive")
+        if not 1 <= self.elite_count <= self.population:
+            raise ValueError("MPC elite_count must be in [1, population]")
+        if not 1 <= self.execute_steps <= self.horizon:
+            raise ValueError("MPC execute_steps must be in [1, horizon]")
+        if not 0 <= self.fallback_action < self.action_count:
+            raise ValueError("MPC fallback_action must be a native Crafter action")
+        if not np.isfinite(self.terminal_penalty) or self.terminal_penalty < 0:
+            raise ValueError("PPO.mpc.crafter_terminal_penalty must be finite and nonnegative")
+        if not np.isfinite(self.resource_guidance_weight) or self.resource_guidance_weight < 0:
+            raise ValueError("PPO.mpc.crafter_resource_guidance_weight must be finite and nonnegative")
+        if not np.isfinite(self.exploration_weight) or self.exploration_weight < 0:
+            raise ValueError("PPO.mpc.crafter_exploration_weight must be finite and nonnegative")
+        if not np.isfinite(self.tool_progress_weight) or self.tool_progress_weight < 0:
+            raise ValueError("PPO.mpc.crafter_tool_progress_weight must be finite and nonnegative")
+        if not np.isfinite(self.inventory_progress_weight) or self.inventory_progress_weight < 0:
+            raise ValueError("PPO.mpc.crafter_inventory_progress_weight must be finite and nonnegative")
+
+    @torch.no_grad()
+    def plan(
+        self, state: torch.Tensor, inventory: torch.Tensor, context,
+        visited_positions: np.ndarray, inventory_progress_peaks: np.ndarray | None = None,
+    ) -> MPCPlan:
+        state = state.to(device=DEVICE, dtype=torch.float32)
+        inventory = inventory.to(device=DEVICE, dtype=torch.float32)
+        if state.ndim != 3 or state.shape[0] != 2 or inventory.shape != (16,):
+            raise ValueError("Crafter MPC expects [2,H,W] grid and 16 inventory values")
+        initial_unlocked, initial_life, initial_hp = context
+        objects = state[0].long().cpu().numpy()
+        player_yx = np.argwhere(objects == 13)
+        if len(player_yx) != 1:
+            raise ValueError("Crafter MPC expects exactly one player on the current map")
+        start_y, start_x = map(int, player_yx[0])
+        stage = _crafter_inventory_progress_stage(objects, inventory.cpu().numpy())
+        stage_targets = _crafter_inventory_progress_targets(stage, bool((objects == 12).any()))
+        if inventory_progress_peaks is None:
+            stage_peaks = inventory.clone()
+        else:
+            history = np.asarray(inventory_progress_peaks, dtype=np.float32)
+            if history.shape != (5, 16):
+                raise ValueError("Crafter MPC inventory progress peaks must have shape [5, 16]")
+            stage_peaks = torch.as_tensor(history[stage], device=DEVICE)
+        visited_positions = np.asarray(visited_positions, dtype=np.bool_)
+        if visited_positions.shape != objects.shape:
+            raise ValueError(
+                f"Crafter visited map shape {visited_positions.shape} does not match {objects.shape}"
+            )
+        visited = torch.as_tensor(visited_positions, device=DEVICE, dtype=torch.bool)
+        frontier_values = _crafter_unvisited_distances(objects, visited_positions)
+        frontier_distances = torch.as_tensor(frontier_values, device=DEVICE)
+        start_frontier_distance = float(frontier_values[start_y, start_x])
+        resource_maps = (
+            _crafter_resource_distances(objects, (14,)),  # food: cow; plant ripeness is hidden
+            _crafter_resource_distances(objects, (1,)),       # drink: water
+        )
+        resource_distances = tuple(torch.as_tensor(values, device=DEVICE) for values in resource_maps)
+        start_distances = tuple(float(values[start_y, start_x]) for values in resource_maps)
+        tool_maps = (
+            _crafter_resource_distances(objects, (6,)),  # tree
+            _crafter_resource_distances(objects, (3,)),  # stone
+            _crafter_resource_distances(objects, (11,)),  # table
+        )
+        tool_distances = tuple(torch.as_tensor(values, device=DEVICE) for values in tool_maps)
+        start_position = torch.tensor([start_y, start_x], device=DEVICE, dtype=torch.long)
+        start_tool_progress = _crafter_tool_progress(
+            torch.as_tensor(objects, device=DEVICE, dtype=torch.long),
+            inventory, start_position, *tool_distances,
+            reserve_wood_for_first_table=self.require_three_wood_for_first_table,
+        )[0]
+        late_active = self.late_stage_guidance and bool(
+            inventory[11].ge(0.5) or inventory[12].ge(0.5)
+        )
+        late_distances = None
+        if late_active:
+            late_maps = {6: tool_maps[0], 3: tool_maps[1], 11: tool_maps[2]}
+            for resource in (8, 9, 10, 12):
+                late_maps[resource] = _crafter_resource_distances(objects, (resource,))
+            late_distances = tuple(
+                torch.as_tensor(late_maps[resource], device=DEVICE)
+                for resource in (6, 3, 8, 9, 10, 11)
+            )
+            start_late_progress = _crafter_late_tool_progress(
+                torch.as_tensor(objects, device=DEVICE, dtype=torch.long),
+                inventory, start_position, *late_distances,
+            )[0]
+            guided_prefixes = _crafter_late_guided_prefixes(
+                objects, inventory.cpu().numpy(), (start_y, start_x),
+                int(state[1, start_y, start_x].item()), late_maps, self.horizon,
+            )
+        else:
+            start_late_progress = torch.zeros(5, device=DEVICE)
+            guided_prefixes = []
+        if self.inventory_progress_weight > 0 and stage <= 2:
+            direction = int(state[1, start_y, start_x].item())
+            resource = 6 if stage <= 1 else 3
+            slot, cap = stage_targets[0]
+            if float(stage_peaks[slot]) < cap:
+                distance = tool_maps[0 if resource == 6 else 1]
+                prefix = _crafter_guided_resource_prefix(
+                    objects, (start_y, start_x), direction,
+                    distance, resource, self.horizon,
+                )
+                if prefix:
+                    guided_prefixes.append((prefix, 5 in prefix))
+            craft_action = None
+            if stage == 1 and inventory[4] >= 1:
+                craft_action = 11  # make_wood_pickaxe
+            elif stage == 2 and inventory[4] >= 1 and inventory[5] >= 1:
+                craft_action = 12  # make_stone_pickaxe
+            if craft_action is not None:
+                prefix = _crafter_late_crafting_prefix(
+                    objects, (start_y, start_x), direction, self.horizon, craft_action
+                )
+                if prefix:
+                    guided_prefixes.append((prefix, True))
+        best = probabilities = None
+        imagined = invalid = 0
+        for _ in range(self.iterations):
+            if probabilities is None:
+                sequences = torch.randint(
+                    self.action_count, (self.population, self.horizon), device=DEVICE
+                )
+            else:
+                sequences = torch.multinomial(
+                    probabilities.unsqueeze(0).expand(self.population, -1, -1).reshape(-1, self.action_count),
+                    1,
+                ).reshape(self.population, self.horizon)
+            guided_bonus = torch.zeros(self.population, device=DEVICE)
+            for index, (prefix, attempts_resource) in enumerate(guided_prefixes[:self.population]):
+                sequences[index, :len(prefix)] = torch.as_tensor(prefix, device=DEVICE)
+                if attempts_resource and len(prefix) <= self.execute_steps:
+                    weight = self.inventory_progress_weight if stage <= 2 else self.tool_progress_weight
+                    guided_bonus[index] = weight * self.gamma ** (len(prefix) - 1)
+            states = state.unsqueeze(0).expand(self.population, -1, -1, -1).clone()
+            inventories = inventory.unsqueeze(0).expand(self.population, -1).clone()
+            unlocked = initial_unlocked.expand(self.population, -1).clone()
+            life = {name: value.expand(self.population).clone() for name, value in initial_life.items()}
+            hp = initial_hp.expand(self.population, -1, -1).clone()
+            scores = torch.zeros(self.population, device=DEVICE)
+            inventory_progress_contribution = torch.zeros_like(scores)
+            candidate_peaks = stage_peaks.unsqueeze(0).expand(self.population, -1).clone()
+            done = torch.zeros(self.population, device=DEVICE, dtype=torch.bool)
+            rollout_lengths = torch.zeros(self.population, device=DEVICE, dtype=torch.float32)
+            positions = torch.full(
+                (self.population, self.horizon, 2), -1, device=DEVICE, dtype=torch.long
+            )
+            predicted_inventory = torch.empty(
+                (self.population, self.horizon, 16), device=DEVICE
+            )
+            prefix_state = prefix_inventory = None
+            prefix_length = 0
+            for t in range(self.horizon):
+                actions = sequences[:, t]
+                if self.require_three_wood_for_first_table:
+                    premature_table = (
+                        actions.eq(CRAFTER_ACTION_NAMES.index("place_table"))
+                        & inventories[:, 4].lt(3.0)
+                        & inventories[:, 10].lt(0.5)
+                        & ~states[:, 0].eq(11).flatten(1).any(dim=1)
+                    )
+                    # Replace only this impossible-for-the-goal proposal; CEM
+                    # updates from the actions it actually imagined and returns.
+                    actions = torch.where(premature_table, torch.zeros_like(actions), actions)
+                    sequences[:, t] = actions
+                next_states, next_inv = imagined_crafter_step_batch(
+                    self.model, states, actions, inventories,
+                    self.spec.attention_mask_size, self.spec.inventory_output_mode,
+                    predict_survival=self.spec.predict_survival,
+                    inventory_value_mode=self.spec.inventory_value_mode,
+                )
+                reward, _, next_unlocked, next_life, next_hp, next_inv = native_reward_batch(
+                    states, inventories, actions, next_states, next_inv,
+                    unlocked, life["sleeping"], hp, life,
+                )
+                valid = crafter_player_counts(next_states).eq(1)
+                valid &= torch.isfinite(next_states).flatten(1).all(dim=1)
+                valid &= torch.isfinite(next_inv).all(dim=1)
+                active = ~done
+                invalid += int((active & ~valid).sum().item())
+                rollout_lengths += (active & valid).float()
+                predicted_death = active & valid & next_inv[:, 0].le(0.5)
+                if self.inventory_progress_weight > 0:
+                    gain, next_peaks = _crafter_inventory_progress_gain(
+                        next_inv, candidate_peaks, stage_targets
+                    )
+                    eligible = active & valid & ~predicted_death
+                    contribution = (self.gamma ** t) * self.inventory_progress_weight * torch.where(
+                        eligible, gain, 0.0
+                    )
+                    scores += contribution
+                    inventory_progress_contribution += contribution
+                    candidate_peaks = torch.where(eligible.unsqueeze(1), next_peaks, candidate_peaks)
+                scores += (self.gamma ** t) * torch.where(active & valid, reward, 0.0)
+                scores -= (self.gamma ** t) * (active & ~valid).float()
+                scores -= (self.gamma ** t) * predicted_death.float() * self.terminal_penalty
+                done |= ~valid | predicted_death
+                flat = next_states[:, 0].eq(13).flatten(1)
+                index = flat.float().argmax(dim=1)
+                width = next_states.shape[-1]
+                positions[:, t, 0] = torch.where(valid, index // width, -1)
+                positions[:, t, 1] = torch.where(valid, index % width, -1)
+                predicted_inventory[:, t] = next_inv
+                states, inventories = next_states, next_inv
+                if self.tool_progress_weight > 0 and t < self.execute_steps:
+                    prefix_state = next_states[:, 0].long().clone()
+                    prefix_inventory = next_inv.clone()
+                    prefix_length = t + 1
+                unlocked, life, hp = next_unlocked, next_life, next_hp
+                imagined += self.population
+                if bool(done.all()):
+                    positions[:, t + 1:] = positions[:, t:t + 1]
+                    predicted_inventory[:, t + 1:] = next_inv.unsqueeze(1)
+                    break
+            # Partial progress toward food/water makes long routes discoverable
+            # before a 16-step rollout can reach the resource itself.
+            final_positions = positions[:, -1]
+            final_y = final_positions[:, 0].clamp(0, state.shape[-2] - 1)
+            final_x = final_positions[:, 1].clamp(0, state.shape[-1] - 1)
+            guidance = torch.zeros_like(scores)
+            for slot, distances, start_distance in zip((1, 2), resource_distances, start_distances):
+                guidance += (inventories[:, slot] - inventory[slot]) / 9.0
+                if np.isfinite(start_distance) and start_distance > 0:
+                    end_distance = distances[final_y, final_x]
+                    progress = ((start_distance - torch.where(
+                        torch.isfinite(end_distance), end_distance, start_distance
+                    )) / min(start_distance, 4.0)).clamp(-1.0, 1.0)
+                    urgency = (9.0 - inventory[slot].clamp(0.0, 9.0)) / 9.0
+                    guidance += urgency * progress
+            scores += (self.gamma ** self.horizon) * self.resource_guidance_weight * torch.where(
+                ~done, guidance, 0.0
+            )
+            exploration_bonus, novel_count = _crafter_exploration_bonus(
+                positions, visited, frontier_distances, start_frontier_distance, ~done
+            )
+            exploration_contribution = (
+                (self.gamma ** self.horizon) * self.exploration_weight * exploration_bonus
+            )
+            scores += exploration_contribution
+
+            final_positions = positions[:, -1]
+            final_progress = _crafter_tool_progress(
+                states[:, 0].long(), inventories, final_positions, *tool_distances,
+                reserve_wood_for_first_table=self.require_three_wood_for_first_table,
+            )
+            final_progress = torch.where(done.unsqueeze(1), torch.zeros_like(final_progress), final_progress)
+            progress_discount = self.gamma ** rollout_lengths
+            if self.tool_progress_weight > 0:
+                prefix_progress = _crafter_tool_progress(
+                    prefix_state, prefix_inventory,
+                    positions[:, self.execute_steps - 1], *tool_distances,
+                    reserve_wood_for_first_table=self.require_three_wood_for_first_table,
+                )
+                prefix_progress = torch.where(
+                    done.unsqueeze(1), torch.zeros_like(prefix_progress), prefix_progress
+                )
+                prefix_discount = self.gamma ** prefix_length
+                # Half the shaping signal must be reachable before the next replan.
+                tool_progress_contribution = self.tool_progress_weight * (
+                    0.5 * prefix_discount * prefix_progress.sum(dim=1)
+                    + 0.5 * progress_discount * final_progress.sum(dim=1)
+                    - start_tool_progress.sum()
+                )
+            else:
+                prefix_progress = torch.zeros_like(final_progress)
+                tool_progress_contribution = torch.zeros_like(scores)
+            scores += tool_progress_contribution
+            late_progress_contribution = torch.zeros_like(scores)
+            if late_active:
+                final_late_progress = _crafter_late_tool_progress(
+                    states[:, 0].long(), inventories, final_positions, *late_distances,
+                )
+                prefix_late_progress = _crafter_late_tool_progress(
+                    prefix_state, prefix_inventory,
+                    positions[:, self.execute_steps - 1], *late_distances,
+                ) if self.tool_progress_weight > 0 else torch.zeros_like(final_late_progress)
+                final_late_progress = torch.where(
+                    done.unsqueeze(1), torch.zeros_like(final_late_progress), final_late_progress
+                )
+                prefix_late_progress = torch.where(
+                    done.unsqueeze(1), torch.zeros_like(prefix_late_progress), prefix_late_progress
+                )
+                if self.tool_progress_weight > 0:
+                    late_progress_contribution = self.tool_progress_weight * (
+                        0.5 * (self.gamma ** prefix_length) * prefix_late_progress.sum(dim=1)
+                        + 0.5 * progress_discount * final_late_progress.sum(dim=1)
+                        - start_late_progress.sum()
+                    )
+                scores += late_progress_contribution
+            guided_bonus = torch.where(~done, guided_bonus, torch.zeros_like(guided_bonus))
+            scores += guided_bonus
+
+            winner = int(scores.argmax().item())
+            if best is None or float(scores[winner]) > float(best[0]):
+                best = (
+                    scores[winner].clone(), sequences[winner].clone(),
+                    positions[winner].clone(), predicted_inventory[winner].clone(),
+                    exploration_contribution[winner].clone(), novel_count[winner].clone(),
+                    tool_progress_contribution[winner].clone(),
+                    prefix_progress[winner].clone(), final_progress[winner].clone(),
+                    late_progress_contribution[winner].clone(), guided_bonus[winner].clone(),
+                    inventory_progress_contribution[winner].clone(),
+                )
+            elite = sequences[scores.topk(self.elite_count).indices]
+            counts = torch.nn.functional.one_hot(elite, self.action_count).float().sum(dim=0)
+            probabilities = (counts + 1.0) / (self.elite_count + self.action_count)
+        (
+            score, actions, positions, predicted_inventory, exploration_score, novel_cells,
+            tool_progress_score, prefix_tool_progress, end_tool_progress,
+            late_progress_score, guided_attempt_score, inventory_progress_score,
+        ) = best
+        return MPCPlan(
+            actions=actions.cpu().tolist(), score=float(score),
+            predicted_positions=[tuple(map(int, pos)) for pos in positions.cpu().tolist()],
+            predicted_inventories=predicted_inventory.cpu().tolist(),
+            diagnostics={
+                "iterations": self.iterations, "population": self.population,
+                "horizon": self.horizon, "imagined_transitions": imagined,
+                "invalid_imagined_actions": invalid,
+                "exploration_score": float(exploration_score.item()),
+                "novel_cells": int(novel_cells.item()),
+                "tool_progress_score": float(tool_progress_score.item()),
+                "late_progress_score": float(late_progress_score.item()),
+                "guided_attempt_score": float(guided_attempt_score.item()),
+                "guided_candidate_count": min(len(guided_prefixes), self.population),
+                "inventory_progress_stage": stage,
+                "inventory_progress_score": float(inventory_progress_score.item()),
+                "late_stage_active": late_active,
+                "tool_progress_start_total": float(start_tool_progress.sum().item()),
+                "tool_progress_prefix_total": float(prefix_tool_progress.sum().item()),
+                "tool_progress_end_total": float(end_tool_progress.sum().item()),
+                "tool_progress_start_table": float(start_tool_progress[0].item()),
+                "tool_progress_start_wood_pickaxe": float(start_tool_progress[1].item()),
+                "tool_progress_start_stone": float(start_tool_progress[2].item()),
+                "tool_progress_start_stone_pickaxe": float(start_tool_progress[3].item()),
+                "tool_progress_end_table": float(end_tool_progress[0].item()),
+                "tool_progress_end_wood_pickaxe": float(end_tool_progress[1].item()),
+                "tool_progress_end_stone": float(end_tool_progress[2].item()),
+                "tool_progress_end_stone_pickaxe": float(end_tool_progress[3].item()),
+            },
+        )
+
+
+def run_online_crafter_mpc(cfg: DictConfig) -> list[dict]:
+    """Plan in the frozen WM and execute bounded prefixes in real Crafter."""
+    if str(getattr(cfg.PPO, "wm_control_mode", "ppo")).lower() != "mpc":
+        raise ValueError("Crafter MPC requires PPO.wm_control_mode=mpc")
+    if bool(cfg.PPO.train_in_real_env):
+        raise ValueError("MPC requires PPO.train_in_real_env=false")
+    mpc_cfg = cfg.PPO.mpc
+    if DEVICE.type == "cpu":
+        threads = int(mpc_cfg.cpu_threads)
+        if threads < 1:
+            raise ValueError("PPO.mpc.cpu_threads must be positive")
+        torch.set_num_threads(threads)
+    _seed_everything(int(cfg.PPO.seed))
+    configured = getattr(mpc_cfg, "checkpoint_path", None)
+    if configured is None or str(configured).strip().lower() in {"", "null", "none"}:
+        configured = mpc_cfg.crafter_checkpoint_path
+    checkpoint = Path(str(configured)).expanduser().resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Crafter MPC WM checkpoint not found: {checkpoint}")
+    model, spec = load_crafter_planning_model(checkpoint)
+    change_bias = getattr(mpc_cfg, "crafter_inventory_change_bias", None)
+    if change_bias is not None:
+        if not spec.inventory_event_residual_enabled:
+            raise ValueError("Crafter inventory change bias requires an event-residual WM checkpoint")
+        change_bias = float(change_bias)
+        if not np.isfinite(change_bias):
+            raise ValueError("PPO.mpc.crafter_inventory_change_bias must be finite")
+        model.crafter_inventory_event_residual_change_bias = change_bias
+    model.to(DEVICE).eval()
+    planner = CrafterWorldModelMPC(model, spec, mpc_cfg)
+    episodes, max_steps = int(mpc_cfg.episodes), int(cfg.PPO.max_ep_len)
+    if episodes < 1 or max_steps < 1:
+        raise ValueError("MPC episodes and max_ep_len must be positive")
+    print_every = int(mpc_cfg.print_every_steps)
+    if print_every < 1:
+        raise ValueError("MPC print_every_steps must be positive")
+    output_dir = Path(str(mpc_cfg.crafter_output_dir)).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    step_path = output_dir / "wm_mpc_steps.csv"
+    fields = (
+        "episode", "seed", "environment_step", "plan_id", "plan_step",
+        "replan_reason", "action", "action_name", "real_reward", "cumulative_real_reward",
+        "plan_score", "planning_latency_ms", "imagined_transitions_this_plan",
+        "imagined_transitions_total", "pose_match", "inventory_match",
+        "survival_inventory_match", "item_inventory_match",
+        "actual_item_delta", "predicted_item_delta",
+        "newly_unlocked", "unique_visited_cells", "plan_exploration_score",
+        "plan_tool_progress_score", "plan_late_progress_score",
+        "plan_guided_attempt_score", "plan_guided_candidate_count",
+        "plan_inventory_progress_stage", "plan_inventory_progress_score",
+        "plan_tool_progress_start_total",
+        "plan_tool_progress_prefix_total", "plan_tool_progress_end_total",
+        "plan_tool_progress_start_table",
+        "plan_tool_progress_start_wood_pickaxe", "plan_tool_progress_start_stone",
+        "plan_tool_progress_start_stone_pickaxe", "plan_tool_progress_end_table",
+        "plan_tool_progress_end_wood_pickaxe", "plan_tool_progress_end_stone",
+        "plan_tool_progress_end_stone_pickaxe", "terminated", "truncated",
+    )
+    rows, traces = [], []
+    with step_path.open("w", newline="", encoding="utf-8") as handle:
+        csv.DictWriter(handle, fieldnames=fields).writeheader()
+    for episode in range(episodes):
+        seed = int(cfg.PPO.seed) + episode
+        env = CustomCrafterEnv(
+            txt_file_path=str(cfg.PPO.env_path), max_steps=max_steps, seed=seed
+        )
+        try:
+            observation, _ = env.reset()
+            # CustomCrafterEnv builds a fresh World with RandomState(None).
+            # Seed its objects here so MPC comparisons use the requested seed.
+            world_rng = np.random.RandomState(seed)
+            env.env._world.random = world_rng
+            for entity in env.env._world._objects:
+                if entity is not None:
+                    entity.random = world_rng
+            initial_objects = np.transpose(observation["image"], (2, 0, 1))[0]
+            visited_positions = _crafter_initial_visit_map(initial_objects)
+            inventory_progress_peaks = np.zeros((5, 16), dtype=np.float32)
+            initial_stage = _crafter_inventory_progress_stage(
+                initial_objects, np.asarray(observation["inventory"])
+            )
+            inventory_progress_peaks[initial_stage] = observation["inventory"]
+            terminated = truncated = False
+            episode_steps = 0
+            real_return = 0.0
+            plan_calls = early_replans = imagined_total = 0
+            episode_trace = []
+            unlocked = set()
+            while not (terminated or truncated):
+                state = torch.as_tensor(
+                    np.transpose(observation["image"], (2, 0, 1)), device=DEVICE, dtype=torch.float32
+                )
+                inventory = torch.as_tensor(observation["inventory"], device=DEVICE)
+                context = _crafter_context(env, state)
+                started = time.perf_counter()
+                plan = planner.plan(
+                    state, inventory, context, visited_positions, inventory_progress_peaks
+                )
+                latency_ms = (time.perf_counter() - started) * 1000.0
+                plan_calls += 1
+                imagined_total += int(plan.diagnostics["imagined_transitions"])
+                actions = plan.actions[:planner.execute_steps] or [planner.fallback_action]
+                for index, action in enumerate(actions):
+                    previous_inv = np.asarray(observation["inventory"])
+                    observation, reward, terminated, truncated, info = env.step(action)
+                    episode_steps += 1
+                    real_return += float(reward)
+                    new = [str(name) for name in info.get("newly_unlocked", [])]
+                    unlocked.update(new)
+                    actual_position = tuple(map(int, env.get_agent_position()))
+                    if (0 <= actual_position[0] < visited_positions.shape[0]
+                            and 0 <= actual_position[1] < visited_positions.shape[1]):
+                        visited_positions[actual_position] = True
+                    pose_match = actual_position == plan.predicted_positions[index]
+                    actual_inv = np.asarray(observation["inventory"])
+                    actual_objects = np.transpose(observation["image"], (2, 0, 1))[0]
+                    actual_stage = _crafter_inventory_progress_stage(actual_objects, actual_inv)
+                    inventory_progress_peaks[actual_stage] = np.maximum(
+                        inventory_progress_peaks[actual_stage], actual_inv
+                    )
+                    predicted_inv = np.asarray(plan.predicted_inventories[index])
+                    inv_match = bool(np.array_equal(actual_inv, predicted_inv))
+                    survival_inv_match = bool(np.array_equal(
+                        actual_inv[:SURVIVAL_SLOTS], predicted_inv[:SURVIVAL_SLOTS]
+                    ))
+                    item_inv_match = bool(np.array_equal(
+                        actual_inv[SURVIVAL_SLOTS:], predicted_inv[SURVIVAL_SLOTS:]
+                    ))
+                    if terminated:
+                        reason = "terminated"
+                    elif truncated:
+                        reason = "truncated"
+                    elif not (pose_match and inv_match):
+                        reason = "prediction_mismatch"
+                        early_replans += 1
+                    elif index == len(actions) - 1:
+                        reason = "block_complete"
+                    else:
+                        reason = "block_continue"
+                    row = {
+                        "episode": episode, "seed": seed, "environment_step": episode_steps,
+                        "plan_id": plan_calls, "plan_step": index + 1, "replan_reason": reason,
+                        "action": action, "action_name": CRAFTER_ACTION_NAMES[action],
+                        "real_reward": float(reward), "cumulative_real_reward": real_return,
+                        "plan_score": plan.score,
+                        "planning_latency_ms": latency_ms if index == 0 else 0.0,
+                        "imagined_transitions_this_plan": int(plan.diagnostics["imagined_transitions"]) if index == 0 else 0,
+                        "imagined_transitions_total": imagined_total, "pose_match": pose_match,
+                        "inventory_match": inv_match,
+                        "survival_inventory_match": survival_inv_match,
+                        "item_inventory_match": item_inv_match,
+                        "actual_item_delta": json.dumps((
+                            actual_inv[SURVIVAL_SLOTS:] - previous_inv[SURVIVAL_SLOTS:]
+                        ).astype(int).tolist()),
+                        "predicted_item_delta": json.dumps((
+                            predicted_inv[SURVIVAL_SLOTS:] - previous_inv[SURVIVAL_SLOTS:]
+                        ).astype(int).tolist()),
+                        "newly_unlocked": json.dumps(new),
+                        "unique_visited_cells": int(visited_positions.sum()),
+                        "plan_exploration_score": (
+                            float(plan.diagnostics["exploration_score"]) if index == 0 else 0.0
+                        ),
+                        "plan_tool_progress_score": (
+                            float(plan.diagnostics["tool_progress_score"]) if index == 0 else 0.0
+                        ),
+                        "plan_late_progress_score": (
+                            float(plan.diagnostics["late_progress_score"]) if index == 0 else 0.0
+                        ),
+                        "plan_guided_attempt_score": (
+                            float(plan.diagnostics["guided_attempt_score"]) if index == 0 else 0.0
+                        ),
+                        "plan_guided_candidate_count": (
+                            int(plan.diagnostics["guided_candidate_count"]) if index == 0 else 0
+                        ),
+                        "plan_inventory_progress_stage": int(plan.diagnostics["inventory_progress_stage"]),
+                        "plan_inventory_progress_score": (
+                            float(plan.diagnostics["inventory_progress_score"]) if index == 0 else 0.0
+                        ),
+                        "plan_tool_progress_start_total": (
+                            float(plan.diagnostics["tool_progress_start_total"]) if index == 0 else 0.0
+                        ),
+                        "plan_tool_progress_prefix_total": (
+                            float(plan.diagnostics["tool_progress_prefix_total"]) if index == 0 else 0.0
+                        ),
+                        "plan_tool_progress_end_total": (
+                            float(plan.diagnostics["tool_progress_end_total"]) if index == 0 else 0.0
+                        ),
+                        "plan_tool_progress_start_table": (
+                            float(plan.diagnostics["tool_progress_start_table"]) if index == 0 else 0.0
+                        ),
+                        "plan_tool_progress_start_wood_pickaxe": (
+                            float(plan.diagnostics["tool_progress_start_wood_pickaxe"]) if index == 0 else 0.0
+                        ),
+                        "plan_tool_progress_start_stone": (
+                            float(plan.diagnostics["tool_progress_start_stone"]) if index == 0 else 0.0
+                        ),
+                        "plan_tool_progress_start_stone_pickaxe": (
+                            float(plan.diagnostics["tool_progress_start_stone_pickaxe"]) if index == 0 else 0.0
+                        ),
+                        "plan_tool_progress_end_table": (
+                            float(plan.diagnostics["tool_progress_end_table"]) if index == 0 else 0.0
+                        ),
+                        "plan_tool_progress_end_wood_pickaxe": (
+                            float(plan.diagnostics["tool_progress_end_wood_pickaxe"]) if index == 0 else 0.0
+                        ),
+                        "plan_tool_progress_end_stone": (
+                            float(plan.diagnostics["tool_progress_end_stone"]) if index == 0 else 0.0
+                        ),
+                        "plan_tool_progress_end_stone_pickaxe": (
+                            float(plan.diagnostics["tool_progress_end_stone_pickaxe"]) if index == 0 else 0.0
+                        ),
+                        "terminated": bool(terminated), "truncated": bool(truncated),
+                    }
+                    episode_trace.append(row)
+                    with step_path.open("a", newline="", encoding="utf-8") as handle:
+                        csv.DictWriter(handle, fieldnames=fields).writerow(row)
+                    if episode_steps % print_every == 0 or new or terminated or truncated:
+                        print(
+                            f"[Crafter MPC][ep={episode} step={episode_steps}] "
+                            f"action={row['action_name']} reward={reward:.3f} "
+                            f"return={real_return:.3f} achievements={len(unlocked)} "
+                            f"new={new} reason={reason}"
+                        )
+                    if reason in {"terminated", "truncated", "prediction_mismatch"}:
+                        break
+            rows.append({
+                "episode": episode, "seed": seed, "environment_steps": episode_steps,
+                "real_reward": real_return, "unique_achievements": len(unlocked),
+                "achievements": json.dumps(sorted(unlocked)), "plan_calls": plan_calls,
+                "early_replans": early_replans, "imagined_transitions": imagined_total,
+                "unique_visited_cells": int(visited_positions.sum()),
+                "wm_real_inventory_match_rate": sum(step["inventory_match"] for step in episode_trace) / episode_steps,
+                "wm_real_survival_inventory_match_rate": sum(step["survival_inventory_match"] for step in episode_trace) / episode_steps,
+                "wm_real_item_inventory_match_rate": sum(step["item_inventory_match"] for step in episode_trace) / episode_steps,
+                "inventory_change_bias": (
+                    model.crafter_inventory_event_residual_change_bias
+                    if spec.inventory_event_residual_enabled else None
+                ),
+                "tool_progress_weight": planner.tool_progress_weight,
+                "inventory_progress_weight": planner.inventory_progress_weight,
+                "require_three_wood_for_first_table": planner.require_three_wood_for_first_table,
+                "late_stage_guidance": planner.late_stage_guidance,
+                "wm_checkpoint": str(checkpoint),
+            })
+            traces.append({"episode": episode, "actions": episode_trace})
+        finally:
+            env.close()
+    summary = output_dir / "wm_mpc_results.csv"
+    with summary.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    (output_dir / "wm_mpc_traces.json").write_text(json.dumps(traces, indent=2), encoding="utf-8")
+    print(f"[Crafter MPC] results={summary}; step curve={step_path}")
+    return rows
+
+
 def run_online_mpc(cfg: DictConfig) -> list[dict]:
     """Evaluate online MPC with bounded multi-step real-environment execution."""
+    if str(cfg.domain).lower() == "crafter":
+        return run_online_crafter_mpc(cfg)
     if bool(getattr(cfg.PPO, "train_in_real_env", False)):
         raise ValueError("MPC requires PPO.train_in_real_env=false so it loads a WM")
     mode = str(getattr(cfg.PPO, "wm_control_mode", "ppo")).lower()

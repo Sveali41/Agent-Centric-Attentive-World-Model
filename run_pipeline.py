@@ -277,15 +277,23 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
             "the acquisition explorer is trained separately in the real environment"
         )
 
+    mpc_world_model_path = policy_world_model_path
+    if domain == "crafter" and str(getattr(cfg.PPO, "wm_control_mode", "ppo")).lower() == "mpc":
+        configured_mpc_checkpoint = getattr(cfg.PPO.mpc, "checkpoint_path", None)
+        if configured_mpc_checkpoint is None or str(configured_mpc_checkpoint).strip().lower() in {"", "null", "none"}:
+            configured_mpc_checkpoint = cfg.PPO.mpc.crafter_checkpoint_path
+        mpc_world_model_path = Path(str(configured_mpc_checkpoint)).expanduser().resolve()
+
     if skip_world_model:
-        if not policy_world_model_path.is_file():
+        required_world_model_path = mpc_world_model_path if domain == "crafter" and str(getattr(cfg.PPO, "wm_control_mode", "ppo")).lower() == "mpc" else policy_world_model_path
+        if not required_world_model_path.is_file():
             raise FileNotFoundError(
                 f"[{domain}] pipeline.skip_world_model=true but the configured "
-                f"WM checkpoint does not exist: {policy_world_model_path}"
+                f"WM checkpoint does not exist: {required_world_model_path}"
             )
         print(
             f"[{domain}] Reusing existing world-model checkpoint and skipping "
-            f"all data/WM stages: {policy_world_model_path}"
+            f"all data/WM stages: {required_world_model_path}"
         )
         data_recollected = False
     elif continual_enabled:
@@ -520,7 +528,10 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
 
     if bool(cfg.pipeline.skip_policy):
         print(f"[SKIP] Policy stage disabled for {domain}")
-    elif domain == "minigrid" and str(getattr(cfg.PPO, "wm_control_mode", "ppo")).lower() in {"mpc", "mcts", "astar"}:
+    elif (
+        (domain == "minigrid" and str(getattr(cfg.PPO, "wm_control_mode", "ppo")).lower() in {"mpc", "mcts", "astar"})
+        or (domain == "crafter" and str(getattr(cfg.PPO, "wm_control_mode", "ppo")).lower() == "mpc")
+    ):
         control_mode = str(cfg.PPO.wm_control_mode).lower()
         print(f"[{domain}] Running online WM {control_mode.upper()} evaluation; PPO training is disabled by flag.")
         control_cfg = getattr(cfg.PPO, control_mode)
@@ -551,7 +562,15 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
             )
             if hasattr(control_cfg, name)
         ]
-        if control_mode == "mpc":
+        control_world_model_path = policy_world_model_path
+        if control_mode == "mpc" and domain == "crafter":
+            control_world_model_path = mpc_world_model_path
+            control_overrides.extend([
+                f"PPO.mpc.checkpoint_path={control_world_model_path}",
+                f"PPO.mpc.crafter_output_dir={control_cfg.crafter_output_dir}",
+                f"PPO.env_path={cfg.PPO.env_path}",
+            ])
+        elif control_mode == "mpc":
             control_overrides.append(
                 "PPO.use_main_dense_reward="
                 f"{str(bool(cfg.PPO.use_main_dense_reward)).lower()}"
@@ -569,8 +588,9 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
                     if control_mode == "astar"
                     else f"modelBased.policy_training.planners.{control_mode}_planner"
                 ),
-                "domain=minigrid",
-                f"PPO.checkpoint_path_wm={policy_world_model_path}",
+                f"domain={domain}",
+                f"PPO.checkpoint_path_wm={control_world_model_path}",
+                *(domain_overrides if domain == "crafter" else []),
                 *policy_overrides,
                 *control_overrides,
             ],

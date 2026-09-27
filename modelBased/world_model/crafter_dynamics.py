@@ -30,9 +30,10 @@ ITEM_EFFECT_CLASSES = ITEM_DELTA_CLASSES + 1  # KEEP plus the four signed deltas
 
 # The observed non-target DR inventory dynamics use these complete item-row
 # effects.  Class zero is KEEP; remaining rows are stored in stable tuple
-# order.  Keeping the table here gives training, validation and planning one
-# exact semantic contract rather than reconstructing it from a dataset at
-# load time.
+# order.  The final three rows are saturated crafts: the crafted tool is
+# already at capacity, so only its recipe ingredients are consumed.  Keeping
+# the table here gives training, validation and planning one exact semantic
+# contract rather than reconstructing it from a dataset at load time.
 CRAFTER_CANONICAL_EVENT_CODEBOOK = (
     (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
     (-2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
@@ -51,11 +52,14 @@ CRAFTER_CANONICAL_EVENT_CODEBOOK = (
     (0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0),
     (0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
     (1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    (-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    (-1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    (-1, 0, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0),
 )
 
 
 def crafter_event_codebook(*, device=None, dtype=torch.long) -> torch.Tensor:
-    """Return the fixed 17-event inventory transition codebook."""
+    """Return the fixed canonical inventory transition codebook."""
     return torch.tensor(CRAFTER_CANONICAL_EVENT_CODEBOOK, device=device, dtype=dtype)
 
 
@@ -87,7 +91,10 @@ def crafter_event_scores_from_slot_logits(
         raise ValueError("Crafter item-effect logits must have shape [B,5,12]")
     table = crafter_event_codebook(device=item_effect_logits.device) if codebook is None else codebook.to(item_effect_logits.device)
     if tuple(table.shape) != (len(CRAFTER_CANONICAL_EVENT_CODEBOOK), ITEM_SLOTS):
-        raise ValueError("Crafter event codebook must have shape [17,12]")
+        raise ValueError(
+            "Crafter event codebook must have shape "
+            f"[{len(CRAFTER_CANONICAL_EVENT_CODEBOOK)},{ITEM_SLOTS}]"
+        )
     value_to_class = {0: 0, -4: 1, -2: 2, -1: 3, 1: 4}
     event_classes = torch.tensor(
         [[value_to_class[int(v)] for v in row] for row in table.detach().cpu().tolist()],
@@ -345,6 +352,7 @@ def balanced_categorical_effect_loss(
     target: torch.Tensor,
     *,
     reduction: str = "balanced_mean",
+    keep_weight: float | None = None,
     label_smoothing: float = 0.0,
     normalize: bool = True,
     focal_gamma: float = 0.0,
@@ -354,6 +362,10 @@ def balanced_categorical_effect_loss(
     ``balanced_mean`` first averages each non-empty group (KEEP and SET_TO),
     then averages the group losses.  It therefore avoids a hand-tuned class
     weight while preventing unchanged cells from dominating sparse effects.
+
+    ``keep_weight`` optionally overrides group weighting with an explicit
+    weighted mean of the KEEP and CHANGE group means. If either group is empty,
+    the non-empty group mean is returned without attenuation.
 
     ``sqrt_balanced`` also averages each non-empty group, but weights the
     resulting group means by the square root of that group's sample count.
@@ -400,6 +412,26 @@ def balanced_categorical_effect_loss(
 
     if reduction == "none":
         return per_cell
+    if keep_weight is not None:
+        if reduction not in {"balanced_mean", "sqrt_balanced"}:
+            raise ValueError(
+                "keep_weight can only be used with balanced_mean or sqrt_balanced"
+            )
+        keep_weight = float(keep_weight)
+        if not math.isfinite(keep_weight) or not 0.0 <= keep_weight <= 1.0:
+            raise ValueError(
+                f"keep_weight must be finite and in [0, 1], got {keep_weight!r}"
+            )
+        keep_mask = target.eq(0)
+        change_mask = ~keep_mask
+        keep_loss = per_cell[keep_mask].mean() if keep_mask.any() else None
+        change_loss = per_cell[change_mask].mean() if change_mask.any() else None
+        if keep_loss is None:
+            return change_loss if change_loss is not None else per_cell.sum()
+        if change_loss is None:
+            return keep_loss
+        return keep_weight * keep_loss + (1.0 - keep_weight) * change_loss
+
     if reduction == "mean":
         return per_cell.mean()
     if reduction not in {"balanced_mean", "sqrt_balanced"}:
@@ -628,6 +660,7 @@ def crafter_inventory_effect_loss(
     *,
     predict_survival: bool = True,
     effect_reduction: str = "balanced_mean",
+    keep_weight: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Loss for the unified five-way Crafter item-effect head.
 
@@ -656,6 +689,7 @@ def crafter_inventory_effect_loss(
     )
     item_loss = balanced_categorical_effect_loss(
         prediction["item_effect_logits"], item_target, reduction=effect_reduction,
+        keep_weight=keep_weight,
     )
     components = ([survival_loss] if predict_survival else []) + [item_loss]
     return torch.stack(components).mean(), {
@@ -666,9 +700,19 @@ def crafter_inventory_effect_loss(
 
 def crafter_inventory_event_residual_loss(
     prediction: dict[str, torch.Tensor], current: torch.Tensor, following: torch.Tensor,
+    *, correct_keep_fraction: float = 0.0, keep_weight: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Residual event CE on true changes plus base-model false-positive KEEPs."""
-    required = {"item_event_base_scores", "item_event_residual_logits", "item_event_codebook"}
+    """Train on true changes, decoder errors, and optional correct KEEP rows."""
+    if not math.isfinite(correct_keep_fraction) or not 0.0 <= correct_keep_fraction <= 1.0:
+        raise ValueError("correct_keep_fraction must be between 0 and 1")
+    if keep_weight is not None and (
+        not math.isfinite(keep_weight) or not 0.0 <= keep_weight <= 1.0
+    ):
+        raise ValueError("keep_weight must be null or between 0 and 1")
+    required = {
+        "item_event_base_scores", "item_event_residual_logits",
+        "item_event_codebook", "item_event_change_bias",
+    }
     if not required.issubset(prediction):
         raise ValueError("Crafter event residual prediction is missing required tensors")
     current_items = current.long()[:, SURVIVAL_SLOTS:]
@@ -676,20 +720,61 @@ def crafter_inventory_event_residual_loss(
     target = categorical_crafter_inventory_event_target(
         current_items, following_items, codebook=prediction["item_event_codebook"]
     )
-    base_scores = prediction["item_event_base_scores"]
-    base_event = base_scores.argmax(dim=1)
-    hard_rows = target.ne(0) | (target.eq(0) & base_event.ne(0))
     residual_logits = prediction["item_event_residual_logits"]
-    logits = base_scores + residual_logits
-    if bool(hard_rows.any()):
-        loss = F.cross_entropy(logits[hard_rows], target[hard_rows]) / math.log(float(logits.shape[1]))
+    logits = prediction["item_event_base_scores"] + residual_logits
+    calibrated_logits = logits.clone()
+    calibrated_logits[:, 1:] += float(prediction["item_event_change_bias"])
+    predicted_event = calibrated_logits.detach().argmax(dim=1)
+    hard_rows = target.ne(0) | (target.eq(0) & predicted_event.ne(0))
+    selected_rows = hard_rows.clone()
+    selected_correct_keep_count = 0
+    if correct_keep_fraction > 0.0:
+        correct_keep_indices = torch.nonzero(
+            target.eq(0) & predicted_event.eq(0), as_tuple=False
+        ).flatten()
+        selected_correct_keep_count = min(
+            int(correct_keep_fraction * correct_keep_indices.numel() + 0.5),
+            int(hard_rows.sum().item()),
+        )
+        if selected_correct_keep_count:
+            spaced = torch.arange(
+                selected_correct_keep_count, device=correct_keep_indices.device
+            ) * correct_keep_indices.numel() // selected_correct_keep_count
+            selected_rows[correct_keep_indices[spaced]] = True
+    if bool(selected_rows.any()):
+        selected_logits = calibrated_logits[selected_rows]
+        selected_target = target[selected_rows]
+        if keep_weight is None:
+            # Preserve the existing selected-row CE exactly when unconfigured.
+            loss = F.cross_entropy(selected_logits, selected_target)
+        else:
+            per_row_loss = F.cross_entropy(
+                selected_logits, selected_target, reduction="none"
+            )
+            keep_rows = selected_target.eq(0)
+            change_rows = selected_target.ne(0)
+            if bool(keep_rows.any()) and bool(change_rows.any()):
+                loss = (
+                    keep_weight * per_row_loss[keep_rows].mean()
+                    + (1.0 - keep_weight) * per_row_loss[change_rows].mean()
+                )
+            elif bool(keep_rows.any()):
+                loss = per_row_loss[keep_rows].mean()
+            else:
+                loss = per_row_loss[change_rows].mean()
+        loss = loss / math.log(float(logits.shape[1]))
     else:
         loss = residual_logits.sum() * 0.0
     return loss, {
         "event_residual": loss,
         "event_residual_hard_rows": hard_rows.sum().to(dtype=loss.dtype),
+        "event_residual_selected_correct_keep_rows": loss.new_tensor(
+            selected_correct_keep_count
+        ),
         "event_residual_true_change_rows": target.ne(0).sum().to(dtype=loss.dtype),
-        "event_residual_false_positive_keep_rows": (target.eq(0) & base_event.ne(0)).sum().to(dtype=loss.dtype),
+        "event_residual_false_positive_keep_rows": (
+            target.eq(0) & predicted_event.ne(0)
+        ).sum().to(dtype=loss.dtype),
     }
 
 

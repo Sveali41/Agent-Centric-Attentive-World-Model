@@ -469,9 +469,28 @@ PPO:
     iterations: 3
     gamma: 0.99
     fallback_action: 0
+    # One-time cost when an imagined Crafter trajectory reaches zero health.
+    crafter_terminal_penalty: 5.0
+    # Terminal resource value plus distance progress on the observed map.
+    crafter_resource_guidance_weight: 3.0
+    crafter_exploration_weight: 1.0
+    # Small potential-based signal for the wood -> stone tool chain.
+    crafter_tool_progress_weight: 0.25
+    # One-time, recipe-capped inventory gains for the current real tool tier.
+    crafter_inventory_progress_weight: 0.25
+    # First table costs 2 wood; reserve 1 more for the wood pickaxe.
+    crafter_require_three_wood_for_first_table: true
+    # After stone/iron pickaxe, guide missing materials and resource interactions.
+    crafter_late_stage_guidance: true
     episodes: 10
     print_every_steps: 1
+    # MPC can evaluate the current DR model without changing PPO's WM source.
+    checkpoint_path: null
+    crafter_checkpoint_path: ${oc.env:MODEL_FPATH}/AttentionWM/dr_attention_world_model_crafter_none_seed0_last.ckpt
+    # Null keeps the bias stored in the Crafter WM checkpoint.
+    crafter_inventory_change_bias: null
     output_dir: ${paths.planning}/mpc/${domains.minigrid.task_name}_seed${PPO.seed}_dense_exec${PPO.mpc.execute_steps}
+    crafter_output_dir: ${paths.planning}/mpc/crafter_${domains.crafter.task_name}_seed${PPO.seed}_native_exec${PPO.mpc.execute_steps}
   mcts:
     simulations: 64
     max_depth: 256

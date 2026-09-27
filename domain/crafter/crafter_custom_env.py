@@ -216,7 +216,7 @@ CHAR_TO_ENTITY = {
 # ------------------------------------------------------------
 # 2. Build Crafter world from character grid (safe version)
 # ------------------------------------------------------------
-def make_world_from_chars(char_grid, seed=0):
+def make_world_from_chars(char_grid, seed=0, *, seed_world_rng=False):
     """Safe version: Create a Crafter world from a character grid, ensuring material ID alignment."""
     H, W = char_grid.shape
 
@@ -233,6 +233,8 @@ def make_world_from_chars(char_grid, seed=0):
     # ---- 2. Create the actual world with the same structure ----
     # area should be (Width, Height) -> (Cols, Rows)
     world = World(area=(W, H), materials=list(constants.materials), chunk_size=(12, 12))
+    if seed_world_rng:
+        world.reset(seed=int(seed))
     world.daylight = 1.0
 
     # ---- 3. Fill the material map from character layout ----
@@ -306,6 +308,7 @@ class CustomCrafterEnv(gym.Env):
         crafter.worldgen.generate_world = lambda world, player: None
 
         self.seed = seed
+        self._seed_world_rng = bool(kwargs.get("deterministic_world_rng", False))
         self.txt_file_path = txt_file_path
         self.layout_str = layout_str
         self.max_steps = max_steps or 10000
@@ -368,7 +371,9 @@ class CustomCrafterEnv(gym.Env):
         self.env = crafter.Env(reward=False, seed=seed)
 
         # Inject custom world
-        world, player = make_world_from_chars(self.char_grid, seed)
+        world, player = make_world_from_chars(
+            self.char_grid, seed, seed_world_rng=self._seed_world_rng
+        )
         self.env._world = world
         self.env._player = player
 
@@ -448,7 +453,9 @@ class CustomCrafterEnv(gym.Env):
         self.env.reset()
 
         # Build custom map
-        world, player = make_world_from_chars(self.char_grid, seed=self.seed)
+        world, player = make_world_from_chars(
+            self.char_grid, seed=self.seed, seed_world_rng=self._seed_world_rng
+        )
         
         # --- Handle custom position/direction for uniform sampling ---
         target_pos = kwargs.get('agent_pos', None)

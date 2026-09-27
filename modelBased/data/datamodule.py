@@ -7,6 +7,7 @@ from typing import Dict, Optional
 from modelBased.common.utils import get_env, normalize_obs
 from modelBased.common.utils import merge_data_dicts
 from domain.minigrid.transition_codec import MINIGRID_ACTION_COUNT
+from modelBased.world_model.crafter_event_audit import inventory_event_rows
 
 try:
     from func_timeout import func_set_timeout
@@ -70,6 +71,8 @@ class WMRLDataset(Dataset):
         self.act_norm_values = hparams.action_norm_values
         self.replay_sampling_stats = None
         self.protected_replay_slot_counts = {}
+        self.replay_inventory_event_rows = []
+        self.replay_source_mask = np.zeros(0, dtype=bool)
         self.data = self.make_data(loaded, replay_data)
 
     @staticmethod
@@ -538,8 +541,11 @@ class WMRLDataset(Dataset):
             current_n = max_train_samples
             print(f"[Dataset] Capped current task data to {max_train_samples} samples.")
 
+        replay_source_mask = np.zeros(current_n, dtype=bool)
+
         # Short-circuit when both current and replay datasets are empty.
         if current_n == 0 and (replay_data is None or len(replay_data.get('obs', [])) == 0):
+            self.replay_source_mask = replay_source_mask
             return {'obs': np.array([]), 'obs_next': np.array([]), 'act': np.array([])}
 
         # ===== (0.5) Frame Stacking (If enabled for new data) =====
@@ -705,6 +711,9 @@ class WMRLDataset(Dataset):
                     inv = np.concatenate([inv, r_inv], axis=0) if (current_n > 0 and inv is not None) else r_inv
                 if r_inv_next is not None:
                     inv_next = np.concatenate([inv_next, r_inv_next], axis=0) if (current_n > 0 and inv_next is not None) else r_inv_next
+                replay_source_mask = np.concatenate((
+                    replay_source_mask, np.ones(len(r_obs), dtype=bool)
+                )) if current_n > 0 else np.ones(len(r_obs), dtype=bool)
             else:
                 print(f"Warning: Replay buffer obs shape {r_obs.shape} does not match current obs shape {obs.shape}. Skipping replay.")
 
@@ -719,6 +728,7 @@ class WMRLDataset(Dataset):
                     inv = inv[perm]
                 if inv_next is not None and len(inv_next) == N:
                     inv_next = inv_next[perm]
+                replay_source_mask = replay_source_mask[perm]
 
             print(f"Adding replay buffer with {len(r_obs)} samples.")
         if current_n == 0:
@@ -838,6 +848,7 @@ class WMRLDataset(Dataset):
             inventory_dtype = np.int64 if env_type == 'minigrid' else np.float32
             data['inv'] = inv[:len(obs_f)].astype(inventory_dtype)
             data['inv_next'] = inv_next[:len(obs_f)].astype(inventory_dtype)
+        self.replay_source_mask = replay_source_mask[:len(obs_f)]
         return data
 
             
@@ -900,6 +911,15 @@ class WMRLDataModule(pl.LightningDataModule):
         else:
             self.data_train = torch.utils.data.Subset(data, range(0, split_size))
             self.data_test = torch.utils.data.Subset(data, range(split_size, len(data)))
+
+        if self.cfg.env_type == "crafter" and "inv" in data.data and "inv_next" in data.data:
+            train_replay_mask = data.replay_source_mask[:len(self.data_train)]
+            if bool(np.any(train_replay_mask)):
+                train_length = len(self.data_train)
+                data.replay_inventory_event_rows = inventory_event_rows(
+                    data.data["inv"][:train_length][train_replay_mask],
+                    data.data["inv_next"][:train_length][train_replay_mask],
+                )
 
         # DR checkpoint selection must use a fixed, non-target archive.  It is
         # deliberately constructed without replay and is never part of the

@@ -223,11 +223,11 @@ class AttentionModule(nn.Module):
             crafter_inventory_event_residual_change_bias
         )
         if self.crafter_inventory_architecture not in {
-            "shared_pool_v1", "isolated_global_v1", "slot_attention_v1"
+            "shared_pool_v1", "shared_pool_detached_v1", "isolated_global_v1", "slot_attention_v1"
         }:
             raise ValueError(
                 "crafter_inventory_architecture must be shared_pool_v1, "
-                "isolated_global_v1, or slot_attention_v1"
+                "shared_pool_detached_v1, isolated_global_v1, or slot_attention_v1"
             )
         if self.crafter_inventory_event_residual_enabled and (
             env_type != "crafter" or self.crafter_inventory_output_mode != "categorical_effect"
@@ -287,7 +287,7 @@ class AttentionModule(nn.Module):
                 else:
                     # Unified item effects: KEEP, -4, -2, -1, +1.
                     inventory_output_width = 4 * (self.crafter_inventory_classes + 1) + 12 * 5
-                if self.crafter_inventory_architecture == "shared_pool_v1":
+                if self.crafter_inventory_architecture in {"shared_pool_v1", "shared_pool_detached_v1"}:
                     self.inv_head = nn.Sequential(
                         nn.Linear(embed_dim, embed_dim),
                         nn.ReLU(),
@@ -339,8 +339,13 @@ class AttentionModule(nn.Module):
                     self.crafter_inventory_event_action_embedding = nn.Embedding(
                         17, self.crafter_inventory_event_residual_action_embed_dim
                     )
+                    residual_feature_width = (
+                        12 * embed_dim + len(self.crafter_inventory_event_codebook)
+                        if self.crafter_inventory_architecture == "slot_attention_v1"
+                        else embed_dim
+                    )
                     widths = (
-                        embed_dim + 12 + self.crafter_inventory_event_residual_action_embed_dim,
+                        residual_feature_width + 12 + self.crafter_inventory_event_residual_action_embed_dim,
                         *self.crafter_inventory_event_residual_hidden_dims,
                     )
                     layers = []
@@ -668,24 +673,26 @@ class AttentionModule(nn.Module):
         x = self.dropout_conv(x)
         return self.flatten(x).transpose(1, 2) + self.pos_embedding
 
-    def _crafter_isolated_inventory_prediction(self, state, action, inv):
+    def _crafter_isolated_inventory_prediction(self, map_tokens, action, inv):
         """Return effect logits without exposing shared WM representations.
 
-        The map tokens are state-only and detached before the private decoder.
-        This deliberately keeps inventory supervision from updating the map
-        encoder or the transition action embedding.
+        The map tokens are action-conditioned Transformer outputs. Detaching
+        them keeps inventory supervision from updating the shared WM.
         """
-        B = state.shape[0]
-        map_tokens = self._encode_discrete_tokens(state).detach()
-        action_ids = torch.as_tensor(action, device=state.device).long().reshape(-1)
+        if (map_tokens.ndim != 3 or map_tokens.shape[0] < 1
+                or map_tokens.shape[1] < 1 or map_tokens.shape[2] != self.embed_dim):
+            raise ValueError("Crafter inventory decoder requires [B,N,D] map tokens with D=embed_dim")
+        B = map_tokens.shape[0]
+        map_tokens = map_tokens.detach()
+        action_ids = torch.as_tensor(action, device=map_tokens.device).long().reshape(-1)
         if action_ids.numel() == 1 and B > 1:
             action_ids = action_ids.expand(B)
         if action_ids.numel() != B:
-            raise ValueError("Crafter inventory action batch size must match state")
+            raise ValueError("Crafter inventory action batch size must match map tokens")
         if inv is None:
-            inventory = torch.zeros(B, 16, device=state.device, dtype=map_tokens.dtype)
+            inventory = torch.zeros(B, 16, device=map_tokens.device, dtype=map_tokens.dtype)
         else:
-            inventory = torch.as_tensor(inv, device=state.device, dtype=map_tokens.dtype)
+            inventory = torch.as_tensor(inv, device=map_tokens.device, dtype=map_tokens.dtype)
             inventory = inventory.reshape(B, -1)
             if inventory.shape[1] != 16:
                 raise ValueError("Crafter inventory decoder requires [B,16] inventory")
@@ -699,45 +706,72 @@ class AttentionModule(nn.Module):
             value_tokens = self.crafter_inventory_value_embedding(inventory.long())
             value_tokens = value_tokens + self.crafter_inventory_slot_embedding.unsqueeze(0)
             action_token = self.crafter_inventory_action_embedding(action_ids).unsqueeze(1)
-            tokens = torch.cat((value_tokens, action_token), dim=1)
-            tokens, _ = self.crafter_inventory_self_attention(tokens, tokens, tokens, need_weights=False)
+            input_tokens = torch.cat((value_tokens, action_token), dim=1)
+            attended_tokens, _ = self.crafter_inventory_self_attention(
+                input_tokens, input_tokens, input_tokens, need_weights=False
+            )
+            tokens = input_tokens + attended_tokens
             queries = tokens[:, 4:16]
-            slots, _ = self.crafter_inventory_cross_attention(
+            attended_slots, _ = self.crafter_inventory_cross_attention(
                 queries, map_tokens, map_tokens, need_weights=False
             )
+            slots = queries + attended_slots
             item_logits = self.crafter_inventory_slot_head(slots)
         # Native rules own survival during planning for every new architecture.
         survival_logits = item_logits.new_zeros(B, self.crafter_inventory_classes + 1, 4)
         survival_logits[:, 0] = 1.0
-        return {
+        prediction = {
             "survival_effect_logits": survival_logits,
             "item_effect_logits": item_logits.transpose(1, 2).contiguous(),
         }
+        if self.crafter_inventory_architecture == "slot_attention_v1":
+            prediction["item_slot_features"] = slots
+        return prediction
 
     def _crafter_attach_event_residual(self, inv_pred, pooled_tokens, action, inv):
         """Attach detached factorised event scores plus a trainable residual."""
         if not self.crafter_inventory_event_residual_enabled:
             return inv_pred
-        B = pooled_tokens.shape[0]
-        if inv is None:
-            inventory = pooled_tokens.new_zeros(B, 16)
+        if self.crafter_inventory_architecture == "slot_attention_v1":
+            slots = inv_pred.get("item_slot_features")
+            if slots is None or slots.ndim != 3 or slots.shape[1] != 12:
+                raise ValueError("Crafter slot event residual requires [B,12,D] item_slot_features")
+            B = slots.shape[0]
+            expected_width = (12 * slots.shape[2] + len(self.crafter_inventory_event_codebook)
+                              + 12 + self.crafter_inventory_event_residual_action_embed_dim)
+            if expected_width != self.crafter_inventory_event_residual[0].in_features:
+                raise ValueError("Crafter slot event residual feature width does not match its configured input")
+            device = slots.device
         else:
-            inventory = torch.as_tensor(inv, device=pooled_tokens.device).reshape(B, -1)
+            B = pooled_tokens.shape[0]
+            device = pooled_tokens.device
+        if inv is None:
+            inventory = torch.zeros(B, 16, device=device)
+        else:
+            inventory = torch.as_tensor(inv, device=device).reshape(B, -1)
             if inventory.shape[1] != 16:
                 raise ValueError("Crafter event residual requires [B,16] inventory")
-        action_ids = torch.as_tensor(action, device=pooled_tokens.device).long().reshape(-1)
+        action_ids = torch.as_tensor(action, device=device).long().reshape(-1)
         if action_ids.numel() == 1 and B > 1:
             action_ids = action_ids.expand(B)
         if action_ids.numel() != B:
             raise ValueError("Crafter event residual action batch size must match state")
-        # Both pooled WM feature and factorised slot scores are detached. The
-        # residual objective cannot alter the pre-existing WM heads.
+        # Factorised slot scores are detached, so residual supervision cannot
+        # alter the base inventory head.
         base_scores, _ = crafter_event_scores_from_slot_logits(
             inv_pred["item_effect_logits"].detach(), inventory[:, 4:],
             codebook=self.crafter_inventory_event_codebook,
         )
+        if self.crafter_inventory_architecture == "slot_attention_v1":
+            # Flattening preserves slot identity. Softmax turns impossible
+            # event scores into finite zero-valued features.
+            residual_features = torch.cat((
+                slots.detach().flatten(1), base_scores.detach().softmax(dim=1),
+            ), dim=1)
+        else:
+            residual_features = pooled_tokens.detach()
         inputs = torch.cat((
-            pooled_tokens.detach(), inventory[:, 4:].float() / 9.0,
+            residual_features, inventory[:, 4:].float() / 9.0,
             self.crafter_inventory_event_action_embedding(action_ids),
         ), dim=1)
         residual_logits = self.crafter_inventory_event_residual(inputs)
@@ -959,8 +993,13 @@ class AttentionModule(nn.Module):
                 effect_width = 4 * (self.crafter_inventory_classes + 1)
                 gate_width = 12 * 2
                 if self.crafter_inventory_output_mode == "categorical_effect":
-                    if self.crafter_inventory_architecture == "shared_pool_v1":
-                        shared_raw = self.inv_head(x_pooled)
+                    if self.crafter_inventory_architecture in {"shared_pool_v1", "shared_pool_detached_v1"}:
+                        inventory_features = (
+                            x_pooled.detach()
+                            if self.crafter_inventory_architecture == "shared_pool_detached_v1"
+                            else x_pooled
+                        )
+                        shared_raw = self.inv_head(inventory_features)
                         survival_raw = shared_raw[:, :effect_width]
                         item_effect_raw = shared_raw[:, effect_width:]
                         inv_pred = {
@@ -971,7 +1010,7 @@ class AttentionModule(nn.Module):
                             .transpose(1, 2).contiguous(),
                         }
                     else:
-                        inv_pred = self._crafter_isolated_inventory_prediction(state, action, inv)
+                        inv_pred = self._crafter_isolated_inventory_prediction(x.detach(), action, inv)
                     inv_pred = self._crafter_attach_event_residual(inv_pred, x_pooled, action, inv)
                 elif self.crafter_inventory_value_mode == "categorical_delta":
                     # Keep gate/survival connected to the spatial encoder.

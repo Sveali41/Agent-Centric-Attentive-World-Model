@@ -58,6 +58,58 @@ from matplotlib import pyplot as plt
 from gymnasium.wrappers import TimeLimit
 
 
+_CRAFTER_UNIFORM_INVENTORY_ITEMS = (
+    'wood', 'stone', 'coal', 'iron', 'diamond', 'sapling',
+    'wood_pickaxe', 'stone_pickaxe', 'iron_pickaxe',
+    'wood_sword', 'stone_sword', 'iron_sword',
+)
+
+
+def _randomize_crafter_uniform_inventory(player):
+    """Sample all editable Crafter inventory slots from the official range."""
+    for item in _CRAFTER_UNIFORM_INVENTORY_ITEMS:
+        player.inventory[item] = float(np.random.randint(0, 10))
+
+
+def _crafter_uniform_spawn_positions(env):
+    """Return every empty tile that the native Crafter player can occupy.
+
+    Query the constructed native world so the candidate set follows Crafter's
+    actual walkability rules and excludes harvestable materials and entities.
+    """
+    crafter_env = env.unwrapped.env
+    world = crafter_env._world
+    player = crafter_env._player
+    player_pos = tuple(map(int, player.pos))
+    positions = []
+    for x in range(int(world.area[0])):
+        for y in range(int(world.area[1])):
+            material, occupant = world[(x, y)]
+            if material not in player.walkable:
+                continue
+            # The player's initial tile is valid, but occupied before reset.
+            # All other occupied tiles make World.move reject the teleport.
+            if occupant is None or (x, y) == player_pos:
+                positions.append((x, y))
+    return positions
+
+
+def _crafter_uniform_reset_kwargs(spawn_point, default_spawn_point):
+    """Build reset arguments without moving the player onto itself."""
+    if spawn_point is None or spawn_point == default_spawn_point:
+        return {}
+    return {'agent_pos': spawn_point}
+
+
+def _crafter_uniform_reset_interval(transition_budget, spawn_count, configured_interval):
+    """Bound rollout length so one transition budget visits every spawn."""
+    if spawn_count <= 0:
+        raise ValueError("spawn_count must be positive")
+    return min(
+        max(1, int(configured_interval)),
+        max(1, int(transition_budget) // int(spawn_count)),
+    )
+
 def _coerce_render_image(img):
     """
     Best-effort normalization of render outputs to an image ndarray.
@@ -585,27 +637,26 @@ def run_env(
         )
         policy.begin_rollout(rollout_budget)
 
-    # --- 1. Exhaustive Shuffled Queue for 100% Coverage ---
-
-    ground_tiles_queue = []
+    # Uniform Crafter records one transition from each legal spawn tile before
+    # cycling. The native world decides legality, so resources and entities
+    # cannot be accidentally erased by CustomCrafterEnv.reset().
+    ground_tiles_queue = deque()
+    crafter_default_spawn = None
     if randomize_inventory and is_crafter:
-        cg = env.unwrapped.char_grid
-        h_grid, w_grid = cg.shape
-        # Collect all non-water tiles.
-        all_terrestrial = [(c, r) for r in range(h_grid) for c in range(w_grid) if cg[r,c] != 'W']
-        np.random.shuffle(all_terrestrial)
-        ground_tiles_queue = all_terrestrial
-        print(f"[RunEnv] Exhaustive Queue initialized with {len(ground_tiles_queue)} unique spawn points.")
+        spawn_points = _crafter_uniform_spawn_positions(env)
+        if not spawn_points:
+            raise RuntimeError("Crafter uniform collection found no legal spawn positions.")
+        np.random.shuffle(spawn_points)
+        ground_tiles_queue = deque(spawn_points)
+        crafter_default_spawn = tuple(map(int, env.unwrapped.env._player.pos))
+        print(f"[RunEnv] Uniform queue initialized with {len(ground_tiles_queue)} legal spawn points.")
 
     def get_next_spawn_point():
-        nonlocal ground_tiles_queue
         if not ground_tiles_queue:
             return None
-        # Cycle through the queue by popping from the front.
-        pt = ground_tiles_queue.pop(0)
-        # Re-append to keep the queue exhaustive across repeated passes.
-        ground_tiles_queue.append(pt)
-        return pt
+        point = ground_tiles_queue.popleft()
+        ground_tiles_queue.append(point)
+        return point
 
     def _maybe_add_bipedal_spawn(reset_kwargs):
         if not (is_bipedal and data_type == "uniform"):
@@ -629,22 +680,17 @@ def run_env(
     # --- Initial Reset ---
     reset_kwargs = {}
     if randomize_inventory and is_crafter:
-        sp = get_next_spawn_point()
-        if sp: reset_kwargs['agent_pos'] = sp
+        reset_kwargs = _crafter_uniform_reset_kwargs(
+            get_next_spawn_point(), crafter_default_spawn
+        )
     reset_kwargs = _maybe_add_bipedal_spawn(reset_kwargs)
 
     obs = env.reset(**reset_kwargs)[0]
-
     # --- BOOST 1: Randomize the very FIRST episode if needed ---
     if randomize_inventory and is_crafter:
         player = env.unwrapped.env._player
 
-        for stat in ['health', 'food', 'drink', 'energy']:
-            setattr(player, stat, float(np.random.randint(5, 10)))
-        all_possible_items = ['wood', 'stone', 'coal', 'iron', 'diamond', 'sapling', 'wood_pickaxe', 'stone_pickaxe', 'iron_pickaxe', 'wood_sword', 'stone_sword', 'iron_sword']
-        for item in all_possible_items:
-            # Bias toward carrying advanced tools with 70% probability.
-            player.inventory[item] = 1.0 if (('pickaxe' in item or 'sword' in item) and np.random.random() < 0.7) else float(np.random.randint(0, 5))
+        _randomize_crafter_uniform_inventory(player)
         # Refresh the observation immediately after inventory edits.
         obs = env.unwrapped._extract_obs()
 
@@ -779,22 +825,9 @@ def run_env(
             # --- 1. CORE RANDOMIZATION (Every Step in Uniform Mode) ---
             if randomize_inventory and is_crafter:
                 player = env.unwrapped.env._player
-                
-                # Sample survival stats uniformly from [1, 9].
-                for stat in ['health', 'food', 'drink', 'energy']:
-                    setattr(player, stat, float(np.random.randint(1, 10)))
-                
-                # Sample basic materials uniformly from [0, 9].
-                materials = ['wood', 'stone', 'coal', 'iron', 'diamond', 'sapling']
-                for item in materials:
-                    player.inventory[item] = float(np.random.randint(0, 10))
-                
-                # Sample tools and weapons from a uniform subset distribution.
-                tools = ['wood_pickaxe', 'stone_pickaxe', 'iron_pickaxe', 'wood_sword', 'stone_sword', 'iron_sword']
-                num_tools = np.random.randint(0, len(tools) + 1)
-                selected_tools = np.random.choice(tools, num_tools, replace=False)
-                for t in tools:
-                    player.inventory[t] = 1.0 if t in selected_tools else 0.0
+
+                # Sample all editable inventory slots uniformly from [0, 9].
+                _randomize_crafter_uniform_inventory(player)
                 
                 # Refresh the observation after editing the inventory.
                 obs = env.unwrapped._extract_obs()
@@ -927,14 +960,24 @@ def run_env(
                         done = True
                         stuck_terminated = True
 
-            # In MiniGrid target-uniform collection, random starts only take
-            # effect when the environment is reset. Bound each rollout so a
-            # large transition budget produces many independent random starts
-            # instead of a few very long random walks. Crafter keeps the same
-            # periodic-reset behavior it previously had below.
+            # In uniform Crafter collection, reset often enough to complete one
+            # legal-spawn cycle within the requested transition budget. This
+            # retains short rollouts instead of turning every transition into a
+            # separate episode.
             uniform_reset_steps = int(
                 getattr(collect_cfg, "uniform_reset_steps", 50 if is_crafter else 300)
             )
+            if is_crafter and randomize_inventory and data_type == "uniform":
+                transition_budget = (
+                    int(maximum_dataset_size)
+                    if maximum_dataset_size is not None
+                    else int(mini_dataset_size)
+                )
+                uniform_reset_steps = _crafter_uniform_reset_interval(
+                    transition_budget,
+                    len(ground_tiles_queue),
+                    uniform_reset_steps,
+                )
             periodic_uniform_reset = (
                 uniform_reset_steps > 0
                 and step_in_episode >= uniform_reset_steps
@@ -1062,13 +1105,12 @@ def run_env(
                     recent_hull_x.clear()
                     recent_rewards.clear()
                     recent_actions.clear()
-                
-                # --- BOOST 2: Exhaustive Spawning (Cycling through all tiles) ---
+                # Cycle through the legal spawn queue on every uniform reset.
                 reset_kwargs = {}
                 if randomize_inventory and is_crafter:
-                    sp = get_next_spawn_point()
-                    if sp: reset_kwargs['agent_pos'] = sp
-
+                    reset_kwargs = _crafter_uniform_reset_kwargs(
+                        get_next_spawn_point(), crafter_default_spawn
+                    )
                 reset_kwargs = _maybe_add_bipedal_spawn(reset_kwargs)
 
                 obs = env.reset(**reset_kwargs)[0]
@@ -1082,15 +1124,7 @@ def run_env(
                 
                 if randomize_inventory and is_crafter:
                     player = env.unwrapped.env._player
-                    for stat in ['health', 'food', 'drink', 'energy']:
-                        setattr(player, stat, float(np.random.randint(1, 10)))
-                    materials = ['wood', 'stone', 'coal', 'iron', 'diamond', 'sapling']
-                    for item in materials:
-                        player.inventory[item] = float(np.random.randint(0, 10))
-                    tools = ['wood_pickaxe', 'stone_pickaxe', 'iron_pickaxe', 'wood_sword', 'stone_sword', 'iron_sword']
-                    num_tools = np.random.randint(0, len(tools) + 1)
-                    sel = np.random.choice(tools, num_tools, replace=False)
-                    for t in tools: player.inventory[t] = 1.0 if t in sel else 0.0
+                    _randomize_crafter_uniform_inventory(player)
                     
                     # Sync observation after injection
                     obs = env.unwrapped._extract_obs()

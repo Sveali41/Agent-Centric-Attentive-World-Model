@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+import numpy as np
 import tempfile
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from modelBased.world_model.crafter_dynamics import (
     crafter_pose_target,
     decode_crafter_pose_logits,
     categorical_crafter_inventory_event_target,
+    CRAFTER_CANONICAL_EVENT_CODEBOOK,
     crafter_event_codebook,
     crafter_inventory_event_residual_loss,
     crafter_player_counts,
@@ -57,6 +59,17 @@ def _prediction(
 
 
 class CrafterInventoryGateLossTest(unittest.TestCase):
+    def test_event_codebook_encodes_saturated_crafts(self):
+        current = torch.ones(3, 12, dtype=torch.long)
+        following = current.clone()
+        following[0, 0] -= 1
+        following[1, :2] -= 1
+        following[2, [0, 2, 3]] -= 1
+
+        target = categorical_crafter_inventory_event_target(current, following)
+        self.assertEqual(target.tolist(), [17, 18, 19])
+        self.assertEqual(len(CRAFTER_CANONICAL_EVENT_CODEBOOK), 20)
+
     def test_event_codebook_round_trip_and_invalid_context_mask(self):
         current = torch.zeros(2, 12, dtype=torch.long)
         following = current.clone()
@@ -87,15 +100,108 @@ class CrafterInventoryGateLossTest(unittest.TestCase):
         following[0, 4] = 1
         prediction = {
             "item_event_codebook": crafter_event_codebook(),
-            "item_event_base_scores": torch.zeros(2, 17),
-            "item_event_residual_logits": torch.zeros(2, 17, requires_grad=True),
+            "item_event_change_bias": 1.875,
+            "item_event_base_scores": torch.zeros(2, len(CRAFTER_CANONICAL_EVENT_CODEBOOK)),
+            "item_event_residual_logits": torch.zeros(
+                2, len(CRAFTER_CANONICAL_EVENT_CODEBOOK), requires_grad=True
+            ),
         }
-        # Only second KEEP is a model-defined false positive.
+        # The second KEEP is a false positive under the deployed decoder.
         prediction["item_event_base_scores"][1, 1] = 3.0
         loss, parts = crafter_inventory_event_residual_loss(prediction, current, following)
         self.assertEqual(int(parts["event_residual_hard_rows"]), 2)
         loss.backward()
         self.assertGreater(float(prediction["item_event_residual_logits"].grad.abs().sum()), 0.0)
+
+    def test_event_residual_trains_on_bias_induced_false_change(self):
+        current = torch.zeros(1, 16, dtype=torch.long)
+        base_scores = torch.full((1, len(CRAFTER_CANONICAL_EVENT_CODEBOOK)), -5.0)
+        base_scores[0, 0] = 2.0
+        wood_gain = CRAFTER_CANONICAL_EVENT_CODEBOOK.index(
+            (1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        )
+        base_scores[0, wood_gain] = 1.0
+        residual = torch.zeros_like(base_scores, requires_grad=True)
+        prediction = {
+            "item_event_codebook": crafter_event_codebook(),
+            "item_event_base_scores": base_scores,
+            "item_event_residual_logits": residual,
+            "item_event_change_bias": 1.875,
+        }
+        loss, parts = crafter_inventory_event_residual_loss(
+            prediction, current, current
+        )
+        self.assertEqual(int(parts["event_residual_hard_rows"]), 1)
+        self.assertEqual(int(parts["event_residual_false_positive_keep_rows"]), 1)
+        loss.backward()
+        self.assertGreater(float(residual.grad.abs().sum()), 0.0)
+
+        prediction["item_event_change_bias"] = 0.0
+        _, parts = crafter_inventory_event_residual_loss(
+            prediction, current, current
+        )
+        self.assertEqual(int(parts["event_residual_hard_rows"]), 0)
+
+    def test_event_residual_correct_keep_sampling_is_deterministic_and_capped(self):
+        current = torch.zeros(12, 16, dtype=torch.long)
+        following = current.clone()
+        following[0, 4] = 1
+        base_scores = torch.zeros(12, len(CRAFTER_CANONICAL_EVENT_CODEBOOK))
+        base_scores[1, 1] = 3.0  # Incorrect change on a true KEEP row.
+        residual = torch.zeros_like(base_scores, requires_grad=True)
+        prediction = {
+            "item_event_codebook": crafter_event_codebook(),
+            "item_event_base_scores": base_scores,
+            "item_event_residual_logits": residual,
+            "item_event_change_bias": 0.0,
+        }
+        default_loss, default_parts = crafter_inventory_event_residual_loss(
+            prediction, current, following
+        )
+        zero_loss, zero_parts = crafter_inventory_event_residual_loss(
+            prediction, current, following, correct_keep_fraction=0.0
+        )
+        self.assertTrue(torch.equal(default_loss, zero_loss))
+        self.assertEqual(int(default_parts["event_residual_hard_rows"]), 2)
+        self.assertEqual(int(default_parts["event_residual_selected_correct_keep_rows"]), 0)
+        self.assertEqual(int(zero_parts["event_residual_selected_correct_keep_rows"]), 0)
+
+        sampled_loss, sampled_parts = crafter_inventory_event_residual_loss(
+            prediction, current, following, correct_keep_fraction=0.5
+        )
+        self.assertEqual(int(sampled_parts["event_residual_hard_rows"]), 2)
+        self.assertEqual(int(sampled_parts["event_residual_selected_correct_keep_rows"]), 2)
+        target = categorical_crafter_inventory_event_target(
+            current[:, 4:], following[:, 4:]
+        )
+        expected = torch.nn.functional.cross_entropy(
+            base_scores[[0, 1, 2, 7]], target[[0, 1, 2, 7]]
+        ) / np.log(base_scores.shape[1])
+        self.assertTrue(torch.allclose(sampled_loss, expected))
+        sampled_again, _ = crafter_inventory_event_residual_loss(
+            prediction, current, following, correct_keep_fraction=0.5
+        )
+        self.assertTrue(torch.equal(sampled_loss, sampled_again))
+
+    def test_event_residual_no_hard_rows_never_adds_correct_keep(self):
+        current = torch.zeros(5, 16, dtype=torch.long)
+        prediction = {
+            "item_event_codebook": crafter_event_codebook(),
+            "item_event_base_scores": torch.zeros(5, len(CRAFTER_CANONICAL_EVENT_CODEBOOK)),
+            "item_event_residual_logits": torch.zeros(
+                5, len(CRAFTER_CANONICAL_EVENT_CODEBOOK), requires_grad=True
+            ),
+            "item_event_change_bias": 0.0,
+        }
+        loss, parts = crafter_inventory_event_residual_loss(
+            prediction, current, current, correct_keep_fraction=1.0
+        )
+        self.assertEqual(int(parts["event_residual_selected_correct_keep_rows"]), 0)
+        self.assertEqual(float(loss.detach()), 0.0)
+        with self.assertRaisesRegex(ValueError, "correct_keep_fraction"):
+            crafter_inventory_event_residual_loss(
+                prediction, current, current, correct_keep_fraction=1.1
+            )
 
     def test_event_residual_isolated_from_slot_and_map_heads(self):
         module = AttentionModule(
@@ -179,6 +285,75 @@ class CrafterInventoryGateLossTest(unittest.TestCase):
             crafter_inventory_value_mode="categorical_delta",
         )
         self.assertEqual(module.inv_head[-1].out_features, 104)
+
+    def test_crafter_pcgrad_projects_only_conflicting_shared_gradients(self):
+        model = AttentionWorldModel.__new__(AttentionWorldModel)
+        torch.nn.Module.__init__(model)
+        shared = torch.nn.Parameter(torch.zeros(2))
+        layout_head = torch.nn.Parameter(torch.zeros(2))
+        inventory_head = torch.nn.Parameter(torch.zeros(2))
+        layout_grad = torch.tensor([1.0, 0.0])
+        inventory_grad = torch.tensor([-1.0, 1.0])
+        other_grad = torch.tensor([0.3, 0.2])
+        shared.grad = layout_grad + inventory_grad + other_grad
+        layout_head.grad = torch.tensor([2.0, 3.0])
+        inventory_head.grad = torch.tensor([4.0, 5.0])
+        model._pcgrad_task_grads = (
+            ((shared, layout_grad, inventory_grad),),
+            (layout_grad * inventory_grad).sum(),
+            layout_grad.square().sum(),
+            inventory_grad.square().sum(),
+        )
+        model.on_after_backward()
+        torch.testing.assert_close(shared.grad, torch.tensor([0.8, 1.7]))
+        torch.testing.assert_close(layout_head.grad, torch.tensor([2.0, 3.0]))
+        torch.testing.assert_close(inventory_head.grad, torch.tensor([4.0, 5.0]))
+        self.assertIsNone(model._pcgrad_task_grads)
+
+        aligned = torch.tensor([1.0, 1.0])
+        shared.grad = layout_grad + aligned + other_grad
+        model._pcgrad_task_grads = (
+            ((shared, layout_grad, aligned),),
+            (layout_grad * aligned).sum(),
+            layout_grad.square().sum(),
+            aligned.square().sum(),
+        )
+        model.on_after_backward()
+        torch.testing.assert_close(shared.grad, layout_grad + aligned + other_grad)
+
+    def test_shared_pool_detached_keeps_predictions_and_isolates_inventory_gradients(self):
+        kwargs = dict(
+            data_type="discrete", grid_shape=(2, 5, 5), mask_size=5,
+            embed_dim=8, num_heads=1, env_type="crafter",
+            crafter_output_mode="effect", crafter_inventory_output_mode="categorical_effect",
+            crafter_inventory_event_residual_enabled=True,
+        )
+        shared = AttentionModule(**kwargs, crafter_inventory_architecture="shared_pool_v1").eval()
+        detached = AttentionModule(**kwargs, crafter_inventory_architecture="shared_pool_detached_v1").eval()
+        detached.load_state_dict(shared.state_dict())
+        state = torch.zeros((2, 2, 5, 5), dtype=torch.long)
+        action = torch.tensor([0, 1])
+        inventory = torch.zeros((2, 16))
+        shared_map, _, shared_inv = shared(state, action, None, inv=inventory)
+        detached_map, _, detached_inv = detached(state, action, None, inv=inventory)
+        torch.testing.assert_close(detached_map, shared_map)
+        for name in ("item_effect_logits", "item_event_scores"):
+            torch.testing.assert_close(detached_inv[name], shared_inv[name])
+
+        (detached_inv["item_effect_logits"].sum()
+         + detached_inv["item_event_residual_logits"].sum()).backward()
+        self.assertIsNone(detached.conv1.weight.grad)
+        self.assertIsNone(detached.action_embedding.weight.grad)
+        self.assertIsNone(detached.fc.weight.grad)
+        self.assertIsNotNone(detached.inv_head[-1].weight.grad)
+        self.assertIsNotNone(detached.crafter_inventory_event_residual[-1].weight.grad)
+
+        detached.zero_grad(set_to_none=True)
+        map_logits, _, _ = detached(state, action, None, inv=inventory)
+        map_logits.sum().backward()
+        self.assertIsNotNone(detached.conv1.weight.grad)
+        self.assertIsNone(detached.inv_head[-1].weight.grad)
+        self.assertIsNone(detached.crafter_inventory_event_residual[-1].weight.grad)
 
     def test_isolated_inventory_decoder_shapes_and_gradient_isolation(self):
         module = AttentionModule(
@@ -809,47 +984,6 @@ class CrafterFocalDiagnosticsTest(unittest.TestCase):
         )
         self.assertEqual(float(diagnostics["inventory_focal_available"]), 0.0)
 
-class CrafterGeneratorInventoryEditTest(unittest.TestCase):
-    def test_materialization_ignores_survival_banks_and_keeps_item_edits(self):
-        import numpy as np
-        from types import SimpleNamespace
-        from generator.generator_interface import GeneratorInterface
-        fake = SimpleNamespace(
-            is_crafter=True,
-            is_minigrid=False,
-            cfg=SimpleNamespace(generator_agent=SimpleNamespace(random_stats_actions=False)),
-            _apply_action=lambda obj, action, mask: (obj, obj, obj),
-        )
-        stats_actions = torch.zeros((1, 32), dtype=torch.long)
-        stats_actions[0, 0] = 1       # survival slot 0, +1: ignored
-        stats_actions[0, 19] = 1      # survival slot 3, +5: ignored
-        stats_actions[0, 4] = 1       # item slot 4, +1
-        stats_actions[0, 21] = 1      # item slot 5, +5
-        _, _, _, stats = GeneratorInterface._materialize_candidates(
-            fake, np.zeros((1, 2, 2), dtype=np.int64), np.zeros((1, 2, 2), dtype=np.int64),
-            stats_actions.numpy(), np.zeros((1, 16), dtype=np.int64), torch.zeros((1, 1, 2, 2)),
-        )
-        self.assertEqual(stats[0][:4].tolist(), [0, 0, 0, 0])
-        self.assertEqual(stats[0][4], 1)
-        self.assertEqual(stats[0][5], 5)
-
-    def test_random_and_ppo_masks_disable_both_survival_banks(self):
-        from generator.generator_network import MapEditorActorCritic
-        from generator.random_generator_agent import RandomGeneratorAgent
-        model = MapEditorActorCritic(env_type="crafter")
-        logits = torch.zeros((2, 32, 2))
-        ppo_mask = model._get_stats_topk_mask(logits, 1.0)
-        self.assertFalse(ppo_mask[:, 0:4].any())
-        self.assertFalse(ppo_mask[:, 16:20].any())
-        self.assertEqual(int(ppo_mask[0].sum()), 24)
-        random_agent = RandomGeneratorAgent(12, device="cpu", env_type="crafter")
-        result = random_agent.select_action(torch.zeros((2, 3, 3, 3)), None, torch.zeros((2, 1, 3, 3)), 0.0, 1.0)
-        stats_action, random_mask = result[1], result[6]
-        self.assertFalse(random_mask[:, 0:4].any())
-        self.assertFalse(random_mask[:, 16:20].any())
-        self.assertTrue(torch.equal(stats_action[:, 0:4], torch.zeros_like(stats_action[:, 0:4])))
-        self.assertTrue(torch.equal(stats_action[:, 16:20], torch.zeros_like(stats_action[:, 16:20])))
-
 class CrafterLearningProgressAggregationTest(unittest.TestCase):
     def test_aggregates_only_finite_identical_probe_pairs(self):
         from generator.generator_interface import GeneratorInterface
@@ -888,15 +1022,323 @@ class CrafterLearningProgressRewardTest(unittest.TestCase):
                 "probe_trajectories": [{}, {}, {}],
                 "rewards": [99.0, 88.0, 77.0],
                 "auxiliary_rewards": [1.0, 2.0, 3.0],
+                "stage_tokens": np.array([0, 0, 0]),
             },
             last_crafter_metrics={},
         )
-        interface._evaluate_crafter_changed_focal_losses = lambda trajectories, valid, phase: np.array([2.5, 1.0, 0.0])
+        interface._evaluate_crafter_changed_focal_losses = lambda trajectories, valid, phase: np.array([2.5, 1.0, np.nan])
         interface._aggregate_crafter_learning_progress = GeneratorInterface._aggregate_crafter_learning_progress
         GeneratorInterface.finalize_crafter_learning_progress(interface, apply_rewards=True)
         # paired: 1 + 2 * (3 - 2.5); valid-unpaired: auxiliary only; invalid: -5.
         self.assertEqual(interface.ppo.buffer["reward"], [2.0, 2.0, -5.0])
+        self.assertAlmostEqual(interface.last_crafter_metrics["Pre_Changed_Focal_Loss"], 3.0)
+        self.assertAlmostEqual(interface.last_crafter_metrics["Post_Changed_Focal_Loss"], 2.5)
+        self.assertAlmostEqual(interface.last_crafter_metrics["Learning_Progress"], 0.5)
         self.assertIsNone(interface._pending_crafter_round)
+
+    def test_dr_finalization_groups_lp_by_random_stage_token(self):
+        import numpy as np
+        from types import SimpleNamespace
+        from generator.generator_interface import GeneratorInterface
+        pre = np.arange(1.0, 7.0, dtype=np.float32)
+        interface = SimpleNamespace(
+            is_crafter=True,
+            batch_size=6,
+            _pending_crafter_round={
+                "valid": [True] * 6,
+                "pre_changed_focal_losses": pre,
+                "probe_trajectories": [{}] * 6,
+                "rewards": [0.0] * 6,
+                "auxiliary_rewards": [0.0] * 6,
+                "stage_tokens": np.arange(6),
+            },
+            last_crafter_metrics={},
+        )
+        interface._evaluate_crafter_changed_focal_losses = (
+            lambda trajectories, valid, phase: pre - 0.5
+        )
+        interface._aggregate_crafter_learning_progress = (
+            GeneratorInterface._aggregate_crafter_learning_progress
+        )
+
+        GeneratorInterface.finalize_crafter_learning_progress(
+            interface, apply_rewards=False
+        )
+
+        self.assertAlmostEqual(interface.last_crafter_metrics["Learning_Progress"], 0.5)
+        self.assertAlmostEqual(interface.last_crafter_metrics["Inventory_KEEP_Ratio"], 1.0 / 6.0)
+        for stage in range(5):
+            self.assertEqual(interface.last_crafter_metrics[f"Inventory_Stage_{stage}_Count"], 1)
+            self.assertAlmostEqual(interface.last_crafter_metrics[f"Inventory_Stage_{stage}_Mean_LP"], 0.5)
+
+
+class CrafterGeneratorStageTokenTest(unittest.TestCase):
+    def test_stage_token_policy_starts_with_uniform_bias_prior(self):
+        from generator.generator_network import MapEditorActorCritic
+        model = MapEditorActorCritic(env_type="crafter", initial_inventory_edit_ratio=0.25)
+        bias = model.stats_actor[-1].bias.detach()
+        torch.testing.assert_close(bias, torch.zeros_like(bias))
+        probabilities = torch.softmax(bias, dim=-1)
+        torch.testing.assert_close(probabilities, torch.full_like(probabilities, 1.0 / 6.0))
+
+    def test_stage_token_policy_act_and_evaluate_agree(self):
+        from generator.generator_network import MapEditorActorCritic
+        torch.manual_seed(7)
+        model = MapEditorActorCritic(env_type="crafter", initial_inventory_edit_ratio=0.25)
+        maps = torch.zeros((3, 3, 4, 4))
+        context = torch.zeros((3, 64))
+        action, token, map_logp, location_logp, token_logp, _, topk, order, selected = model.act(
+            maps, context, torch.zeros((3, 1, 4, 4)), stats_heat=torch.zeros((3, 16))
+        )
+        self.assertEqual(tuple(token.shape), (3, 1))
+        self.assertTrue(torch.all((0 <= token) & (token <= 5)))
+        evaluated = model.evaluate(
+            maps, context, (action, token), torch.zeros((3, 1, 4, 4)),
+            target_topk_mask=topk, target_location_order=order,
+            target_stats_topk_mask=selected, stats_heat=torch.zeros((3, 16)),
+        )
+        self.assertTrue(torch.allclose(token_logp, evaluated[2]))
+
+    def test_stage_inventory_ranges_and_unlock_constraints(self):
+        from generator.generator_interface import GeneratorInterface
+        from types import SimpleNamespace
+
+        instance = object.__new__(GeneratorInterface)
+        instance.cfg = SimpleNamespace(seed=3)
+        GeneratorInterface._initialize_crafter_stage_inventory_rng(instance)
+        for stage in range(5):
+            items = np.stack([
+                GeneratorInterface._sample_crafter_stage_inventory(instance, stage)
+                for _ in range(32)
+            ])
+            self.assertEqual(items.shape, (32, 12))
+            self.assertTrue(np.all(items[:, :6] >= 0))
+            self.assertTrue(np.all(items[:, :6] <= 9))
+            self.assertTrue(np.all(items[:, 6:] >= 0))
+            self.assertTrue(np.all(items[:, 6:] <= 9))
+            if stage == 0:
+                np.testing.assert_array_equal(items, 0)
+            else:
+                unlocked_resources = {
+                    1: (0, 5), 2: (0, 1, 2, 5),
+                    3: (0, 1, 2, 3, 5), 4: (0, 1, 2, 3, 5),
+                }[stage]
+                locked_resources = sorted(set(range(6)) - set(unlocked_resources))
+                if locked_resources:
+                    np.testing.assert_array_equal(items[:, locked_resources], 0)
+                if stage == 1:
+                    self.assertTrue(np.all(items[:, 0] >= 1))
+            np.testing.assert_array_equal(items[:, 4], 0)
+            pickaxes = {2: (6,), 3: (6, 7), 4: (6, 7, 8)}.get(stage, ())
+            for index in pickaxes:
+                self.assertTrue(np.all((items[:, index] >= 1) & (items[:, index] <= 9)))
+            locked_pickaxes = sorted(set(range(6, 9)) - set(pickaxes))
+            np.testing.assert_array_equal(items[:, locked_pickaxes], 0)
+            swords = {1: (9,), 2: (9, 10), 3: (9, 10, 11), 4: (9, 10, 11)}.get(stage, ())
+            locked_swords = sorted(set(range(9, 12)) - set(swords))
+            np.testing.assert_array_equal(items[:, locked_swords], 0)
+            for index in swords:
+                self.assertTrue(np.all((items[:, index] >= 0) & (items[:, index] <= 9)))
+
+    def test_stage_inventory_sampling_is_seed_reproducible(self):
+        from generator.generator_interface import GeneratorInterface
+        from types import SimpleNamespace
+
+        def sample_sequence(seed):
+            instance = object.__new__(GeneratorInterface)
+            instance.cfg = SimpleNamespace(seed=seed)
+            GeneratorInterface._initialize_crafter_stage_inventory_rng(instance)
+            return np.stack([
+                GeneratorInterface._sample_crafter_stage_inventory(instance, stage)
+                for stage in (0, 1, 2, 3, 4, 4, 2)
+            ])
+
+        np.testing.assert_array_equal(sample_sequence(17), sample_sequence(17))
+        self.assertFalse(np.array_equal(sample_sequence(17), sample_sequence(18)))
+
+    def test_stage_materialization_preserves_survival(self):
+        from generator.generator_interface import GeneratorInterface
+        from types import SimpleNamespace
+
+        instance = object.__new__(GeneratorInterface)
+        instance.cfg = SimpleNamespace(seed=3)
+        GeneratorInterface._initialize_crafter_stage_inventory_rng(instance)
+        fake = SimpleNamespace(
+            is_crafter=True, is_minigrid=False,
+            _apply_action=lambda obj, action, mask: (obj, obj, obj),
+            _sample_crafter_stage_inventory=lambda stage: GeneratorInterface._sample_crafter_stage_inventory(instance, stage),
+        )
+        base = np.zeros((1, 16), dtype=np.float32)
+        base[0, :4] = [9, 8, 7, 6]
+        common = (np.zeros((1, 2, 2), dtype=np.int64), np.zeros((1, 2, 2), dtype=np.int64))
+        _, _, _, keep = GeneratorInterface._materialize_candidates(
+            fake, *common, np.array([[0]]), base, torch.zeros((1, 1, 2, 2))
+        )
+        _, _, _, changed = GeneratorInterface._materialize_candidates(
+            fake, *common, np.array([[4]]), base, torch.zeros((1, 1, 2, 2))
+        )
+        np.testing.assert_array_equal(keep[0], base[0])
+        np.testing.assert_array_equal(changed[0][:4], base[0][:4])
+        self.assertEqual(changed[0][4:16].shape, (12,))
+
+    def test_random_crafter_tokens_are_uniform_and_ignore_ratio(self):
+        from generator.random_generator_agent import RandomGeneratorAgent
+        random_agent = RandomGeneratorAgent(12, device="cpu", env_type="crafter")
+        tokens_by_ratio = []
+        for ratio in (0.0, 1.0):
+            torch.manual_seed(13)
+            result = random_agent.select_action(
+                torch.zeros((4096, 3, 3, 3)), None, torch.zeros((4096, 1, 3, 3)),
+                max_edits_layout=0.0, max_stats_edit_ratio=ratio,
+            )
+            token, selected = result[1], result[6]
+            self.assertEqual(tuple(token.shape), (4096, 1))
+            self.assertTrue(torch.all((0 <= token) & (token <= 5)))
+            counts = torch.bincount(token[:, 0], minlength=6)
+            self.assertTrue(torch.all(counts > 0))
+            self.assertTrue(torch.all(selected == token.ne(0)))
+            tokens_by_ratio.append(token)
+        torch.testing.assert_close(tokens_by_ratio[0], tokens_by_ratio[1])
+
+    def test_random_bipedal_stats_remain_32_zeroes(self):
+        from generator.random_generator_agent import RandomGeneratorAgent
+        result = RandomGeneratorAgent(10, device="cpu", env_type="bipedalwalker").select_action(
+            torch.zeros((4, 3, 3, 3)), None, torch.zeros((4, 1, 3, 3)), 0.0, 1.0
+        )
+        self.assertEqual(tuple(result[1].shape), (4, 32))
+        self.assertEqual(tuple(result[6].shape), (4, 32))
+        self.assertFalse(result[1].any())
+        self.assertFalse(result[6].any())
+
+    def test_old_32_key_crafter_action_is_rejected(self):
+        from types import SimpleNamespace
+        from generator.generator_interface import GeneratorInterface
+        fake = SimpleNamespace(is_crafter=True, is_minigrid=False, _apply_action=lambda obj, action, mask: (obj, obj, obj))
+        with self.assertRaisesRegex(ValueError, r"must have shape \(1, 1\)"):
+            GeneratorInterface._materialize_candidates(
+                fake, np.zeros((1, 2, 2), dtype=np.int64), np.zeros((1, 2, 2), dtype=np.int64),
+                np.zeros((1, 32), dtype=np.int64), np.zeros((1, 16), dtype=np.float32), torch.zeros((1, 1, 2, 2))
+            )
+
+    def test_crafter_fixed_budget_locations_replay_exactly(self):
+        from generator.generator_network import MapEditorActorCritic
+        torch.manual_seed(11)
+        model = MapEditorActorCritic(env_type="crafter")
+        maps, context = torch.zeros((1, 3, 4, 4)), torch.zeros((1, 64))
+        immutable = torch.zeros((1, 1, 4, 4)); immutable[:, :, 0, 0] = 1
+        action, token, map_logp, location_logp, token_logp, _, selected, order, stats_selected = model.act(maps, context, immutable, max_edits=0.25, stats_heat=torch.zeros((1, 16)))
+        self.assertEqual(int(selected.sum()), 4)
+        self.assertFalse(selected[0, 0, 0])
+        self.assertEqual(int(order.max()), 4)
+        self.assertEqual(len(torch.unique(order[selected])), 4)
+        self.assertTrue(torch.all(action[selected] != 0))
+        self.assertTrue(torch.all(action[torch.logical_not(selected)] == 0))
+        evaluated = model.evaluate(maps, context, (action, token), immutable, selected, order, stats_selected, torch.zeros((1, 16)))
+        self.assertTrue(torch.allclose(location_logp, evaluated[1]))
+        self.assertTrue(torch.allclose(map_logp.sum((1, 2)) + location_logp + token_logp, evaluated[0].sum((1, 2)) + evaluated[1] + evaluated[2]))
+
+    def test_random_crafter_uses_fixed_location_budget(self):
+        from generator.random_generator_agent import RandomGeneratorAgent
+        mask = torch.zeros((2, 1, 4, 4)); mask[:, :, 0, 0] = 1
+        result = RandomGeneratorAgent(12, device="cpu", env_type="crafter").select_action(torch.zeros((2, 3, 4, 4)), None, mask, max_edits_layout=0.25)
+        self.assertTrue(torch.equal(result[4].sum((1, 2)), torch.tensor([4, 4])))
+
+    def test_path_is_not_a_generator_action_and_multiple_objects_are_applied(self):
+        from types import SimpleNamespace
+        from generator.generator_interface import GeneratorInterface
+        from generator.crafter_env_designer import CRAFTER_OBJ_MAP
+        fake = SimpleNamespace(
+            is_crafter=True, is_bipedal=False, is_minigrid=False,
+            OBJ_START=CRAFTER_OBJ_MAP["agent"], OBJ_EMPTY=CRAFTER_OBJ_MAP["grass"],
+            ACTION_TABLE={1: CRAFTER_OBJ_MAP["diamond"], 2: CRAFTER_OBJ_MAP["table"],
+                          3: CRAFTER_OBJ_MAP["furnace"]},
+        )
+        self.assertNotIn(CRAFTER_OBJ_MAP["path"], fake.ACTION_TABLE.values())
+        action = np.array([[0, 1, 1, 2], [2, 3, 3, 4], [4, 0, 0, 0]], dtype=np.int64)
+        base = np.full((3, 4), CRAFTER_OBJ_MAP["grass"])
+        base[0, 0] = CRAFTER_OBJ_MAP["agent"]
+        obj, _, _ = GeneratorInterface._apply_action(fake, base, action)
+        self.assertEqual(int((obj == CRAFTER_OBJ_MAP["diamond"]).sum()), 2)
+        self.assertEqual(int((obj == CRAFTER_OBJ_MAP["table"]).sum()), 2)
+        self.assertEqual(int((obj == CRAFTER_OBJ_MAP["furnace"]).sum()), 2)
+        self.assertEqual(int((obj == CRAFTER_OBJ_MAP["path"]).sum()), 0)
+
+class CrafterTargetValidationIdentityTest(unittest.TestCase):
+    def test_rmax_uniform_metadata_aligns_isolated_validation_config(self):
+        import hashlib
+        import json
+        from unittest.mock import patch
+
+        from omegaconf import OmegaConf
+        from modelBased.common.artifacts import dataset_matches
+        from trainer.common.utils import validate_on_target_task
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout_path = root / "target.txt"
+            layout_path.write_text("AAAAAAAA\n", encoding="utf-8")
+            metadata = {
+                "domain": "crafter",
+                "task_name": "target",
+                "env_path": str(layout_path.resolve()),
+                "layout_path": str(layout_path.resolve()),
+                "layout_hash": hashlib.sha256(layout_path.read_bytes()).hexdigest(),
+                "reward_schema": "crafter_native_v1",
+                "inventory_encoding": "crafter_inventory_v1",
+                "episode_max_steps": 4096,
+                "collection_policy": "crafter_rmax_count_local5_inv12_v1",
+                "rmax_like": {
+                    "count_key_version": "local5_inv12_sa_v1",
+                    "mask_size": 5,
+                    "death_penalty": 5.0,
+                    "train_steps": 360000,
+                    "frozen_steps": 40000,
+                    "seed": 1,
+                },
+            }
+            dataset_path = root / "target_uniform.npz"
+            np.savez(dataset_path, metadata=np.array(json.dumps(metadata), dtype=object))
+            cfg = OmegaConf.create({
+                "domain": "crafter",
+                "attention_model": {
+                    "env_type": "crafter",
+                    "freeze_weight": False,
+                    "keep_cell_loss": False,
+                    "use_wandb": False,
+                    "target_validation_max_samples": 500,
+                    "target_validation_batch_size": 256,
+                    "target_validation_seed": 0,
+                },
+                "domains": {
+                    "crafter": {
+                        "task_name": "active",
+                        "layout_path": str(layout_path.resolve()),
+                    },
+                },
+                "env": {
+                    "env_path": str(layout_path.resolve()),
+                    "collect": {
+                        "data_type": "random",
+                        "replace_start_with_empty": False,
+                    },
+                },
+            })
+
+            def fake_train_api(validation_cfg, *args):
+                self.assertTrue(dataset_matches(dataset_path, validation_cfg))
+                self.assertEqual(validation_cfg.domains.crafter.data_collection.max_steps, 4096)
+                self.assertTrue(validation_cfg.rmax_like.enabled)
+                return {"avg_val_loss": {"avg_val_loss_wm": 1.0}}, None, object()
+
+            with patch(
+                "trainer.common.utils.AttentionWM_training.train_api",
+                side_effect=fake_train_api,
+            ):
+                result = validate_on_target_task(
+                    cfg, object(), None, str(root), dataset_path.name
+                )
+            self.assertEqual(result["avg_val_loss_wm"], 1.0)
+
 
 class TargetBaselineCsvSchemaTest(unittest.TestCase):
     def test_headered_schema_mismatch_is_backed_up_not_appended(self):

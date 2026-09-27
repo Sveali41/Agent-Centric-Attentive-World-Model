@@ -113,8 +113,13 @@ def _validate_event_residual(
     codebook = _checkpoint_value(residual, "codebook", None)
     if not hidden or any(value <= 0 for value in hidden) or action_dim <= 0 or not np.isfinite(bias):
         raise ValueError("Crafter event residual contract has invalid dimensions or change_bias")
-    if not isinstance(codebook, list) or len(codebook) != 17 or any(len(row) != 12 for row in codebook):
-        raise ValueError("Crafter event residual contract requires a [17,12] codebook")
+    event_count = len(CRAFTER_CANONICAL_EVENT_CODEBOOK)
+    if (not isinstance(codebook, list) or len(codebook) != event_count
+            or any(len(row) != 12 for row in codebook)):
+        raise ValueError(
+            "Crafter event residual contract requires a "
+            f"[{event_count},12] codebook"
+        )
     expected = torch.tensor(codebook, dtype=torch.long)
     if expected.tolist() != [list(row) for row in CRAFTER_CANONICAL_EVENT_CODEBOOK]:
         raise ValueError("Crafter event residual contract codebook is not canonical")
@@ -124,7 +129,7 @@ def _validate_event_residual(
     if _single_head_width(state, "crafter_inventory_event_action_embedding.weight") != 17:
         raise ValueError("Crafter event residual requires a 17-action embedding")
     final_weight = state.get("crafter_inventory_event_residual.%d.weight" % (2 * len(hidden)))
-    if final_weight is None or tuple(final_weight.shape) != (17, hidden[-1]):
+    if final_weight is None or tuple(final_weight.shape) != (event_count, hidden[-1]):
         raise ValueError("Crafter event residual final layer does not match contract")
     return True, hidden, action_dim, bias
 

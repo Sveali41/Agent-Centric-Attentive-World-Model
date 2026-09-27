@@ -154,7 +154,11 @@ class CrafterAchievementTracker:
 
         elif effective_name.startswith("make_") and effective_name in self.counts:
             item = effective_name.removeprefix("make_")
-            if after.get(item, 0.0) > before.get(item, 0.0):
+            from crafter import constants
+            uses = constants.make[item]["uses"]
+            if (after.get(item, 0.0) > before.get(item, 0.0)
+                    or (before.get(item, 0.0) >= 9
+                        and all(after[resource] < before[resource] for resource in uses))):
                 events.append(effective_name)
 
         elif effective_name.startswith("place_") and effective_name in _PLACE_IDS and effective_name in self.counts:
@@ -445,13 +449,18 @@ def native_reward_batch(
     event[:, 10] = do & (front == 18) & (next_inv[:, 1] > inv[:, 1] + 0.5)
 
     make_map = {
-        11: (15, 10), 12: (13, 11), 13: (11, 12),
-        14: (16, 13), 15: (14, 14), 16: (12, 15),
+        11: (15, 10, (4,)), 12: (13, 11, (4, 5)), 13: (11, 12, (4, 6, 7)),
+        14: (16, 13, (4,)), 15: (14, 14, (4, 5)), 16: (12, 15, (4, 6, 7)),
     }
-    for action_id, (achievement_index, inventory_index) in make_map.items():
+    for action_id, (achievement_index, inventory_index, resource_indices) in make_map.items():
+        saturated_craft = (inv[:, inventory_index] >= 9) & torch.stack([
+            next_inv[:, resource] < inv[:, resource] - 0.5
+            for resource in resource_indices
+        ]).all(dim=0)
         event[:, achievement_index] = (
             (effective_actions == action_id)
-            & (next_inv[:, inventory_index] > inv[:, inventory_index] + 0.5)
+            & ((next_inv[:, inventory_index] > inv[:, inventory_index] + 0.5)
+               | saturated_craft)
         )
 
     place_map = {7: 19, 8: 20, 9: 17, 10: 18}

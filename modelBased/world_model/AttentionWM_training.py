@@ -2,6 +2,7 @@ import os
 import shutil
 import sys
 import warnings
+from collections import OrderedDict
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -15,7 +16,7 @@ from modelBased.data.datamodule import WMRLDataModule, WMRLDataset, WMRLDataset
 from modelBased.common.artifacts import dataset_matches, align_world_model_artifact_path
 from modelBased.common.utils import PROJECT_ROOT, WORLD_MODEL_PATH, WM_RESULTS_PATH, get_env
 import hydra
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.loggers import CSVLogger
 from pytorch_lightning.loggers.wandb import WandbLogger
 import pytorch_lightning as pl
@@ -43,6 +44,8 @@ warnings.filterwarnings(
 # This allows using 100% data for validation without modifying the original library code.
 class ValidationDataModule(WMRLDataModule):
     def setup(self, stage=None):
+        if hasattr(self, "data_test"):
+            return
         if self.direct_data is not None:
             loaded = self.direct_data
         else:
@@ -106,6 +109,34 @@ class ValidationDataModule(WMRLDataModule):
             pin_memory=True,
             persistent_workers=False
         )
+
+
+_crafter_target_datamodules = OrderedDict()
+
+
+class CrafterTargetValidationSweep:
+    """Share prepared fixed targets across sweeps and one Trainer within a sweep."""
+
+    def __init__(self):
+        self.trainer = None
+
+    def datamodule(self, cfg):
+        path = Path(str(cfg.attention_model.data_dir)).expanduser().resolve()
+        stat = path.stat()
+        key = (
+            str(path), stat.st_size, stat.st_mtime_ns,
+            OmegaConf.to_yaml(cfg.attention_model, resolve=True),
+        )
+        cached = _crafter_target_datamodules.get(key)
+        if cached is not None:
+            _crafter_target_datamodules.move_to_end(key)
+            return cached
+        datamodule = ValidationDataModule(hparams=cfg.attention_model, data=None, replay_data=None)
+        datamodule.setup("validate")
+        _crafter_target_datamodules[key] = datamodule
+        if len(_crafter_target_datamodules) > 20:
+            _crafter_target_datamodules.popitem(last=False)
+        return datamodule
 
 @hydra.main(version_base=None, config_path="../config", config_name="config")
 def train(cfg: DictConfig):
@@ -174,6 +205,7 @@ def run(
     replay_data=None,
     direct_data=None,
     fit_ckpt_path=None,
+    validation_sweep=None,
 ):
     align_world_model_artifact_path(cfg)
     if net is None:
@@ -209,7 +241,11 @@ def run(
     
     if should_use_validation_mode:
         # Validation-only mode uses 100% of the data without a train/val split.
-        datamodule = ValidationDataModule(hparams=cfg.attention_model, data=direct_data, replay_data=None)
+        datamodule = (
+            validation_sweep.datamodule(cfg)
+            if validation_sweep is not None else
+            ValidationDataModule(hparams=cfg.attention_model, data=direct_data, replay_data=None)
+        )
     elif bool(getattr(cfg.attention_model, "continue_learning", False)):
         datamodule = WMRLDataModule(hparams=cfg.attention_model, data=direct_data, replay_data=replay_data)
     else:
@@ -318,18 +354,22 @@ def run(
             resume_epoch_offset = 0
     max_epochs = int(cfg.attention_model.n_epochs) + resume_epoch_offset
 
-    trainer = pl.Trainer(
-        precision=32,
-        logger=logger,
-        max_epochs=max_epochs,
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=1,
-        gradient_clip_val=1.0,
-        callbacks=[early_stop_callback, checkpoint_callback],
-        deterministic=False,
-        enable_progress_bar=show_progress_bar,
-        log_every_n_steps=int(getattr(cfg.attention_model, "log_every_n_steps", 10)),
-    )
+    trainer = validation_sweep.trainer if validation_sweep is not None else None
+    if trainer is None:
+        trainer = pl.Trainer(
+            precision=32,
+            logger=logger,
+            max_epochs=max_epochs,
+            accelerator="gpu" if torch.cuda.is_available() else "cpu",
+            devices=1,
+            gradient_clip_val=1.0,
+            callbacks=[early_stop_callback, checkpoint_callback],
+            deterministic=False,
+            enable_progress_bar=show_progress_bar,
+            log_every_n_steps=int(getattr(cfg.attention_model, "log_every_n_steps", 10)),
+        )
+        if validation_sweep is not None:
+            validation_sweep.trainer = trainer
 
 
     result = {
@@ -356,6 +396,8 @@ def run(
 
         result["mode"] = "val"
         result["avg_val_loss"] = avg_val_loss
+        if getattr(net, "crafter_event_confusion_result", None) is not None:
+            result["crafter_event_confusion"] = net.crafter_event_confusion_result
         return result
 
     else:
@@ -374,6 +416,13 @@ def run(
             # they contain the OmegaConf objects stored by Lightning.
             os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
         trainer.fit(net, datamodule, ckpt_path=resume_fit_path)
+        if str(cfg.attention_model.env_type) == "crafter":
+            training_dataset = datamodule.data_train
+            while isinstance(training_dataset, torch.utils.data.Subset):
+                training_dataset = training_dataset.dataset
+            result["replay_inventory_event_rows"] = getattr(
+                training_dataset, "replay_inventory_event_rows", []
+            )
 
         # Lightning leaves the module at the last epoch, while the desired
         # artifact is the best validation checkpoint. Load that checkpoint
@@ -482,6 +531,7 @@ def train_api(
     replay_data=None,
     direct_data=None,
     fit_ckpt_path=None,
+    validation_sweep=None,
 ):
     result = run(
         cfg,
@@ -492,6 +542,7 @@ def train_api(
         replay_data=replay_data,
         direct_data=direct_data,
         fit_ckpt_path=fit_ckpt_path,
+        validation_sweep=validation_sweep,
     )
 
     # Return the actual trained module.  Older curriculum code passed a
