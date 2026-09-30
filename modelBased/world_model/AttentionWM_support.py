@@ -38,7 +38,7 @@ class CustomTransformerEncoderLayer(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, src, src_mask=None, src_key_padding_mask=None):
+    def forward(self, src, src_mask=None, src_key_padding_mask=None, *, return_attention_weights=True):
         """
         :param src: input tensor with shape (B, seq_len, d_model)
         :return:
@@ -50,7 +50,7 @@ class CustomTransformerEncoderLayer(nn.Module):
             src, src, src,
             attn_mask=src_mask,
             key_padding_mask=src_key_padding_mask,
-            need_weights=True
+            need_weights=return_attention_weights
         )
         # Residual connection + LayerNorm.
         src = src + self.dropout1(attn_output)
@@ -826,7 +826,8 @@ class AttentionModule(nn.Module):
     def forward(self, state, action, info, inv=None, return_outcome=False,
                 return_distribution=False, next_state=None, next_inventory=None,
                 latent_labels=None,
-                sample_mode="sample", generator=None, return_pose=False):
+                sample_mode="sample", generator=None, return_pose=False,
+                return_attention_weights=True):
         orginal_dim = state.ndim
         if self.is_bipedal:
             if orginal_dim == 1:
@@ -848,7 +849,7 @@ class AttentionModule(nn.Module):
 
             attn_weights = None
             for layer in self.transformer_layers:
-                x, attn_weights = layer(x)
+                x, attn_weights = layer(x, return_attention_weights=return_attention_weights)
 
             x = self.res_mlp(x)
             x_out, contact_logits = self.decode_bipedal_tokens(x, state)
@@ -913,7 +914,7 @@ class AttentionModule(nn.Module):
         # ==== Transformer ====
         attn_weights = None
         for layer in self.transformer_layers:
-            x, attn_weights = layer(x)
+            x, attn_weights = layer(x, return_attention_weights=return_attention_weights)
 
         # ==== Residual MLP before FC ====
         x = self.res_mlp(x)  # shape: (B, N, D)

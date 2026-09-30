@@ -9,6 +9,7 @@ Imagined transitions are logged separately from ``env.step``.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import random
 import time
@@ -208,6 +209,13 @@ class WorldModelMPC:
             raise ValueError("PPO.mpc.minigrid_goal_guide_weight must be finite and nonnegative")
         self.reward_settings = reward_settings(ppo_config)
         self.fallback_action = int(config.fallback_action)
+        self.capture_action_hashes = bool(getattr(config, "capture_action_hashes", False))
+        self.return_attention_weights = not bool(
+            getattr(config, "minigrid_skip_attention_weights", False)
+        )
+        self.capture_profile_timing = bool(getattr(config, "profile_timing", False))
+        self.action_hashes: list[tuple[str, int, str]] = []
+        self._forward_decode_events = []
         self.execute_steps = int(getattr(config, "minigrid_execute_steps", self.horizon))
         if self.horizon < 1 or self.population < 1 or self.iterations < 1:
             raise ValueError("MPC horizon, population, and iterations must be positive")
@@ -274,9 +282,12 @@ class WorldModelMPC:
         predicted_inventories = torch.empty(
             (self.population, self.horizon), device=DEVICE, dtype=torch.long
         )
-        uncertainty_sum = 0.0
-        invalid_sum = 0
+        uncertainty_sum = torch.zeros((), device=DEVICE, dtype=torch.float64)
+        invalid_sum = torch.zeros((), device=DEVICE, dtype=torch.long)
         end_positions = utils.get_agent_position_torch(states)
+        current_positions = end_positions
+        row_indices = torch.arange(self.population, device=DEVICE)
+        deltas = torch.as_tensor(((0, 1), (1, 0), (0, -1), (-1, 0)), device=DEVICE)
         end_steps = torch.full(
             (self.population,), self.horizon - 1, device=DEVICE, dtype=torch.long
         )
@@ -285,16 +296,13 @@ class WorldModelMPC:
             actions = sequences[:, step]
             previous_states = states
             previous_inventories = inventories
-            before_positions = utils.get_agent_position_torch(previous_states)
+            before_positions = current_positions
             directions = previous_states[
-                torch.arange(self.population, device=DEVICE),
+                row_indices,
                 2,
                 before_positions[:, 0],
                 before_positions[:, 1],
             ].long()
-            deltas = torch.as_tensor(
-                ((0, 1), (1, 0), (0, -1), (-1, 0)), device=DEVICE
-            )
             front = before_positions + deltas[directions.clamp(0, 3)]
             height, width = previous_states.shape[-2:]
             valid_front = (
@@ -303,7 +311,7 @@ class WorldModelMPC:
                 & front[:, 1].ge(0) & front[:, 1].lt(width)
             )
             front_objects = previous_states[
-                torch.arange(self.population, device=DEVICE),
+                row_indices,
                 0,
                 front[:, 0].clamp(0, height - 1),
                 front[:, 1].clamp(0, width - 1),
@@ -311,10 +319,27 @@ class WorldModelMPC:
             lava_terminated = (
                 ~finished & actions.eq(2) & valid_front & front_objects.eq(9)
             )
+            if self.capture_profile_timing and DEVICE.type == "cuda":
+                forward_start = torch.cuda.Event(enable_timing=True)
+                forward_end = torch.cuda.Event(enable_timing=True)
+                forward_start.record()
+            else:
+                forward_started = time.perf_counter() if self.capture_profile_timing else 0.0
             states, inventories, transition = rollout_minigrid_wm(
-                self.model, states, actions, inventories, self.attention_mask_size
+                self.model, states, actions, inventories, self.attention_mask_size,
+                agent_positions=before_positions,
+                return_attention_weights=self.return_attention_weights,
             )
+            if self.capture_profile_timing:
+                if DEVICE.type == "cuda":
+                    forward_end.record()
+                    self._forward_decode_events.append((forward_start, forward_end))
+                else:
+                    self._forward_decode_seconds += time.perf_counter() - forward_started
             after_positions = transition["agent_positions_after"]
+            current_positions = after_positions
+            if use_legacy_dense:
+                end_positions = after_positions
             predicted_positions[:, step] = after_positions
             predicted_inventories[:, step] = inventories
             at_goal = (after_positions[:, 0] == goal_yx[0]) & (
@@ -362,8 +387,8 @@ class WorldModelMPC:
                 )
                 failure_terminal |= lava_terminated | new_truncation
                 finished |= new_goal | lava_terminated | new_truncation
-            uncertainty_sum += float(transition["uncertainty"].sum().item())
-            invalid_sum += int(invalid.sum().item())
+            uncertainty_sum += transition["uncertainty"].sum().to(torch.float64)
+            invalid_sum += invalid.sum()
 
         goal_guide_scores = torch.zeros_like(scores)
         if not use_legacy_dense:
@@ -392,8 +417,8 @@ class WorldModelMPC:
             scores = native_returns + failure_penalties + goal_guide_scores
         legacy_dense_returns = scores.clone() if use_legacy_dense else torch.zeros_like(scores)
         diagnostics = {
-            "mean_rollout_uncertainty": uncertainty_sum / (self.population * self.horizon),
-            "invalid_imagined_actions": invalid_sum,
+            "mean_rollout_uncertainty": float(uncertainty_sum.item()) / (self.population * self.horizon),
+            "invalid_imagined_actions": int(invalid_sum.item()),
             "imagined_transitions": self.population * self.horizon,
         }
         return (
@@ -425,8 +450,14 @@ class WorldModelMPC:
         total_imagined = 0
         total_invalid = 0
         uncertainty_values = []
-        for _ in range(self.iterations):
+        self.action_hashes = []
+        self._forward_decode_events = []
+        self._forward_decode_seconds = 0.0
+        for iteration in range(self.iterations):
             sequences = self._sample(probabilities)
+            if self.capture_action_hashes:
+                digest = hashlib.sha256(sequences.contiguous().cpu().numpy().tobytes()).hexdigest()
+                self.action_hashes.append(("candidate_sequences", iteration, digest))
             (
                 scores,
                 predicted_positions,
@@ -443,6 +474,10 @@ class WorldModelMPC:
             total_imagined += int(diagnostics["imagined_transitions"])
             total_invalid += int(diagnostics["invalid_imagined_actions"])
             uncertainty_values.append(float(diagnostics["mean_rollout_uncertainty"]))
+            if self.capture_action_hashes:
+                ranking = scores.argsort(descending=True).contiguous()
+                digest = hashlib.sha256(ranking.cpu().numpy().tobytes()).hexdigest()
+                self.action_hashes.append(("candidate_ranking", iteration, digest))
             best_index = int(scores.argmax().item())
             if best is None or scores[best_index] > best[0]:
                 best = (
@@ -473,6 +508,16 @@ class WorldModelMPC:
             failure_penalty,
             legacy_dense_return,
         ) = best
+        forward_decode_seconds = self._forward_decode_seconds
+        if self.capture_profile_timing and DEVICE.type == "cuda":
+            torch.cuda.synchronize()
+            forward_decode_seconds = sum(
+                start.elapsed_time(end) / 1000.0
+                for start, end in self._forward_decode_events
+            )
+        if self.capture_action_hashes:
+            digest = hashlib.sha256(actions.contiguous().cpu().numpy().tobytes()).hexdigest()
+            self.action_hashes.append(("selected_action_list", -1, digest))
         return MPCPlan(
             actions=[int(action) for action in actions.detach().cpu().tolist()],
             score=float(score.item()),
@@ -495,6 +540,7 @@ class WorldModelMPC:
                 "failure_penalty": float(failure_penalty.item()),
                 "legacy_dense_return": float(legacy_dense_return.item()),
                 "reward_mode": self.reward_mode,
+                "model_forward_decode_seconds": forward_decode_seconds,
             },
         )
 
@@ -1656,8 +1702,19 @@ def _minigrid_block_reason(
     return "block_continue"
 
 
-def run_online_mpc(cfg: DictConfig) -> list[dict]:
-    """Evaluate online MPC with bounded multi-step real-environment execution."""
+def _synchronize_for_timing(enabled: bool) -> None:
+    if enabled and DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def run_online_mpc(
+    cfg: DictConfig, loaded_model: tuple[torch.nn.Module, Path] | None = None
+) -> list[dict]:
+    """Evaluate online MPC with bounded multi-step real-environment execution.
+
+    Sweep workers may pass an already loaded, matching checkpoint to amortize
+    Python/model startup across target and horizon conditions.
+    """
     if str(cfg.domain).lower() == "crafter":
         return run_online_crafter_mpc(cfg)
     if bool(getattr(cfg.PPO, "train_in_real_env", False)):
@@ -1681,8 +1738,28 @@ def run_online_mpc(cfg: DictConfig) -> list[dict]:
             raise ValueError("PPO.mpc.cpu_threads must be positive")
         torch.set_num_threads(cpu_threads)
     _seed_everything(int(cfg.PPO.seed))
-    model, checkpoint = _load_world_model(cfg)
     mpc_cfg = cfg.PPO.mpc
+    profile_timing = bool(getattr(mpc_cfg, "profile_timing", False))
+    if loaded_model is None:
+        _synchronize_for_timing(profile_timing)
+        load_started = time.perf_counter()
+        model, checkpoint = _load_world_model(cfg)
+        _synchronize_for_timing(profile_timing)
+        model_load_seconds = time.perf_counter() - load_started if profile_timing else float("nan")
+    else:
+        model, checkpoint = loaded_model
+        configured_checkpoint = getattr(cfg.PPO, "checkpoint_path_wm", None)
+        if configured_checkpoint is not None and str(configured_checkpoint).strip().lower() not in {"", "null", "none"}:
+            configured_checkpoint = Path(str(configured_checkpoint)).expanduser().resolve()
+            if configured_checkpoint != Path(checkpoint).resolve():
+                raise ValueError(
+                    "Cached MiniGrid WM checkpoint does not match this sweep case: "
+                    f"{configured_checkpoint} != {checkpoint}"
+                )
+        model_load_seconds = 0.0 if profile_timing else float("nan")
+        model.eval()
+    if profile_timing and DEVICE.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
     planner = WorldModelMPC(model, cfg.attention_model.attention_mask_size, mpc_cfg, cfg.PPO)
     stop_on_prediction_mismatch = bool(
         getattr(mpc_cfg, "minigrid_stop_on_prediction_mismatch", False)
@@ -1699,6 +1776,10 @@ def run_online_mpc(cfg: DictConfig) -> list[dict]:
     all_traces = []
     total_environment_steps = 0
     step_path = output_dir / "wm_mpc_steps.csv"
+    hash_path = output_dir / "wm_mpc_action_hashes.csv"
+    timing_path = output_dir / "wm_mpc_timing.csv"
+    hash_rows = []
+    timing_rows = []
     block_path = output_dir / "wm_mpc_blocks.csv"
     block_fields = (
         "episode", "seed", "plan_id", "start_environment_step", "end_environment_step",
@@ -1754,6 +1835,11 @@ def run_online_mpc(cfg: DictConfig) -> list[dict]:
         pose_matches = []
         inventory_matches = []
         action_trace = []
+        episode_step_rows = []
+        episode_block_rows = []
+        episode_env_step_seconds = 0.0
+        episode_log_seconds = 0.0
+        episode_forward_decode_seconds = 0.0
         plan_id = 0
         replan_reason_counts = {}
 
@@ -1761,14 +1847,19 @@ def run_online_mpc(cfg: DictConfig) -> list[dict]:
             state_np = _state_from_observation(observation)
             inventory = carrying_token_from_env(env)
             goal_yx = _find_goal(state_np)
+            _synchronize_for_timing(profile_timing)
             started = time.perf_counter()
             plan = planner.plan(
                 torch.as_tensor(state_np, device=DEVICE), inventory, goal_yx,
                 reward_context, episode_step=len(action_trace),
                 max_episode_steps=max_steps,
             )
+            _synchronize_for_timing(profile_timing)
             planning_latency_seconds = time.perf_counter() - started
             planning_seconds += planning_latency_seconds
+            episode_forward_decode_seconds += float(
+                plan.diagnostics.get("model_forward_decode_seconds", 0.0)
+            )
             plan_calls += 1
             plan_start_y, plan_start_x = minigrid_utils.get_agent_position(state_np)
             plan_start_distance = float(
@@ -1783,6 +1874,13 @@ def run_online_mpc(cfg: DictConfig) -> list[dict]:
             plan_legacy_dense_returns.append(float(plan.diagnostics["legacy_dense_return"]))
             plan_scores.append(float(plan.score))
             plan_id += 1
+            if planner.capture_action_hashes:
+                for hash_kind, iteration, digest in planner.action_hashes:
+                    hash_rows.append({
+                        "episode": episode, "seed": int(cfg.PPO.seed) + episode,
+                        "plan_id": plan_id, "hash_kind": hash_kind,
+                        "cem_iteration": iteration, "sha256": digest,
+                    })
             actions = plan.actions[: planner.execute_steps]
             if not actions:
                 actions = [planner.fallback_action]
@@ -1795,9 +1893,12 @@ def run_online_mpc(cfg: DictConfig) -> list[dict]:
                     _state_from_observation(observation), device=DEVICE
                 )
                 previous_real_inventory = carrying_token_from_env(env)
+                step_started = time.perf_counter() if profile_timing else 0.0
                 observation, reward, terminated, truncated, _ = env.step(
                     compact_to_native(action)
                 )
+                if profile_timing:
+                    episode_env_step_seconds += time.perf_counter() - step_started
                 reward_sum += float(reward)
                 block_native_reward += float(reward)
                 total_environment_steps += 1
@@ -1829,6 +1930,7 @@ def run_online_mpc(cfg: DictConfig) -> list[dict]:
                     block_step=block_step, block_length=block_length,
                     stop_on_prediction_mismatch=stop_on_prediction_mismatch,
                 )
+                log_started = time.perf_counter() if profile_timing else 0.0
                 step_row = {
                     "episode": episode,
                     "seed": int(cfg.PPO.seed) + episode,
@@ -1868,10 +1970,7 @@ def run_online_mpc(cfg: DictConfig) -> list[dict]:
                     "truncated": bool(truncated),
                 }
                 action_trace.append(step_row)
-                with step_path.open("a", newline="", encoding="utf-8") as handle:
-                    writer = csv.DictWriter(handle, fieldnames=step_fields)
-                    writer.writerow(step_row)
-                    handle.flush()
+                episode_step_rows.append(step_row)
                 if total_environment_steps % print_every_steps == 0 or terminated or truncated:
                     dense_log = (
                         f"dense_diag={dense_reward_value:.3f} "
@@ -1889,6 +1988,8 @@ def run_online_mpc(cfg: DictConfig) -> list[dict]:
                         f"score={plan.score:.3f} "
                         f"reason={block_reason} latency={step_row['planning_latency_ms']:.1f}ms"
                     )
+                if profile_timing:
+                    episode_log_seconds += time.perf_counter() - log_started
                 if terminated or truncated or (
                     stop_on_prediction_mismatch and block_reason == "prediction_mismatch"
                 ):
@@ -1924,12 +2025,31 @@ def run_online_mpc(cfg: DictConfig) -> list[dict]:
                 "terminated": bool(terminated),
                 "truncated": bool(truncated),
             }
-            with block_path.open("a", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(handle, fieldnames=block_fields)
-                writer.writerow(block_row)
-                handle.flush()
+            episode_block_rows.append(block_row)
             replan_reason_counts[block_reason] = replan_reason_counts.get(block_reason, 0) + 1
 
+        log_started = time.perf_counter() if profile_timing else 0.0
+        with step_path.open("a", newline="", encoding="utf-8") as handle:
+            csv.DictWriter(handle, fieldnames=step_fields).writerows(episode_step_rows)
+        with block_path.open("a", newline="", encoding="utf-8") as handle:
+            csv.DictWriter(handle, fieldnames=block_fields).writerows(episode_block_rows)
+        if profile_timing:
+            episode_log_seconds += time.perf_counter() - log_started
+            timing_rows.append({
+                "episode": episode, "seed": int(cfg.PPO.seed) + episode,
+                "model_load_seconds": model_load_seconds,
+                "planning_seconds": planning_seconds,
+                "model_forward_decode_seconds": episode_forward_decode_seconds,
+                "other_planning_seconds": max(
+                    0.0, planning_seconds - episode_forward_decode_seconds
+                ),
+                "env_step_seconds": episode_env_step_seconds,
+                "logging_seconds": episode_log_seconds,
+                "plan_calls": plan_calls, "environment_steps": len(action_trace),
+                "cuda_peak_memory_bytes": (
+                    torch.cuda.max_memory_allocated() if DEVICE.type == "cuda" else 0
+                ),
+            })
         rows.append(
             {
                 "episode": episode,
@@ -1968,6 +2088,20 @@ def run_online_mpc(cfg: DictConfig) -> list[dict]:
         all_traces.append({"episode": episode, "actions": action_trace})
         env.close()
 
+    if planner.capture_action_hashes:
+        with hash_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle, fieldnames=(
+                    "episode", "seed", "plan_id", "hash_kind", "cem_iteration", "sha256"
+                )
+            )
+            writer.writeheader()
+            writer.writerows(hash_rows)
+    if profile_timing:
+        with timing_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(timing_rows[0]))
+            writer.writeheader()
+            writer.writerows(timing_rows)
     summary_path = output_dir / "wm_mpc_results.csv"
     with summary_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))

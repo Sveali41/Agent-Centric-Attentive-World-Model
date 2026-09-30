@@ -471,6 +471,10 @@ PPO:
     # MiniGrid planning score: native goal reward plus bounded net distance progress.
     minigrid_reward_mode: native_goal  # native_goal | legacy_dense
     minigrid_goal_guide_weight: 0.05
+    # Optional MiniGrid MPC audits and parity-gated inference acceleration.
+    capture_action_hashes: false
+    profile_timing: false
+    minigrid_skip_attention_weights: false
     population: 128
     elite_count: 16
     iterations: 3

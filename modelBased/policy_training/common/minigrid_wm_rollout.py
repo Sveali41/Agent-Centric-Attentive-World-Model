@@ -33,6 +33,7 @@ def rollout_minigrid_wm(
     *,
     agent_positions: torch.Tensor | None = None,
     collect_diagnostics: bool = True,
+    return_attention_weights: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     """Advance a batch of full MiniGrid states using only the learned WM.
 
@@ -62,18 +63,18 @@ def rollout_minigrid_wm(
     # The same domain-level switch that selected the latent-v2 WM also
     # selects stochastic imagined transitions.  Prior-only sampling is used
     # here because future states are unavailable during rollout.
+    attention_kwargs = {} if return_attention_weights else {"return_attention_weights": False}
     if bool(getattr(model, "stochastic_latent_v2_enabled", False)):
         distribution = model.forward_distribution(
-            masked,
-            actions,
-            None,
-            inv=inventory_tokens,
-            sample_mode="sample",
+            masked, actions, None, inv=inventory_tokens,
+            sample_mode="sample", **attention_kwargs,
         )
         prediction = distribution["state_logits"]
         inventory_logits = distribution["inventory_logits"]
     else:
-        prediction, _, inventory_logits = model(masked, actions, None, inv=inventory_tokens)
+        prediction, _, inventory_logits = model(
+            masked, actions, None, inv=inventory_tokens, **attention_kwargs,
+        )
     next_masked, next_inventory, decoder_diagnostics = decode_minigrid_transition(
         prediction,
         masked,

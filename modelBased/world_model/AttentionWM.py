@@ -913,8 +913,11 @@ class AttentionWorldModel(pl.LightningModule):
             x = x + self.model.pos_embedding               # add position encoding
         return x  # (B, N, embed_dim)
 
-    def forward(self, state, action, info, inv=None):
-        out = self.model(state, action, info, inv=inv)
+    def forward(self, state, action, info, inv=None, *, return_attention_weights=True):
+        out = self.model(
+            state, action, info, inv=inv,
+            return_attention_weights=return_attention_weights,
+        )
         if len(out) == 3:
             next_state_pred, attentionWeight, aux_pred = out
             return next_state_pred, attentionWeight, aux_pred
@@ -989,6 +992,7 @@ class AttentionWorldModel(pl.LightningModule):
     def forward_distribution(
         self, state, action, info=None, inv=None, next_state=None,
         next_inventory=None, latent_labels=None, sample_mode="sample", generator=None,
+        return_attention_weights=True,
     ):
         """One-step categorical latent distribution (v2).
 
@@ -1002,6 +1006,7 @@ class AttentionWorldModel(pl.LightningModule):
             next_state=next_state, next_inventory=next_inventory,
             latent_labels=latent_labels,
             sample_mode=sample_mode, generator=generator,
+            return_attention_weights=return_attention_weights,
         )
 
     @staticmethod

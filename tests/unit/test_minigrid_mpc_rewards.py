@@ -77,7 +77,11 @@ class MiniGridMPCRewardTest(unittest.TestCase):
         base = self.base_state.to(mpc_planner.DEVICE).clone()
         directions = ((0, 1), (1, 0), (0, -1), (-1, 0))
 
-        def rollout(_model, states, actions, inventories, _mask_size):
+        def rollout(
+            _model, states, actions, inventories, _mask_size,
+            *, agent_positions=None, return_attention_weights=True,
+        ):
+            assert agent_positions is not None
             next_states = []
             next_positions = []
             next_inventories = inventories.clone()
@@ -209,6 +213,25 @@ class MiniGridMPCRewardTest(unittest.TestCase):
         expected = -0.001 * (1.0 + planner.gamma)
         self.assertAlmostEqual(float(scores[0]), expected, places=7)
         self.assertAlmostEqual(float(scores[0]), float(legacy[0]), places=7)
+
+
+    def test_plan_captures_candidate_and_ranking_hashes_without_changing_plan(self):
+        planner = self._planner(horizon=1, population=2)
+        planner.capture_action_hashes = True
+        start = self._start()
+        context = self._distance_context(start)
+        with self._install_fixed_rollout():
+            plan = planner.plan(
+                start.to(mpc_planner.DEVICE), 0, (2, 3), context,
+                episode_step=0, max_episode_steps=100,
+            )
+        kinds = [kind for kind, _, _ in planner.action_hashes]
+        self.assertEqual(kinds, [
+            "candidate_sequences", "candidate_ranking", "selected_action_list"
+        ])
+        self.assertEqual([iteration for _, iteration, _ in planner.action_hashes], [0, 0, -1])
+        self.assertEqual(len(plan.actions), 1)
+        self.assertTrue(all(len(digest) == 64 for _, _, digest in planner.action_hashes))
 
     def test_time_limit_ends_native_rollout_without_distance_bonus(self):
         planner = self._planner(horizon=2, population=1)
