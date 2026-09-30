@@ -661,12 +661,15 @@ def crafter_inventory_effect_loss(
     predict_survival: bool = True,
     effect_reduction: str = "balanced_mean",
     keep_weight: float | None = None,
+    focal_gamma: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Loss for the unified five-way Crafter item-effect head.
 
     ``effect_reduction`` is explicit because it is a research choice.  The
     default retains the prior gate objective's KEEP-vs-any-change balancing;
     no prior correction or per-item weighting is implicit in this mode.
+    ``focal_gamma=0`` preserves ordinary normalized cross-entropy; positive
+    values modulate each survival/item effect before the configured reduction.
     """
     validate_discrete_inventory(current, "current")
     validate_discrete_inventory(following, "next")
@@ -680,7 +683,7 @@ def crafter_inventory_effect_loss(
         )
         survival_loss = balanced_categorical_effect_loss(
             prediction["survival_effect_logits"], survival_target,
-            reduction="balanced_mean",
+            reduction="balanced_mean", focal_gamma=focal_gamma,
         )
     else:
         survival_loss = prediction["survival_effect_logits"].sum() * 0.0
@@ -689,7 +692,7 @@ def crafter_inventory_effect_loss(
     )
     item_loss = balanced_categorical_effect_loss(
         prediction["item_effect_logits"], item_target, reduction=effect_reduction,
-        keep_weight=keep_weight,
+        keep_weight=keep_weight, focal_gamma=focal_gamma,
     )
     components = ([survival_loss] if predict_survival else []) + [item_loss]
     return torch.stack(components).mean(), {

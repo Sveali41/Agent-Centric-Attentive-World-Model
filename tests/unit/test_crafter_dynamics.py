@@ -277,6 +277,63 @@ class CrafterInventoryGateLossTest(unittest.TestCase):
         loss.backward()
         self.assertGreater(float(prediction["item_effect_logits"].grad.abs().sum()), 0.0)
 
+    def test_inventory_effect_focal_is_zero_compatible_and_wired_from_model(self):
+        current = torch.zeros((2, 16), dtype=torch.long)
+        following = current.clone()
+        following[1, 4] = 1
+        item_logits = torch.zeros((2, 5, 12))
+        item_logits[:, 0] = 4.0  # Easy KEEP predictions; the change stays difficult.
+        prediction = {
+            "survival_effect_logits": torch.zeros((2, 11, 4)),
+            "item_effect_logits": item_logits,
+        }
+        target = categorical_inventory_effect_target(
+            current[:, 4:], following[:, 4:]
+        )
+        expected_zero = balanced_categorical_effect_loss(
+            item_logits, target, reduction="sqrt_balanced", keep_weight=0.95,
+            focal_gamma=0.0,
+        )
+        expected_one = balanced_categorical_effect_loss(
+            item_logits, target, reduction="sqrt_balanced", keep_weight=0.95,
+            focal_gamma=1.0,
+        )
+        direct_zero, _ = crafter_inventory_effect_loss(
+            prediction, current, following, predict_survival=False,
+            effect_reduction="sqrt_balanced", keep_weight=0.95, focal_gamma=0.0,
+        )
+        direct_one, _ = crafter_inventory_effect_loss(
+            prediction, current, following, predict_survival=False,
+            effect_reduction="sqrt_balanced", keep_weight=0.95, focal_gamma=1.0,
+        )
+        torch.testing.assert_close(direct_zero, expected_zero)
+        torch.testing.assert_close(direct_one, expected_one)
+        self.assertNotAlmostEqual(float(direct_zero), float(direct_one), places=6)
+
+        model = AttentionWorldModel.__new__(AttentionWorldModel)
+        torch.nn.Module.__init__(model)
+        model.env_type = "crafter"
+        model.observation_schema = [{
+            "name": "inventory",
+            "distribution": "categorical_inventory_effect",
+            "prediction_source": "auxiliary",
+            "target_source": "inventory",
+            "target_mode": "categorical_effect",
+        }]
+        model.focal_gamma = 1.0
+        model.predict_survival = False
+        model.crafter_inventory_output_mode = "categorical_effect"
+        model.crafter_inventory_value_mode = "categorical_delta"
+        model.crafter_inventory_effect_reduction = "sqrt_balanced"
+        model.crafter_inventory_effect_keep_weight = 0.95
+        model.crafter_inventory_event_residual_enabled = False
+        actual, fields = model.observation_loss(
+            torch.zeros((2, 1)), torch.zeros((2, 1)),
+            aux_pred=prediction, inv=current, inv_next=following,
+        )
+        torch.testing.assert_close(actual, expected_one)
+        torch.testing.assert_close(fields["inventory"], expected_one)
+
     def test_effect_attention_module_has_104_inventory_outputs(self):
         module = AttentionModule(
             data_type="discrete", grid_shape=(2, 8, 8), mask_size=5,

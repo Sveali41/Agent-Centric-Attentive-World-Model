@@ -65,6 +65,23 @@ def _find_goal(state: np.ndarray) -> tuple[int, int]:
     return tuple(map(int, matches[0]))
 
 
+def _realized_goal_guide_bonus(
+    start_distance: float,
+    end_distance: float,
+    weight: float,
+    gamma: float,
+    executed_steps: int,
+    failed: bool,
+) -> float:
+    """Measure the planner's endpoint distance bonus on an executed action block."""
+    if failed or executed_steps < 1 or not np.isfinite(start_distance) or not np.isfinite(end_distance):
+        return 0.0
+    progress = np.clip(
+        (start_distance - end_distance) / max(1.0, start_distance), -1.0, 1.0
+    )
+    return float(weight * progress * (gamma ** (executed_steps - 1)))
+
+
 class DenseRewardContext:
     """Episode reward history shared by real steps and imagined candidates."""
 
@@ -163,7 +180,7 @@ class MPCPlan:
     score: float
     predicted_positions: list[tuple[int, int]]
     predicted_inventories: list[int] | list[list[float]]
-    diagnostics: dict[str, float | int]
+    diagnostics: dict[str, float | int | str]
 
 
 class WorldModelMPC:
@@ -177,9 +194,21 @@ class WorldModelMPC:
         self.elite_count = int(config.elite_count)
         self.iterations = int(config.iterations)
         self.gamma = float(config.gamma)
+        self.reward_mode = str(
+            getattr(config, "minigrid_reward_mode", "native_goal")
+        ).lower()
+        if self.reward_mode not in {"legacy_dense", "native_goal"}:
+            raise ValueError(
+                "PPO.mpc.minigrid_reward_mode must be 'legacy_dense' or 'native_goal'"
+            )
+        self.goal_guide_weight = float(
+            getattr(config, "minigrid_goal_guide_weight", 0.05)
+        )
+        if not np.isfinite(self.goal_guide_weight) or self.goal_guide_weight < 0:
+            raise ValueError("PPO.mpc.minigrid_goal_guide_weight must be finite and nonnegative")
         self.reward_settings = reward_settings(ppo_config)
         self.fallback_action = int(config.fallback_action)
-        self.execute_steps = int(getattr(config, "execute_steps", 8))
+        self.execute_steps = int(getattr(config, "minigrid_execute_steps", self.horizon))
         if self.horizon < 1 or self.population < 1 or self.iterations < 1:
             raise ValueError("MPC horizon, population, and iterations must be positive")
         if not 1 <= self.execute_steps <= self.horizon:
@@ -213,19 +242,32 @@ class WorldModelMPC:
         sequences: torch.Tensor,
         goal_yx: tuple[int, int],
         reward_context: DenseRewardContext,
+        episode_step: int,
+        max_episode_steps: int,
     ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         dict[str, float],
     ]:
+        if episode_step < 0 or max_episode_steps < 1:
+            raise ValueError("episode_step must be nonnegative and max_episode_steps positive")
         states = start_state.unsqueeze(0).expand(self.population, -1, -1, -1).clone()
         inventories = torch.full(
             (self.population,), int(start_inventory), device=DEVICE, dtype=torch.long
         )
         scores = torch.zeros(self.population, device=DEVICE)
+        native_returns = torch.zeros_like(scores)
+        failure_penalties = torch.zeros_like(scores)
         finished = torch.zeros(self.population, device=DEVICE, dtype=torch.bool)
-        imagined_reward = reward_context.for_population(self.population)
+        use_legacy_dense = self.reward_mode == "legacy_dense"
+        imagined_reward = (
+            reward_context.for_population(self.population) if use_legacy_dense else None
+        )
         predicted_positions = torch.empty(
             (self.population, self.horizon, 2), device=DEVICE, dtype=torch.long
         )
@@ -234,6 +276,11 @@ class WorldModelMPC:
         )
         uncertainty_sum = 0.0
         invalid_sum = 0
+        end_positions = utils.get_agent_position_torch(states)
+        end_steps = torch.full(
+            (self.population,), self.horizon - 1, device=DEVICE, dtype=torch.long
+        )
+        failure_terminal = torch.zeros(self.population, device=DEVICE, dtype=torch.bool)
         for step in range(self.horizon):
             actions = sequences[:, step]
             previous_states = states
@@ -274,23 +321,76 @@ class WorldModelMPC:
                 after_positions[:, 1] == goal_yx[1]
             )
             new_goal = at_goal & ~finished & ~lava_terminated
+            at_time_limit = episode_step + step + 1 >= max_episode_steps
+            new_truncation = (
+                (~finished & ~new_goal & ~lava_terminated) & at_time_limit
+                if not use_legacy_dense
+                else torch.zeros_like(finished)
+            )
             unchanged = states.eq(previous_states).flatten(1).all(dim=1) & inventories.eq(previous_inventories)
             invalid = unchanged & (actions >= 2)
             discount = self.gamma ** step
-            dense_reward = imagined_reward.step(
-                previous_states,
-                states,
-                actions,
-                previous_inventories,
-                inventories,
-                new_goal,
-                lava_terminated,
-                transition_valid=~finished,
-            )
-            scores += discount * torch.where(finished, 0.0, dense_reward)
-            finished |= new_goal | lava_terminated
+            if use_legacy_dense:
+                dense_reward = imagined_reward.step(
+                    previous_states,
+                    states,
+                    actions,
+                    previous_inventories,
+                    inventories,
+                    new_goal,
+                    lava_terminated,
+                    transition_valid=~finished,
+                )
+                scores += discount * torch.where(finished, 0.0, dense_reward)
+                finished |= new_goal | lava_terminated
+            else:
+                success_step = episode_step + step + 1
+                native_success_reward = 1.0 - 0.9 * (
+                    float(success_step) / float(max_episode_steps)
+                )
+                native_returns += discount * new_goal.float() * native_success_reward
+                lava_reward = float(self.reward_settings["lava_reward"])
+                failure_penalties += discount * lava_terminated.float() * lava_reward
+                active_position = (~finished) & ~lava_terminated & ~new_truncation
+                end_positions = torch.where(
+                    active_position.unsqueeze(-1), after_positions, end_positions
+                )
+                end_steps = torch.where(
+                    (new_goal | lava_terminated | new_truncation),
+                    torch.full_like(end_steps, step),
+                    end_steps,
+                )
+                failure_terminal |= lava_terminated | new_truncation
+                finished |= new_goal | lava_terminated | new_truncation
             uncertainty_sum += float(transition["uncertainty"].sum().item())
             invalid_sum += int(invalid.sum().item())
+
+        goal_guide_scores = torch.zeros_like(scores)
+        if not use_legacy_dense:
+            distance_map = reward_context.goal_distance_map
+            start_positions = utils.get_agent_position_torch(
+                start_state.unsqueeze(0)
+            ).expand(self.population, -1)
+            start_distances = distance_map[
+                start_positions[:, 0], start_positions[:, 1]
+            ]
+            end_distances = distance_map[end_positions[:, 0], end_positions[:, 1]]
+            finite_distances = torch.isfinite(start_distances) & torch.isfinite(end_distances)
+            normalized_progress = (
+                (start_distances - end_distances) / start_distances.clamp(min=1.0)
+            ).clamp(-1.0, 1.0)
+            guide_valid = finite_distances & ~failure_terminal
+            guide_discount = torch.pow(
+                torch.full_like(scores, self.gamma), end_steps.float()
+            )
+            goal_guide_scores = (
+                self.goal_guide_weight
+                * normalized_progress
+                * guide_discount
+                * guide_valid.float()
+            )
+            scores = native_returns + failure_penalties + goal_guide_scores
+        legacy_dense_returns = scores.clone() if use_legacy_dense else torch.zeros_like(scores)
         diagnostics = {
             "mean_rollout_uncertainty": uncertainty_sum / (self.population * self.horizon),
             "invalid_imagined_actions": invalid_sum,
@@ -300,6 +400,10 @@ class WorldModelMPC:
             scores,
             predicted_positions,
             predicted_inventories,
+            native_returns,
+            goal_guide_scores,
+            failure_penalties,
+            legacy_dense_returns,
             diagnostics,
         )
 
@@ -310,6 +414,8 @@ class WorldModelMPC:
         inventory_token: int,
         goal_yx: tuple[int, int],
         reward_context: DenseRewardContext,
+        episode_step: int,
+        max_episode_steps: int,
     ) -> MPCPlan:
         state = torch.as_tensor(state, dtype=torch.float32, device=DEVICE)
         if state.ndim != 3:
@@ -325,8 +431,15 @@ class WorldModelMPC:
                 scores,
                 predicted_positions,
                 predicted_inventories,
+                native_returns,
+                goal_guide_scores,
+                failure_penalties,
+                legacy_dense_returns,
                 diagnostics,
-            ) = self._evaluate(state, inventory_token, sequences, goal_yx, reward_context)
+            ) = self._evaluate(
+                state, inventory_token, sequences, goal_yx, reward_context,
+                episode_step, max_episode_steps,
+            )
             total_imagined += int(diagnostics["imagined_transitions"])
             total_invalid += int(diagnostics["invalid_imagined_actions"])
             uncertainty_values.append(float(diagnostics["mean_rollout_uncertainty"]))
@@ -337,6 +450,10 @@ class WorldModelMPC:
                     sequences[best_index].detach().clone(),
                     predicted_positions[best_index].detach().clone(),
                     predicted_inventories[best_index].detach().clone(),
+                    native_returns[best_index].detach().clone(),
+                    goal_guide_scores[best_index].detach().clone(),
+                    failure_penalties[best_index].detach().clone(),
+                    legacy_dense_returns[best_index].detach().clone(),
                 )
             elite_indices = scores.topk(self.elite_count).indices
             elite_actions = sequences[elite_indices]
@@ -351,6 +468,10 @@ class WorldModelMPC:
             actions,
             predicted_positions,
             predicted_inventories,
+            native_return,
+            goal_guide_score,
+            failure_penalty,
+            legacy_dense_return,
         ) = best
         return MPCPlan(
             actions=[int(action) for action in actions.detach().cpu().tolist()],
@@ -369,6 +490,11 @@ class WorldModelMPC:
                 "imagined_transitions": total_imagined,
                 "invalid_imagined_actions": total_invalid,
                 "mean_rollout_uncertainty": float(np.mean(uncertainty_values)),
+                "native_return": float(native_return.item()),
+                "goal_guide_score": float(goal_guide_score.item()),
+                "failure_penalty": float(failure_penalty.item()),
+                "legacy_dense_return": float(legacy_dense_return.item()),
+                "reward_mode": self.reward_mode,
             },
         )
 
@@ -1031,7 +1157,8 @@ class CrafterWorldModelMPC:
                 if prefix:
                     guided_prefixes.append((prefix, True))
         best = probabilities = None
-        imagined = invalid = 0
+        imagined = 0
+        invalid = torch.zeros((), device=DEVICE, dtype=torch.int64)
         for _ in range(self.iterations):
             if probabilities is None:
                 sequences = torch.randint(
@@ -1093,7 +1220,7 @@ class CrafterWorldModelMPC:
                 valid &= torch.isfinite(next_states).flatten(1).all(dim=1)
                 valid &= torch.isfinite(next_inv).all(dim=1)
                 active = ~done
-                invalid += int((active & ~valid).sum().item())
+                invalid += (active & ~valid).sum()
                 rollout_lengths += (active & valid).float()
                 predicted_death = active & valid & next_inv[:, 0].le(0.5)
                 if self.inventory_progress_weight > 0:
@@ -1232,7 +1359,7 @@ class CrafterWorldModelMPC:
             diagnostics={
                 "iterations": self.iterations, "population": self.population,
                 "horizon": self.horizon, "imagined_transitions": imagined,
-                "invalid_imagined_actions": invalid,
+                "invalid_imagined_actions": int(invalid.item()),
                 "exploration_score": float(exploration_score.item()),
                 "novel_cells": int(novel_cells.item()),
                 "tool_progress_score": float(tool_progress_score.item()),
@@ -1514,6 +1641,21 @@ def run_online_crafter_mpc(cfg: DictConfig) -> list[dict]:
     return rows
 
 
+def _minigrid_block_reason(
+    *, terminated: bool, truncated: bool, pose_match: bool, inventory_match: bool,
+    block_step: int, block_length: int, stop_on_prediction_mismatch: bool,
+) -> str:
+    if terminated:
+        return "terminated"
+    if truncated:
+        return "truncated"
+    if stop_on_prediction_mismatch and not (pose_match and inventory_match):
+        return "prediction_mismatch"
+    if block_step == block_length:
+        return "block_complete"
+    return "block_continue"
+
+
 def run_online_mpc(cfg: DictConfig) -> list[dict]:
     """Evaluate online MPC with bounded multi-step real-environment execution."""
     if str(cfg.domain).lower() == "crafter":
@@ -1523,8 +1665,16 @@ def run_online_mpc(cfg: DictConfig) -> list[dict]:
     mode = str(getattr(cfg.PPO, "wm_control_mode", "ppo")).lower()
     if mode != "mpc":
         raise ValueError(f"run_online_mpc requires PPO.wm_control_mode=mpc, got {mode!r}")
-    if not bool(getattr(cfg.PPO, "use_main_dense_reward", False)):
-        raise ValueError("MPC dense scoring requires PPO.use_main_dense_reward=true")
+    configured_reward_mode = str(
+        getattr(cfg.PPO.mpc, "minigrid_reward_mode", "native_goal")
+    ).lower()
+    if (
+        configured_reward_mode == "legacy_dense"
+        and not bool(getattr(cfg.PPO, "use_main_dense_reward", False))
+    ):
+        raise ValueError(
+            "legacy_dense MPC scoring requires PPO.use_main_dense_reward=true"
+        )
     if DEVICE.type == "cpu":
         cpu_threads = int(cfg.PPO.mpc.cpu_threads)
         if cpu_threads < 1:
@@ -1534,6 +1684,10 @@ def run_online_mpc(cfg: DictConfig) -> list[dict]:
     model, checkpoint = _load_world_model(cfg)
     mpc_cfg = cfg.PPO.mpc
     planner = WorldModelMPC(model, cfg.attention_model.attention_mask_size, mpc_cfg, cfg.PPO)
+    stop_on_prediction_mismatch = bool(
+        getattr(mpc_cfg, "minigrid_stop_on_prediction_mismatch", False)
+    )
+    dense_diagnostic_enabled = planner.reward_mode == "legacy_dense"
     episodes = int(mpc_cfg.episodes)
     max_steps = int(cfg.PPO.max_ep_len)
     output_dir = Path(str(mpc_cfg.output_dir)).expanduser().resolve()
@@ -1545,11 +1699,23 @@ def run_online_mpc(cfg: DictConfig) -> list[dict]:
     all_traces = []
     total_environment_steps = 0
     step_path = output_dir / "wm_mpc_steps.csv"
+    block_path = output_dir / "wm_mpc_blocks.csv"
+    block_fields = (
+        "episode", "seed", "plan_id", "start_environment_step", "end_environment_step",
+        "executed_steps", "native_reward", "realized_goal_guide_bonus",
+        "cumulative_real_reward", "cumulative_realized_goal_guide_bonus",
+        "cumulative_real_reward_plus_guide", "start_goal_distance", "end_goal_distance",
+        "terminated", "truncated",
+    )
+    with block_path.open("w", newline="", encoding="utf-8") as handle:
+        csv.DictWriter(handle, fieldnames=block_fields).writeheader()
     step_fields = (
         "episode", "seed", "environment_step", "total_environment_steps",
         "plan_id", "plan_step", "plan_execute_steps", "replan_reason",
         "action", "action_name", "real_reward", "cumulative_real_reward",
-        "dense_reward", "cumulative_dense_reward",
+        "dense_reward", "cumulative_dense_reward", "plan_reward_mode",
+        "plan_native_return", "plan_goal_guide_score", "plan_failure_penalty",
+        "plan_legacy_dense_return",
         "plan_score", "planning_latency_ms", "imagined_transitions_this_plan",
         "imagined_transitions_total", "wm_uncertainty", "pose_match",
         "inventory_match", "terminated", "truncated",
@@ -1575,7 +1741,13 @@ def run_online_mpc(cfg: DictConfig) -> list[dict]:
         )
         terminated = truncated = False
         reward_sum = 0.0
-        dense_reward_sum = 0.0
+        realized_goal_guide_return = 0.0
+        dense_reward_sum = 0.0 if dense_diagnostic_enabled else float("nan")
+        plan_native_returns = []
+        plan_goal_guide_scores = []
+        plan_failure_penalties = []
+        plan_legacy_dense_returns = []
+        plan_scores = []
         plan_calls = 0
         imagined_transitions = 0
         planning_seconds = 0.0
@@ -1592,12 +1764,24 @@ def run_online_mpc(cfg: DictConfig) -> list[dict]:
             started = time.perf_counter()
             plan = planner.plan(
                 torch.as_tensor(state_np, device=DEVICE), inventory, goal_yx,
-                reward_context,
+                reward_context, episode_step=len(action_trace),
+                max_episode_steps=max_steps,
             )
             planning_latency_seconds = time.perf_counter() - started
             planning_seconds += planning_latency_seconds
             plan_calls += 1
+            plan_start_y, plan_start_x = minigrid_utils.get_agent_position(state_np)
+            plan_start_distance = float(
+                reward_context.goal_distance_map[plan_start_y, plan_start_x].item()
+            )
+            block_start_environment_step = len(action_trace) + 1
+            block_native_reward = 0.0
             imagined_transitions += int(plan.diagnostics["imagined_transitions"])
+            plan_native_returns.append(float(plan.diagnostics["native_return"]))
+            plan_goal_guide_scores.append(float(plan.diagnostics["goal_guide_score"]))
+            plan_failure_penalties.append(float(plan.diagnostics["failure_penalty"]))
+            plan_legacy_dense_returns.append(float(plan.diagnostics["legacy_dense_return"]))
+            plan_scores.append(float(plan.score))
             plan_id += 1
             actions = plan.actions[: planner.execute_steps]
             if not actions:
@@ -1615,36 +1799,36 @@ def run_online_mpc(cfg: DictConfig) -> list[dict]:
                     compact_to_native(action)
                 )
                 reward_sum += float(reward)
+                block_native_reward += float(reward)
                 total_environment_steps += 1
                 real_next = _state_from_observation(observation)
                 real_position = minigrid_utils.get_agent_position(real_next)
                 real_inventory = carrying_token_from_env(env)
                 real_success = bool(terminated and reward > 0.0)
-                dense_reward = reward_context.step(
-                    previous_real_state.unsqueeze(0),
-                    torch.as_tensor(real_next, device=DEVICE).unsqueeze(0),
-                    torch.as_tensor([action], device=DEVICE),
-                    torch.as_tensor([previous_real_inventory], device=DEVICE),
-                    torch.as_tensor([real_inventory], device=DEVICE),
-                    torch.as_tensor([real_success], device=DEVICE),
-                    torch.as_tensor([terminated and not real_success], device=DEVICE),
-                )
-                dense_reward_value = float(dense_reward.item())
-                dense_reward_sum += dense_reward_value
+                if dense_diagnostic_enabled:
+                    dense_reward = reward_context.step(
+                        previous_real_state.unsqueeze(0),
+                        torch.as_tensor(real_next, device=DEVICE).unsqueeze(0),
+                        torch.as_tensor([action], device=DEVICE),
+                        torch.as_tensor([previous_real_inventory], device=DEVICE),
+                        torch.as_tensor([real_inventory], device=DEVICE),
+                        torch.as_tensor([real_success], device=DEVICE),
+                        torch.as_tensor([terminated and not real_success], device=DEVICE),
+                    )
+                    dense_reward_value = float(dense_reward.item())
+                    dense_reward_sum += dense_reward_value
+                else:
+                    dense_reward_value = float("nan")
                 pose_match = tuple(map(int, real_position)) == tuple(predicted_position)
                 inventory_match = predicted_inventory == real_inventory
                 pose_matches.append(pose_match)
                 inventory_matches.append(inventory_match)
-                if terminated:
-                    block_reason = "terminated"
-                elif truncated:
-                    block_reason = "truncated"
-                elif not (pose_match and inventory_match):
-                    block_reason = "prediction_mismatch"
-                elif block_step == block_length:
-                    block_reason = "block_complete"
-                else:
-                    block_reason = "block_continue"
+                block_reason = _minigrid_block_reason(
+                    terminated=terminated, truncated=truncated,
+                    pose_match=pose_match, inventory_match=inventory_match,
+                    block_step=block_step, block_length=block_length,
+                    stop_on_prediction_mismatch=stop_on_prediction_mismatch,
+                )
                 step_row = {
                     "episode": episode,
                     "seed": int(cfg.PPO.seed) + episode,
@@ -1660,6 +1844,19 @@ def run_online_mpc(cfg: DictConfig) -> list[dict]:
                     "cumulative_real_reward": reward_sum,
                     "dense_reward": dense_reward_value,
                     "cumulative_dense_reward": dense_reward_sum,
+                    "plan_reward_mode": planner.reward_mode,
+                    "plan_native_return": (
+                        float(plan.diagnostics["native_return"]) if block_step == 1 else 0.0
+                    ),
+                    "plan_goal_guide_score": (
+                        float(plan.diagnostics["goal_guide_score"]) if block_step == 1 else 0.0
+                    ),
+                    "plan_failure_penalty": (
+                        float(plan.diagnostics["failure_penalty"]) if block_step == 1 else 0.0
+                    ),
+                    "plan_legacy_dense_return": (
+                        float(plan.diagnostics["legacy_dense_return"]) if block_step == 1 else 0.0
+                    ),
                     "plan_score": plan.score,
                     "planning_latency_ms": 1000.0 * planning_latency_seconds if block_step == 1 else 0.0,
                     "imagined_transitions_this_plan": int(plan.diagnostics["imagined_transitions"]) if block_step == 1 else 0,
@@ -1676,16 +1873,61 @@ def run_online_mpc(cfg: DictConfig) -> list[dict]:
                     writer.writerow(step_row)
                     handle.flush()
                 if total_environment_steps % print_every_steps == 0 or terminated or truncated:
+                    dense_log = (
+                        f"dense_diag={dense_reward_value:.3f} "
+                        f"dense_diag_return={dense_reward_sum:.3f} "
+                        if dense_diagnostic_enabled else ""
+                    )
                     print(
                         f"[WM MPC][ep={episode} step={step_row['environment_step']} "
                         f"plan={plan_id}:{block_step}/{block_length} total_env={total_environment_steps}] "
                         f"action={step_row['action_name']} native_reward={float(reward):.3f} "
-                        f"dense_reward={dense_reward_value:.3f} dense_return={dense_reward_sum:.3f} "
+                        f"{dense_log}"
+                        f"imagined_native={plan.diagnostics['native_return']:.3f} "
+                        f"goal_guide={plan.diagnostics['goal_guide_score']:.3f} "
+                        f"failure_penalty={plan.diagnostics['failure_penalty']:.3f} "
                         f"score={plan.score:.3f} "
                         f"reason={block_reason} latency={step_row['planning_latency_ms']:.1f}ms"
                     )
-                if terminated or truncated or block_reason == "prediction_mismatch":
+                if terminated or truncated or (
+                    stop_on_prediction_mismatch and block_reason == "prediction_mismatch"
+                ):
                     break
+            end_state_np = _state_from_observation(observation)
+            end_y, end_x = minigrid_utils.get_agent_position(end_state_np)
+            end_distance = float(reward_context.goal_distance_map[end_y, end_x].item())
+            block_executed_steps = len(action_trace) - block_start_environment_step + 1
+            failed = bool(truncated or (terminated and not (reward > 0.0)))
+            realized_guide_bonus = _realized_goal_guide_bonus(
+                plan_start_distance,
+                end_distance,
+                planner.goal_guide_weight,
+                planner.gamma,
+                block_executed_steps,
+                failed,
+            )
+            realized_goal_guide_return += realized_guide_bonus
+            block_row = {
+                "episode": episode,
+                "seed": int(cfg.PPO.seed) + episode,
+                "plan_id": plan_id,
+                "start_environment_step": block_start_environment_step,
+                "end_environment_step": len(action_trace),
+                "executed_steps": block_executed_steps,
+                "native_reward": block_native_reward,
+                "realized_goal_guide_bonus": realized_guide_bonus,
+                "cumulative_real_reward": reward_sum,
+                "cumulative_realized_goal_guide_bonus": realized_goal_guide_return,
+                "cumulative_real_reward_plus_guide": reward_sum + realized_goal_guide_return,
+                "start_goal_distance": plan_start_distance,
+                "end_goal_distance": end_distance,
+                "terminated": bool(terminated),
+                "truncated": bool(truncated),
+            }
+            with block_path.open("a", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=block_fields)
+                writer.writerow(block_row)
+                handle.flush()
             replan_reason_counts[block_reason] = replan_reason_counts.get(block_reason, 0) + 1
 
         rows.append(
@@ -1695,7 +1937,24 @@ def run_online_mpc(cfg: DictConfig) -> list[dict]:
                 "success": bool(terminated and reward_sum > 0.0),
                 "environment_steps": len(action_trace),
                 "real_reward": reward_sum,
+                "realized_goal_guide_return": realized_goal_guide_return,
+                "real_reward_plus_realized_goal_guide": reward_sum + realized_goal_guide_return,
                 "dense_return": dense_reward_sum,
+                "reward_mode": planner.reward_mode,
+                "mean_plan_score": float(np.mean(plan_scores)) if plan_scores else 0.0,
+                "mean_plan_native_return": (
+                    float(np.mean(plan_native_returns)) if plan_native_returns else 0.0
+                ),
+                "mean_plan_goal_guide_score": (
+                    float(np.mean(plan_goal_guide_scores)) if plan_goal_guide_scores else 0.0
+                ),
+                "mean_plan_failure_penalty": (
+                    float(np.mean(plan_failure_penalties)) if plan_failure_penalties else 0.0
+                ),
+                "mean_plan_legacy_dense_return": (
+                    float(np.mean(plan_legacy_dense_returns))
+                    if plan_legacy_dense_returns else 0.0
+                ),
                 "plan_calls": plan_calls,
                 "early_replans": replan_reason_counts.get("prediction_mismatch", 0),
                 "mean_executed_steps_per_plan": len(action_trace) / max(plan_calls, 1),
@@ -1716,14 +1975,18 @@ def run_online_mpc(cfg: DictConfig) -> list[dict]:
         writer.writerows(rows)
     with (output_dir / "wm_mpc_traces.json").open("w", encoding="utf-8") as handle:
         json.dump(all_traces, handle, indent=2)
+    dense_summary = (
+        f"; mean_legacy_dense_diagnostic={np.mean([row['dense_return'] for row in rows]):.3f}"
+        if dense_diagnostic_enabled else ""
+    )
     print(
         f"[WM MPC] success={np.mean([row['success'] for row in rows]):.1%}; "
-        f"environment_steps={sum(row['environment_steps'] for row in rows)}; "
-        f"mean_dense_return={np.mean([row['dense_return'] for row in rows]):.3f}; "
-        f"imagined_transitions={sum(row['imagined_transitions'] for row in rows)}"
+        f"environment_steps={sum(row['environment_steps'] for row in rows)}"
+        f"{dense_summary}; imagined_transitions={sum(row['imagined_transitions'] for row in rows)}"
     )
     print(f"[WM MPC] results={summary_path}")
     print(f"[WM MPC] step curve={step_path}")
+    print(f"[WM MPC] realized reward blocks={block_path}")
     return rows
 
 

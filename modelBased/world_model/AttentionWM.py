@@ -1198,6 +1198,7 @@ class AttentionWorldModel(pl.LightningModule):
                     keep_weight=getattr(
                         self, "crafter_inventory_effect_keep_weight", None
                     ),
+                    focal_gamma=self.focal_gamma if focal_gamma is None else float(focal_gamma),
                 )
                 if self.crafter_inventory_event_residual_enabled:
                     residual_loss, _ = crafter_inventory_event_residual_loss(

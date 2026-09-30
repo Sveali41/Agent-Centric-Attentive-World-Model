@@ -462,8 +462,15 @@ PPO:
     horizon: 16
     cpu_threads: 4
     # Number of actions executed in the real environment before replanning.
-    # A mismatch with the WM prediction ends the block early and replans.
     execute_steps: 8
+    # MiniGrid executes a full planned horizon by default; override for ablations.
+    minigrid_execute_steps: ${PPO.mpc.horizon}
+    # MiniGrid only: when false, execute the full action block even if the
+    # observed state differs from the WM rollout. Mismatch fields remain logs.
+    minigrid_stop_on_prediction_mismatch: false
+    # MiniGrid planning score: native goal reward plus bounded net distance progress.
+    minigrid_reward_mode: native_goal  # native_goal | legacy_dense
+    minigrid_goal_guide_weight: 0.05
     population: 128
     elite_count: 16
     iterations: 3
@@ -489,7 +496,7 @@ PPO:
     crafter_checkpoint_path: ${oc.env:MODEL_FPATH}/AttentionWM/dr_attention_world_model_crafter_none_seed0_last.ckpt
     # Null keeps the bias stored in the Crafter WM checkpoint.
     crafter_inventory_change_bias: null
-    output_dir: ${paths.planning}/mpc/${domains.minigrid.task_name}_seed${PPO.seed}_dense_exec${PPO.mpc.execute_steps}
+    output_dir: ${paths.planning}/mpc/${domains.minigrid.task_name}_seed${PPO.seed}_${PPO.mpc.minigrid_reward_mode}_exec${PPO.mpc.minigrid_execute_steps}
     crafter_output_dir: ${paths.planning}/mpc/crafter_${domains.crafter.task_name}_seed${PPO.seed}_native_exec${PPO.mpc.execute_steps}
   mcts:
     simulations: 64
