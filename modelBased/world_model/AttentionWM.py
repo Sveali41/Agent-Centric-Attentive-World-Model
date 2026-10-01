@@ -45,6 +45,26 @@ from . import AttentionWM_support
 def crafter_selection_loss(object_nll, direction_nll, slot_gate_nll, changed_value_nll):
     """Fixed non-target checkpoint-selection objective."""
     return torch.stack((object_nll, direction_nll, slot_gate_nll, changed_value_nll)).mean()
+
+
+def binary_focal_loss_with_logits(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    gamma: float = 0.0,
+) -> torch.Tensor:
+    """Normalized binary focal loss without a class-balancing weight."""
+    gamma = float(gamma)
+    if not math.isfinite(gamma) or gamma < 0.0:
+        raise ValueError(f"focal gamma must be finite and non-negative, got {gamma!r}")
+    target = target.to(dtype=logits.dtype)
+    per_element = F.binary_cross_entropy_with_logits(
+        logits, target, reduction="none"
+    )
+    if gamma > 0.0:
+        p_true = torch.exp(-per_element)
+        per_element = per_element * (1.0 - p_true).pow(gamma)
+    return per_element.mean() / math.log(2.0)
 from . import Embedding_support
 from . import MLP_support
 import pandas as pd
@@ -121,6 +141,7 @@ class AttentionWorldModel(pl.LightningModule):
         self._val_crafter_changed_count = None
         self._val_crafter_focal_diagnostics = None
         self._val_crafter_inventory_diagnostics = None
+        self._val_bipedal_contact_diagnostics = []
 
         self.fisher = 0
         self.old_params = None
@@ -1152,6 +1173,31 @@ class AttentionWorldModel(pl.LightningModule):
                 fields[name] = F.binary_cross_entropy_with_logits(
                     prediction, target.clamp(0.0, 1.0)
                 ) / math.log(2.0)
+            elif distribution == "bernoulli_effect":
+                if target_source != "observation" or target_mode != "current_plus_delta":
+                    raise ValueError(
+                        f"Bipedal contact-effect field '{name}' requires "
+                        "target_mode='current_plus_delta'"
+                    )
+                if obs_prev is None:
+                    raise ValueError(
+                        f"Bipedal contact-effect field '{name}' requires current state"
+                    )
+                if "target_index" in spec:
+                    indices = [int(spec["target_index"])]
+                else:
+                    indices = list(map(int, spec["indices"]))
+                current_contact = obs_prev[:, indices].gt(0.5)
+                next_contact = target.gt(0.5)
+                changed_target = next_contact.ne(current_contact).to(prediction.dtype)
+                fields[name] = binary_focal_loss_with_logits(
+                    prediction,
+                    changed_target,
+                    gamma=float(
+                        focal_gamma if focal_gamma is not None
+                        else spec.get("focal_gamma", self.focal_gamma)
+                    ),
+                )
             elif distribution == "categorical_effect":
                 if target_source == "inventory":
                     if inv is None:
@@ -1810,8 +1856,17 @@ class AttentionWorldModel(pl.LightningModule):
                     float(field_losses[token_name].detach().cpu())
                 )
                 if token_name in getattr(self.model, "contact_token_names", set()):
-                    target = (obs[:, token_indices] + obs_next[:, token_indices]).clamp(0.0, 1.0)
                     logits = aux_pred["contact_logits"][token_name]
+                    contact_spec = next(
+                        spec for spec in self.observation_schema
+                        if str(spec.get("name")) == token_name
+                    )
+                    if str(contact_spec.get("distribution")) == "bernoulli_effect":
+                        target = obs_next[:, token_indices].ne(0.0).float()
+                    else:
+                        target = (
+                            obs[:, token_indices] + obs_next[:, token_indices]
+                        ).clamp(0.0, 1.0)
                     accuracy = ((torch.sigmoid(logits) >= 0.5).float() == target).float().mean()
                     self.train_token_acc_accumulator[token_name].append(float(accuracy.detach().cpu()))
 
@@ -2108,6 +2163,22 @@ class AttentionWorldModel(pl.LightningModule):
         self._val_field_outputs.append({
             name: value.detach() for name, value in natural_field_values.items()
         })
+        if self.env_type == "bipedalwalker" and isinstance(inv_pred, dict):
+            with torch.no_grad():
+                for spec in self.observation_schema:
+                    if str(spec.get("prediction_source", "")) != "contact_logits":
+                        continue
+                    name = str(spec["name"])
+                    indices = list(map(int, spec.get("indices", [spec.get("target_index")])) )
+                    current_contact = obs[:, indices].gt(0.5)
+                    next_contact = (obs[:, indices] + obs_next[:, indices]).gt(0.5)
+                    self._val_bipedal_contact_diagnostics.append({
+                        "name": name,
+                        "is_effect": str(spec.get("distribution")) == "bernoulli_effect",
+                        "current": current_contact.detach(),
+                        "next": next_contact.detach(),
+                        "logits": inv_pred["contact_logits"][name].detach(),
+                    })
         if self.env_type == "minigrid":
             with torch.no_grad():
                 # The spatial/inventory heads represent the execute branch;
@@ -2226,6 +2297,7 @@ class AttentionWorldModel(pl.LightningModule):
         self._val_crafter_changed_count = None
         self._val_crafter_focal_diagnostics = None
         self._val_crafter_inventory_diagnostics = None
+        self._val_bipedal_contact_diagnostics = []
         self._val_crafter_event_confusion = (
             {"sample_count": 0, "true_keep_count": 0, "true_keep_false_positive": 0,
              "unknown_event_count": 0, "slot_true_positive": 0,
@@ -2297,6 +2369,61 @@ class AttentionWorldModel(pl.LightningModule):
                     f"val/{name}",
                     torch.stack([row[name] for row in self._val_minigrid_diagnostics]).mean(),
                 )
+        if self._val_bipedal_contact_diagnostics:
+            contact_names = sorted({
+                row["name"] for row in self._val_bipedal_contact_diagnostics
+            })
+            for name in contact_names:
+                rows = [
+                    row for row in self._val_bipedal_contact_diagnostics
+                    if row["name"] == name
+                ]
+                current = torch.cat([row["current"] for row in rows], dim=0).float()
+                next_state = torch.cat([row["next"] for row in rows], dim=0).float()
+                logits = torch.cat([row["logits"] for row in rows], dim=0)
+                p_output = torch.sigmoid(logits)
+                if rows[0]["is_effect"]:
+                    p_change = p_output
+                    p_next = torch.where(current.bool(), 1.0 - p_change, p_change)
+                else:
+                    p_next = p_output
+                    p_change = torch.where(current.bool(), 1.0 - p_next, p_next)
+                changed = next_state.ne(current)
+                predicted_next = p_next.ge(0.5)
+                predicted_change = predicted_next.ne(current.bool())
+                self.log(
+                    f"val/{name}_next_contact_bce",
+                    F.binary_cross_entropy(p_next.clamp(1e-7, 1.0 - 1e-7), next_state)
+                    / math.log(2.0),
+                )
+                self.log(
+                    f"val/{name}_next_contact_accuracy",
+                    predicted_next.eq(next_state.bool()).float().mean(),
+                )
+                focal_per_contact = F.binary_cross_entropy(
+                    p_change.clamp(1e-7, 1.0 - 1e-7), changed.float(),
+                    reduction="none",
+                )
+                p_true = torch.exp(-focal_per_contact)
+                changed_focal = (
+                    focal_per_contact * (1.0 - p_true)
+                )[changed].mean() / math.log(2.0) if changed.any() else logits.new_tensor(float("nan"))
+                true_positive = (predicted_change & changed).sum().float()
+                false_positive = (predicted_change & ~changed).sum().float()
+                self.log(f"val/{name}_switch_focal_loss", changed_focal)
+                self.log(
+                    f"val/{name}_switch_recall",
+                    true_positive / changed.sum().clamp_min(1),
+                )
+                self.log(
+                    f"val/{name}_switch_precision",
+                    true_positive / predicted_change.sum().clamp_min(1),
+                )
+                self.log(
+                    f"val/{name}_keep_false_switch_rate",
+                    false_positive / (~changed).sum().clamp_min(1),
+                )
+                self.log(f"val/{name}_switch_count", changed.sum().float())
         if self._val_minigrid_effect_diagnostics:
             for name in ("changed_focal_loss", "false_set_rate", "changed_count"):
                 self.log(

@@ -272,16 +272,17 @@ domains:
     sb3_deterministic: false
     wm_data_type: norm
     use_bipedal_attention: true
+    focal_gamma: 1.0
     transition_balanced_sampling: false
     observation_schema:
       - {name: hull_pose, distribution: mse, indices: [0, 1]}
       - {name: hull_vel, distribution: mse, indices: [2, 3]}
       - {name: leg1_hip, distribution: mse, indices: [4, 5]}
       - {name: leg1_knee, distribution: mse, indices: [6, 7]}
-      - {name: leg1_contact, distribution: bernoulli, indices: [8], prediction_source: contact_logits, target_mode: current_plus_delta}
+      - {name: leg1_contact, distribution: bernoulli_effect, indices: [8], prediction_source: contact_logits, target_mode: current_plus_delta}
       - {name: leg2_hip, distribution: mse, indices: [9, 10]}
       - {name: leg2_knee, distribution: mse, indices: [11, 12]}
-      - {name: leg2_contact, distribution: bernoulli, indices: [13], prediction_source: contact_logits, target_mode: current_plus_delta}
+      - {name: leg2_contact, distribution: bernoulli_effect, indices: [13], prediction_source: contact_logits, target_mode: current_plus_delta}
       - {name: lidar_near, distribution: mse, indices: [14, 15, 16, 17, 18]}
       - {name: lidar_far, distribution: mse, indices: [19, 20, 21, 22, 23]}
 
@@ -371,6 +372,7 @@ attention_model:
   obs_norm_values: ${domains.${domain}.obs_norm_values}
   action_norm_values: ${domains.${domain}.action_norm_values}
   minigrid_transition_mode: ${oc.select:domains.${domain}.minigrid_transition_mode,absolute}
+  focal_gamma: ${oc.select:domains.${domain}.focal_gamma,0.0}
   observation_schema: ${domains.${domain}.observation_schema}
   # Balance generic (action, state-changed) buckets. This teaches rare valid
   # interactions without encoding pickup/drop/toggle rules in the collector.
