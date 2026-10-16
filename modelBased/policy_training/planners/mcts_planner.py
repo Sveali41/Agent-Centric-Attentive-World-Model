@@ -314,7 +314,11 @@ def run_online_mcts(cfg: DictConfig) -> list[dict]:
         csv.DictWriter(handle, fieldnames=step_fields).writeheader()
     rows, traces, total_environment_steps = [], [], 0
     for episode in range(int(tree_cfg.episodes)):
-        env = FullyObsWrapper(CustomMiniGridEnv(txt_file_path=str(cfg.PPO.env_path), custom_mission="Reach the goal.", max_steps=int(cfg.PPO.max_ep_len), render_mode=None))
+        env = FullyObsWrapper(CustomMiniGridEnv(
+            txt_file_path=str(cfg.PPO.env_path), custom_mission="Reach the goal.",
+            max_steps=int(cfg.PPO.max_ep_len), render_mode=None,
+            **minigrid_utils.stochastic_env_kwargs(cfg),
+        ))
         observation, _ = env.reset(seed=int(cfg.PPO.seed) + episode)
         terminated = truncated = False
         reward_sum = planning_seconds = 0.0

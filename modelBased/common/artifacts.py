@@ -347,12 +347,21 @@ def identity_from_config(cfg: Any, domain: str | None = None) -> dict[str, Any]:
         # declare one; otherwise deterministic archives become spuriously
         # incompatible with the deterministic config.
         if stochastic_cfg is not None:
+            if hasattr(stochastic_cfg, "move_failure_prob"):
+                raise ValueError(
+                    "domains.minigrid.stochastic.move_failure_prob was removed; "
+                    "use domains.minigrid.stochastic.action_failure_prob."
+                )
             identity["stochastic"] = {
                 "enabled": bool(getattr(stochastic_cfg, "enabled", False)),
-                "move_failure_prob": float(
-                    getattr(stochastic_cfg, "move_failure_prob", 0.2)
-                ),
             }
+            if identity["stochastic"]["enabled"]:
+                identity["stochastic"].update({
+                    "kernel": "all_actions_noop_v1",
+                    "action_failure_prob": float(
+                        getattr(stochastic_cfg, "action_failure_prob", 0.2)
+                    ),
+                })
         collect_cfg = getattr(getattr(cfg, "env", None), "collect", None)
         identity["collection_replace_start_with_empty"] = bool(
             getattr(collect_cfg, "replace_start_with_empty", False)
@@ -484,6 +493,19 @@ def dataset_matches(path: str | Path, cfg: Any, domain: str | None = None) -> bo
     """Return whether a saved dataset matches the active experiment config."""
     metadata = dataset_metadata(path)
     identity = identity_from_config(cfg, domain)
+    if identity["domain"] == "minigrid" and isinstance(metadata, dict):
+        expected_stochastic = identity.get("stochastic", {})
+        recorded_stochastic = metadata.get("stochastic", {})
+        if not isinstance(recorded_stochastic, dict):
+            return False
+        if expected_stochastic.get("enabled", False) or recorded_stochastic.get("enabled", False):
+            # Active stochastic kernels must never use the legacy missing-provenance allowance.
+            if recorded_stochastic != expected_stochastic:
+                return False
+        else:
+            # Failure probability and kernel do not affect deterministic data.
+            metadata = {key: value for key, value in metadata.items() if key != "stochastic"}
+            identity = {key: value for key, value in identity.items() if key != "stochastic"}
     if metadata == identity:
         return True
     if not isinstance(metadata, dict):

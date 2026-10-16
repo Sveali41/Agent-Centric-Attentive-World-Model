@@ -1814,6 +1814,7 @@ def run_online_mpc(
                 custom_mission="Reach the goal.",
                 max_steps=max_steps,
                 render_mode=None,
+                **minigrid_utils.stochastic_env_kwargs(cfg),
             )
         )
         observation, _ = env.reset(seed=int(cfg.PPO.seed) + episode)

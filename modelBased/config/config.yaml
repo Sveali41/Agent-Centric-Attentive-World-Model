@@ -193,7 +193,7 @@ domains:
     env_type: minigrid
     stochastic:
       enabled: False
-      move_failure_prob: 0.2
+      action_failure_prob: 0.2
     # Representative large target layout used for direct policy planning.
     task_name: target_task2
     data_collection:

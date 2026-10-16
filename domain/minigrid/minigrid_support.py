@@ -42,11 +42,16 @@ def stochastic_env_kwargs(cfg) -> dict:
     except (AttributeError, KeyError, TypeError):
         stochastic_cfg = None
     if stochastic_cfg is None:
-        return {"stochastic_enabled": False, "move_failure_prob": 0.2}
+        return {"stochastic_enabled": False, "action_failure_prob": 0.2}
+    if hasattr(stochastic_cfg, "move_failure_prob"):
+        raise ValueError(
+            "domains.minigrid.stochastic.move_failure_prob was removed; use "
+            "domains.minigrid.stochastic.action_failure_prob for all six actions."
+        )
     return {
         "stochastic_enabled": bool(getattr(stochastic_cfg, "enabled", False)),
-        "move_failure_prob": float(
-            getattr(stochastic_cfg, "move_failure_prob", 0.2)
+        "action_failure_prob": float(
+            getattr(stochastic_cfg, "action_failure_prob", 0.2)
         ),
     }
 

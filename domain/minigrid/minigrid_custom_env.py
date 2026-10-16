@@ -87,7 +87,7 @@ class CustomMiniGridEnv(MiniGridEnv):
             custom_mission: str = "Explore and interact with objects.",
             max_steps: Optional[int] = None,
             stochastic_enabled: bool = False,
-            move_failure_prob: float = 0.2,
+            action_failure_prob: float = 0.2,
             **kwargs,
     ) -> None:
         """
@@ -110,11 +110,13 @@ class CustomMiniGridEnv(MiniGridEnv):
                 key on every reset; ``None`` starts with an empty carrying slot.
             custom_mission (str): Custom mission description.
             max_steps (Optional[int]): Maximum number of steps in an episode.
-            stochastic_enabled (bool): Whether navigation actions can fail.
-            move_failure_prob (float): Probability that a left, right, or
-                forward action becomes a no-op.
+            stochastic_enabled (bool): Whether any of the six actions can fail.
+            action_failure_prob (float): Probability that a requested action
+                becomes an internal no-op.
             **kwargs: Additional keyword arguments for MiniGridEnv.
         """
+        if "move_failure_prob" in kwargs:
+            raise ValueError("move_failure_prob was removed; use action_failure_prob for all six actions.")
         self.txt_file_path = txt_file_path
         self.layout_str = layout_str
         self.color_str = color_str
@@ -128,11 +130,11 @@ class CustomMiniGridEnv(MiniGridEnv):
         self.initial_carrying_key_color = initial_carrying_key_color
         self.stochastic_enabled = bool(stochastic_enabled)
         try:
-            self.move_failure_prob = float(move_failure_prob)
+            self.action_failure_prob = float(action_failure_prob)
         except (TypeError, ValueError) as exc:
-            raise ValueError("move_failure_prob must be a number in [0, 1].") from exc
-        if not 0.0 <= self.move_failure_prob <= 1.0:
-            raise ValueError("move_failure_prob must be in [0, 1].")
+            raise ValueError("action_failure_prob must be a number in [0, 1].") from exc
+        if not 0.0 <= self.action_failure_prob <= 1.0:
+            raise ValueError("action_failure_prob must be in [0, 1].")
 
         # Determine the size of the environment if not provided
         if size is None:
@@ -180,7 +182,7 @@ class CustomMiniGridEnv(MiniGridEnv):
         return self.gen_obs(), info
 
     def step(self, action):
-        """Execute one action, optionally dropping navigation actions.
+        """Execute one action, optionally dropping any of the six actions.
 
         A dropped action follows the environment's private no-op path without
         invoking MiniGrid's native ``done`` action.
@@ -193,15 +195,9 @@ class CustomMiniGridEnv(MiniGridEnv):
         requested_action = self.actions(action_id)
         executed_action = requested_action
         action_failed = False
-        navigation_actions = {
-            self.actions.left,
-            self.actions.right,
-            self.actions.forward,
-        }
         if (
             self.stochastic_enabled
-            and requested_action in navigation_actions
-            and self.np_random.random() < self.move_failure_prob
+            and self.np_random.random() < self.action_failure_prob
         ):
             executed_action = INTERNAL_NOOP_ACTION
             action_failed = True
@@ -216,7 +212,7 @@ class CustomMiniGridEnv(MiniGridEnv):
             executed_action=int(executed_action),
             action_failed=action_failed,
             stochastic_enabled=self.stochastic_enabled,
-            move_failure_prob=self.move_failure_prob,
+            action_failure_prob=self.action_failure_prob,
         )
         return obs, reward, terminated, truncated, info
 

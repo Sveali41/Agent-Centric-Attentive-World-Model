@@ -11,6 +11,7 @@ import hydra
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 from modelBased.common.artifacts import dataset_matches
+from domain.minigrid.minigrid_support import stochastic_env_kwargs
 from modelBased.policy_training.common.experiment_naming import (
     policy_checkpoint_is_compatible,
     policy_checkpoint_path,
@@ -124,12 +125,13 @@ def domain_runtime_overrides(cfg: DictConfig, domain: str) -> list[str]:
     if domain == "minigrid":
         stochastic_cfg = getattr(domain_cfg, "stochastic", None)
         if stochastic_cfg is not None:
+            stochastic_kwargs = stochastic_env_kwargs(cfg)
             overrides.extend(
                 [
                     "domains.minigrid.stochastic.enabled="
                     f"{str(bool(getattr(stochastic_cfg, 'enabled', False))).lower()}",
-                    "domains.minigrid.stochastic.move_failure_prob="
-                    f"{float(getattr(stochastic_cfg, 'move_failure_prob', 0.2))}",
+                    "domains.minigrid.stochastic.action_failure_prob="
+                    f"{stochastic_kwargs['action_failure_prob']}",
                 ]
             )
     collection_cfg = getattr(domain_cfg, "data_collection", None)
@@ -229,12 +231,13 @@ def run_domain(domain: str, cfg: DictConfig) -> None:
     if domain == "minigrid":
         stochastic_cfg = getattr(domain_cfg, "stochastic", None)
         if stochastic_cfg is not None:
+            stochastic_kwargs = stochastic_env_kwargs(cfg)
             policy_identity_overrides.extend(
                 [
                     "domains.minigrid.stochastic.enabled="
                     f"{str(bool(getattr(stochastic_cfg, 'enabled', False))).lower()}",
-                    "domains.minigrid.stochastic.move_failure_prob="
-                    f"{float(getattr(stochastic_cfg, 'move_failure_prob', 0.2))}",
+                    "domains.minigrid.stochastic.action_failure_prob="
+                    f"{stochastic_kwargs['action_failure_prob']}",
                 ]
             )
     if hasattr(cfg, "p2e"):

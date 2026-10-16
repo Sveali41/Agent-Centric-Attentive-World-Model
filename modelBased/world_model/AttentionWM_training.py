@@ -221,14 +221,18 @@ def run(
     if not dataset_matches(cfg.attention_model.data_dir, cfg):
         allow_legacy = bool(getattr(cfg.attention_model, "allow_legacy_dataset", False))
         from modelBased.common.artifacts import dataset_metadata
-        if allow_legacy and dataset_metadata(cfg.attention_model.data_dir) is None:
+        stochastic_minigrid = (
+            str(cfg.domain) == "minigrid"
+            and bool(OmegaConf.select(cfg, "domains.minigrid.stochastic.enabled", default=False))
+        )
+        if allow_legacy and not stochastic_minigrid and dataset_metadata(cfg.attention_model.data_dir) is None:
             print(
                 "[WM] WARNING: using a legacy dataset without identity metadata. "
                 "Verify task_name/layout_path manually."
             )
         else:
             raise RuntimeError(
-                "Dataset identity does not match the selected domain/task/layout. "
+                "Dataset identity does not match the selected domain/task/layout or stochastic kernel. "
                 "Recollect data with: python -m modelBased.data.data_collect "
                 f"domain={cfg.domain}"
             )

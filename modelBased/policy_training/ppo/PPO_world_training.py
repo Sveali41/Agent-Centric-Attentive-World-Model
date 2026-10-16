@@ -432,6 +432,7 @@ def planner_behavior_cloning_warm_start(cfg, model, ppo_agent):
                 agent_start_dir=direction,
                 max_steps=int(ppo_cfg.max_ep_len),
                 render_mode=None,
+                **stochastic_env_kwargs(cfg),
             )
         )
         initial_observation = demo_env.reset(seed=seed)[0]["image"]
