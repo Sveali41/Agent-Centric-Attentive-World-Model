@@ -19,7 +19,7 @@ class ResidualMLP(nn.Module):
         return x + self.fc2(self.dropout(self.relu(self.fc1(x))))
 
 class CustomTransformerEncoderLayer(nn.Module):
-    def __init__(self, d_model, nhead, dropout=0.1):
+    def __init__(self, d_model, nhead, dropout=0.1, *, cnn_dilation=None):
         """
         :param d_model: feature dimension
         :param nhead: number of attention heads
@@ -27,7 +27,22 @@ class CustomTransformerEncoderLayer(nn.Module):
         """
         super(CustomTransformerEncoderLayer, self).__init__()
         # Use `nn.MultiheadAttention` with `batch_first=True` for (B, seq_len, d_model).
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.cnn_dilation = cnn_dilation
+        if cnn_dilation is not None:
+            # Pointwise projections approximately match the four attention
+            # projections' parameter count; depthwise convolution mixes cells.
+            width = 2 * d_model
+            self.spatial_mixer = nn.Sequential(
+                nn.Conv2d(d_model, width, kernel_size=1),
+                nn.Conv2d(
+                    width, width, kernel_size=3, padding=cnn_dilation,
+                    dilation=cnn_dilation, groups=width,
+                ),
+                nn.GELU(),
+                nn.Conv2d(width, d_model, kernel_size=1),
+            )
+        else:
+            self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         # Feed-forward network.
         self.linear1 = nn.Linear(d_model, d_model * 4)
         self.dropout = nn.Dropout(dropout)
@@ -38,7 +53,7 @@ class CustomTransformerEncoderLayer(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, src, src_mask=None, src_key_padding_mask=None, *, return_attention_weights=True):
+    def forward(self, src, src_mask=None, src_key_padding_mask=None, *, return_attention_weights=True, spatial_shape=None):
         """
         :param src: input tensor with shape (B, seq_len, d_model)
         :return:
@@ -46,12 +61,18 @@ class CustomTransformerEncoderLayer(nn.Module):
             - attn_weights: attention weights with shape (B, num_heads, seq_len, seq_len)
         """
         # Compute self-attention and return the attention weights.
-        attn_output, attn_weights = self.self_attn(
-            src, src, src,
-            attn_mask=src_mask,
-            key_padding_mask=src_key_padding_mask,
-            need_weights=return_attention_weights
-        )
+        if self.cnn_dilation is not None:
+            height, width = spatial_shape
+            grid = src.transpose(1, 2).reshape(src.size(0), src.size(2), height, width)
+            attn_output = self.spatial_mixer(grid).flatten(2).transpose(1, 2)
+            attn_weights = None
+        else:
+            attn_output, attn_weights = self.self_attn(
+                src, src, src,
+                attn_mask=src_mask,
+                key_padding_mask=src_key_padding_mask,
+                need_weights=return_attention_weights
+            )
         # Residual connection + LayerNorm.
         src = src + self.dropout1(attn_output)
         src = self.norm1(src)
@@ -191,12 +212,15 @@ class AttentionModule(nn.Module):
         crafter_inventory_event_residual_hidden_dims=(64,),
         crafter_inventory_event_residual_action_embed_dim=8,
         crafter_inventory_event_residual_change_bias=1.875,
+        crafter_spatial_backbone="attention",
     ):
         super().__init__()
         self.data_type = data_type
         self.env_type = env_type
         self.frame_stack = frame_stack
         self.crafter_output_mode = str(crafter_output_mode)
+        if crafter_spatial_backbone not in {"attention", "cnn"}:
+            raise ValueError("crafter_spatial_backbone must be attention or cnn")
         self.crafter_inventory_classes = int(crafter_inventory_classes)
         self.crafter_inventory_output_mode = str(crafter_inventory_output_mode)
         self.crafter_inventory_value_mode = str(crafter_inventory_value_mode).strip().lower()
@@ -462,10 +486,14 @@ class AttentionModule(nn.Module):
         self.res_mlp = ResidualMLP(embed_dim, embed_dim * 2, dropout=0.1)
 
 
-        self.transformer_layers = nn.ModuleList([
-            CustomTransformerEncoderLayer(d_model=embed_dim, nhead=num_heads)
-            for _ in range(2)
-        ])
+        self.transformer_layers = nn.ModuleList(
+            CustomTransformerEncoderLayer(
+                d_model=embed_dim, nhead=num_heads,
+                # Combine adjacent and wider neighborhoods across the two blocks.
+                cnn_dilation=dilation if crafter_spatial_backbone == "cnn" else None,
+            )
+            for dilation in (1, 2)
+        )
         
         if env_type == 'crafter':
             if self.crafter_output_mode == "effect":
@@ -911,10 +939,12 @@ class AttentionModule(nn.Module):
         fused = torch.cat([x, action_emb, context_emb], dim=-1)  # (B, N, 3D)
         x = self.fuse_fc(fused)  # (B, N, D)
 
-        # ==== Transformer ====
+        # ==== Spatial mixing ====
         attn_weights = None
         for layer in self.transformer_layers:
-            x, attn_weights = layer(x, return_attention_weights=return_attention_weights)
+            x, attn_weights = layer(
+                x, return_attention_weights=return_attention_weights, spatial_shape=(H, W)
+            )
 
         # ==== Residual MLP before FC ====
         x = self.res_mlp(x)  # shape: (B, N, D)

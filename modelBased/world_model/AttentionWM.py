@@ -397,6 +397,9 @@ class AttentionWorldModel(pl.LightningModule):
                 "frame_stack": self.frame_stack,
             }
             if module_class is AttentionWM_support.AttentionModule and self.env_type == "crafter":
+                module_kwargs["crafter_spatial_backbone"] = getattr(
+                    hparams, "crafter_spatial_backbone", "attention"
+                )
                 uses_effects = any(
                     str(spec.get("distribution", "")) == "categorical_effect"
                     for spec in self.observation_schema
